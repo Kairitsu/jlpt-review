@@ -72,14 +72,12 @@ class ReviewState {
   factory ReviewState.fromJson(Map<String, Object?> json) {
     return ReviewState(
       sentenceId: json['sentence_id']! as String,
-      nextReviewAt: DateTime.parse(json['next_review_at']! as String),
+      nextReviewAt: _readDateTime(json['next_review_at'])!,
       forceReviewTomorrow: json['force_review_tomorrow'] as bool? ?? false,
-      reviewWeight: json['review_weight'] as int? ?? 0,
-      totalWrongCount: json['total_wrong_count'] as int? ?? 0,
-      totalReviewCount: json['total_review_count'] as int? ?? 0,
-      lastReviewedAt: json['last_reviewed_at'] == null
-          ? null
-          : DateTime.parse(json['last_reviewed_at']! as String),
+      reviewWeight: _readInt(json['review_weight']),
+      totalWrongCount: _readInt(json['total_wrong_count']),
+      totalReviewCount: _readInt(json['total_review_count']),
+      lastReviewedAt: _readDateTime(json['last_reviewed_at']),
     );
   }
 
@@ -94,4 +92,32 @@ class ReviewState {
       'last_reviewed_at': lastReviewedAt?.toIso8601String(),
     };
   }
+}
+
+int _readInt(Object? value) {
+  if (value == null) {
+    return 0;
+  }
+
+  if (value is int) {
+    return value;
+  }
+
+  if (value is num) {
+    return value.toInt();
+  }
+
+  return int.parse(value as String);
+}
+
+DateTime? _readDateTime(Object? value) {
+  if (value == null) {
+    return null;
+  }
+
+  if (value is DateTime) {
+    return value;
+  }
+
+  return DateTime.parse(value as String);
 }

@@ -2,8 +2,13 @@ import '../review/review_state.dart';
 
 /// The kind of task represented by a study group.
 enum StudyGroupType {
-  review,
-  newStudy,
+  review('review'),
+  newStudy('new_study');
+
+  const StudyGroupType(this.storageValue);
+
+  /// Value stored in the `group_type` field for generated task groups.
+  final String storageValue;
 }
 
 /// A group of sentence IDs that should be studied together.
@@ -16,7 +21,17 @@ class StudyGroup {
   final StudyGroupType groupType;
   final List<String> sentenceIds;
 
+  /// Storage/API representation for the generated group's `group_type` field.
+  String get groupTypeValue => groupType.storageValue;
+
   bool get isReview => groupType == StudyGroupType.review;
+
+  Map<String, Object?> toJson() {
+    return <String, Object?>{
+      'group_type': groupTypeValue,
+      'sentence_ids': sentenceIds,
+    };
+  }
 }
 
 /// Settings used when generating study tasks.
@@ -70,7 +85,7 @@ class StudyPlanner {
     final reviewSentenceIds = queryReviewStates(
       states: states,
       now: now,
-    ).map((state) => state.sentenceId).toList();
+    ).map((state) => state.sentenceId).toList(growable: false);
 
     return _chunkSentenceIds(
       sentenceIds: reviewSentenceIds,
