@@ -1,0 +1,20 @@
+name: jlpt_ai_tutor
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cryptography: ^2.7.0
+  flutter_secure_storage: ^9.2.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^5.1.1
+
+flutter:
+  uses-material-design: true
