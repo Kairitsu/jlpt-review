@@ -1,0 +1,18 @@
+name: jlpt_ai_tutor
+description: A private cross-platform Japanese AI tutoring and JLPT practice system.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  go_router: ^14.2.7
+
+dev_dependencies:
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
