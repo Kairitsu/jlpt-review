@@ -13,10 +13,10 @@ enum StudyGroupType {
 
 /// A group of sentence IDs that should be studied together.
 class StudyGroup {
-  const StudyGroup({
+  StudyGroup({
     required this.groupType,
-    required this.sentenceIds,
-  });
+    required Iterable<String> sentenceIds,
+  }) : sentenceIds = List<String>.unmodifiable(sentenceIds);
 
   final StudyGroupType groupType;
   final List<String> sentenceIds;
@@ -55,6 +55,10 @@ class StudyPlanner {
   /// A review is due when `force_review_tomorrow = true` or when
   /// `next_review_at <= todayEnd`.
   DateTime todayEnd(DateTime now) {
+    if (now.isUtc) {
+      return DateTime.utc(now.year, now.month, now.day, 23, 59, 59, 999, 999);
+    }
+
     return DateTime(now.year, now.month, now.day, 23, 59, 59, 999, 999);
   }
 
@@ -190,11 +194,9 @@ class StudyPlanner {
       groups.add(
         StudyGroup(
           groupType: groupType,
-          sentenceIds: List<String>.unmodifiable(
-            sentenceIds.sublist(
-              index,
-              end > sentenceIds.length ? sentenceIds.length : end,
-            ),
+          sentenceIds: sentenceIds.sublist(
+            index,
+            end > sentenceIds.length ? sentenceIds.length : end,
           ),
         ),
       );
