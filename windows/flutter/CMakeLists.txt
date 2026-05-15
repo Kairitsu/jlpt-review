@@ -6,6 +6,7 @@ include(${EPHEMERAL_DIR}/generated_config.cmake)
 
 set(WRAPPER_ROOT "${EPHEMERAL_DIR}/cpp_client_wrapper")
 
+set(FLUTTER_LIBRARY "${EPHEMERAL_DIR}/flutter_windows.dll" PARENT_SCOPE)
 set(FLUTTER_LIBRARY "${EPHEMERAL_DIR}/flutter_windows.dll")
 set(FLUTTER_ICU_DATA_FILE "${EPHEMERAL_DIR}/icudtl.dat" PARENT_SCOPE)
 set(PROJECT_BUILD_DIR "${PROJECT_DIR}/build/" PARENT_SCOPE)
@@ -22,6 +23,12 @@ add_library(flutter INTERFACE)
 target_include_directories(flutter INTERFACE "${EPHEMERAL_DIR}")
 target_link_libraries(flutter INTERFACE "${FLUTTER_LIBRARY}.lib")
 add_dependencies(flutter flutter_assemble)
+
+add_library(flutter_wrapper_app STATIC
+  "${WRAPPER_ROOT}/core_implementations.cc"
+  "${WRAPPER_ROOT}/standard_codec.cc")
+target_include_directories(flutter_wrapper_app PUBLIC "${WRAPPER_ROOT}/include")
+target_link_libraries(flutter_wrapper_app PRIVATE flutter)
 
 add_library(flutter_wrapper_plugin STATIC
   "${WRAPPER_ROOT}/core_implementations.cc"
