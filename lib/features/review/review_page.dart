@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-
 import '../../app/router.dart';
 
 class ReviewPage extends StatelessWidget {
@@ -35,7 +33,7 @@ class ReviewPage extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             FilledButton.icon(
-              onPressed: () => context.push(AppRoute.completion),
+              onPressed: () => Navigator.of(context).pushNamed(AppRoute.completion),
               icon: const Icon(Icons.check_circle_outline),
               label: const Text('完成本组'),
             ),

@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-
 import '../../app/router.dart';
 
 class StudyPage extends StatelessWidget {
@@ -38,7 +36,7 @@ class StudyPage extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               FilledButton.icon(
-                onPressed: () => context.push(AppRoute.dictation),
+                onPressed: () => Navigator.of(context).pushNamed(AppRoute.dictation),
                 icon: const Icon(Icons.edit_note),
                 label: const Text('进入默写'),
               ),

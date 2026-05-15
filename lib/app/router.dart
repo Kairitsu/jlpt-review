@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
 
 import '../features/completion/completion_page.dart';
 import '../features/dictation/dictation_page.dart';
@@ -23,51 +22,25 @@ class AppRoute {
   static const completion = '/completion';
 }
 
-final appRouter = GoRouter(
-  initialLocation: AppRoute.home,
-  routes: [
-    GoRoute(
-      path: AppRoute.home,
-      pageBuilder: (context, state) => _fadePage(state, const HomePage()),
-    ),
-    GoRoute(
-      path: AppRoute.library,
-      pageBuilder: (context, state) => _fadePage(state, const LibraryPage()),
-    ),
-    GoRoute(
-      path: AppRoute.import,
-      pageBuilder: (context, state) => _fadePage(state, const ImportPage()),
-    ),
-    GoRoute(
-      path: AppRoute.settings,
-      pageBuilder: (context, state) => _fadePage(state, const SettingsPage()),
-    ),
-    GoRoute(
-      path: AppRoute.study,
-      pageBuilder: (context, state) => _fadePage(state, const StudyPage()),
-    ),
-    GoRoute(
-      path: AppRoute.dictation,
-      pageBuilder: (context, state) => _fadePage(state, const DictationPage()),
-    ),
-    GoRoute(
-      path: AppRoute.review,
-      pageBuilder: (context, state) => _fadePage(state, const ReviewPage()),
-    ),
-    GoRoute(
-      path: AppRoute.completion,
-      pageBuilder: (context, state) => _fadePage(state, const CompletionPage()),
-    ),
-  ],
-);
+Route<void> onGenerateAppRoute(RouteSettings settings) {
+  final page = switch (settings.name) {
+    AppRoute.home => const HomePage(),
+    AppRoute.library => const LibraryPage(),
+    AppRoute.import => const ImportPage(),
+    AppRoute.settings => const SettingsPage(),
+    AppRoute.study => const StudyPage(),
+    AppRoute.dictation => const DictationPage(),
+    AppRoute.review => const ReviewPage(),
+    AppRoute.completion => const CompletionPage(),
+    _ => const HomePage(),
+  };
 
-CustomTransitionPage<void> _fadePage(GoRouterState state, Widget child) {
-  return CustomTransitionPage<void>(
-    key: state.pageKey,
-    child: child,
+  return PageRouteBuilder<void>(
+    settings: settings,
+    pageBuilder: (context, animation, secondaryAnimation) => page,
     transitionsBuilder: (context, animation, secondaryAnimation, child) {
       return FadeTransition(
-        opacity: CurveTween(curve: Curves.easeOutCubic).animate(animation),
+        opacity: CurvedAnimation(parent: animation, curve: Curves.easeOutCubic),
         child: child,
       );
     },

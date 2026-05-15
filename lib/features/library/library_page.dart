@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-
 import '../../app/router.dart';
 import '../../shared/mock_sentences.dart';
 import '../../shared/page_shell.dart';
@@ -27,7 +25,7 @@ class _LibraryPageState extends State<LibraryPage> {
       actions: [
         IconButton(
           tooltip: '导入',
-          onPressed: () => context.push(AppRoute.import),
+          onPressed: () => Navigator.of(context).pushNamed(AppRoute.import),
           icon: const Icon(Icons.upload_file_outlined),
         ),
       ],

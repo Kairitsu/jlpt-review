@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
 
 import '../app/router.dart';
 
@@ -19,6 +18,8 @@ class PageShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final currentRoute = ModalRoute.of(context)?.settings.name ?? AppRoute.home;
+
     return Scaffold(
       appBar: AppBar(
         title: Column(
@@ -35,8 +36,8 @@ class PageShell extends StatelessWidget {
         actions: actions,
       ),
       bottomNavigationBar: NavigationBar(
-        selectedIndex: _selectedIndex(GoRouterState.of(context).uri.path),
-        onDestinationSelected: (index) => context.go(_routes[index]),
+        selectedIndex: _selectedIndex(currentRoute),
+        onDestinationSelected: (index) => _navigateToTab(context, _routes[index]),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.home_outlined), label: '首页'),
           NavigationDestination(icon: Icon(Icons.menu_book_outlined), label: '句库'),
@@ -54,9 +55,16 @@ class PageShell extends StatelessWidget {
 
   static const _routes = [AppRoute.home, AppRoute.library, AppRoute.settings];
 
-  int _selectedIndex(String path) {
-    if (path.startsWith(AppRoute.library)) return 1;
-    if (path.startsWith(AppRoute.settings)) return 2;
+  void _navigateToTab(BuildContext context, String routeName) {
+    final currentRoute = ModalRoute.of(context)?.settings.name ?? AppRoute.home;
+    if (currentRoute == routeName) return;
+
+    Navigator.of(context).pushNamedAndRemoveUntil(routeName, (route) => false);
+  }
+
+  int _selectedIndex(String routeName) {
+    if (routeName.startsWith(AppRoute.library)) return 1;
+    if (routeName.startsWith(AppRoute.settings)) return 2;
     return 0;
   }
 }

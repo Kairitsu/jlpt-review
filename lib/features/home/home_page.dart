@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-
 import '../../app/router.dart';
 import '../../shared/page_shell.dart';
 
@@ -15,7 +13,7 @@ class HomePage extends StatelessWidget {
       actions: [
         IconButton(
           tooltip: '导入句子',
-          onPressed: () => context.push(AppRoute.import),
+          onPressed: () => Navigator.of(context).pushNamed(AppRoute.import),
           icon: const Icon(Icons.add_circle_outline),
         ),
       ],
@@ -33,7 +31,7 @@ class HomePage extends StatelessWidget {
           ),
           const SizedBox(height: 18),
           FilledButton.icon(
-            onPressed: () => context.push(AppRoute.study),
+            onPressed: () => Navigator.of(context).pushNamed(AppRoute.study),
             icon: const Icon(Icons.play_arrow_rounded),
             label: const Text('开始学习'),
           ),
@@ -42,7 +40,7 @@ class HomePage extends StatelessWidget {
             children: [
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () => context.go(AppRoute.library),
+                  onPressed: () => Navigator.of(context).pushNamed(AppRoute.library),
                   icon: const Icon(Icons.menu_book_outlined),
                   label: const Text('句库'),
                 ),
@@ -50,7 +48,7 @@ class HomePage extends StatelessWidget {
               const SizedBox(width: 12),
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () => context.go(AppRoute.settings),
+                  onPressed: () => Navigator.of(context).pushNamed(AppRoute.settings),
                   icon: const Icon(Icons.settings_outlined),
                   label: const Text('设置'),
                 ),

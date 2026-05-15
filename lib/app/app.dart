@@ -8,11 +8,12 @@ class JlptAiTutorApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp.router(
+    return MaterialApp(
       title: 'JLPT AI Tutor',
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
-      routerConfig: appRouter,
+      initialRoute: AppRoute.home,
+      onGenerateRoute: onGenerateAppRoute,
     );
   }
 }

@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-
 import '../../app/router.dart';
 
 class CompletionPage extends StatelessWidget {
@@ -23,13 +21,13 @@ class CompletionPage extends StatelessWidget {
               const Text('已完成 8 个新学句子和 18 个复习句子。明天会根据掌握情况自动安排间隔复习。', textAlign: TextAlign.center),
               const Spacer(),
               FilledButton.icon(
-                onPressed: () => context.go(AppRoute.home),
+                onPressed: () => Navigator.of(context).pushNamedAndRemoveUntil(AppRoute.home, (route) => false),
                 icon: const Icon(Icons.home_outlined),
                 label: const Text('返回首页'),
               ),
               const SizedBox(height: 12),
               OutlinedButton.icon(
-                onPressed: () => context.go(AppRoute.library),
+                onPressed: () => Navigator.of(context).pushNamed(AppRoute.library),
                 icon: const Icon(Icons.menu_book_outlined),
                 label: const Text('查看句库'),
               ),

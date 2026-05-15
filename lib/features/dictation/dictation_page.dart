@@ -1,6 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:go_router/go_router.dart';
-
 import '../../app/router.dart';
 
 class DictationPage extends StatelessWidget {
@@ -41,7 +39,7 @@ class DictationPage extends StatelessWidget {
             ),
             const SizedBox(height: 16),
             FilledButton.icon(
-              onPressed: () => context.push(AppRoute.review),
+              onPressed: () => Navigator.of(context).pushNamed(AppRoute.review),
               icon: const Icon(Icons.fact_check_outlined),
               label: const Text('提交并查看判定'),
             ),
