@@ -134,6 +134,39 @@ def test_collection_count_is_clamped_and_random_scope_uses_all_sentences(tmp_pat
     assert "已调整为全部" in result["notice"]
 
 
+def test_due_session_count_limits_and_default_uses_all_due_sentences(tmp_path, monkeypatch):
+    client = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence_ids = []
+    for index in range(3):
+        chunk_id = f"due-{index}"
+        created = client.post("/api/sentences", json={
+            "collectionId": collection,
+            "chinese": f"到期句子 {index}",
+            "japanese": f"文{index}",
+            "chunks": [{"id": chunk_id, "text": f"文{index}"}],
+            "correctOrder": [chunk_id],
+        })
+        assert created.status_code == 201
+        sentence_ids.append(created.get_json()["sentence"]["id"])
+
+    import db
+    with db.get_db() as connection:
+        for index, sentence_id in enumerate(sentence_ids):
+            connection.execute(
+                "UPDATE sentences SET next_review_at=? WHERE id=?",
+                (f"2000-01-01T00:00:0{index}+00:00", sentence_id),
+            )
+
+    limited = client.post("/api/practice/sessions", json={"collectionId": collection, "count": 2})
+    assert limited.status_code == 201
+    assert [sentence["id"] for sentence in limited.get_json()["sentences"]] == sentence_ids[:2]
+
+    all_due = client.post("/api/practice/sessions", json={"collectionId": collection})
+    assert all_due.status_code == 201
+    assert [sentence["id"] for sentence in all_due.get_json()["sentences"]] == sentence_ids
+
+
 def test_migration_removes_only_legacy_remote_settings_and_keeps_saved_chunks(tmp_path, monkeypatch):
     client = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]

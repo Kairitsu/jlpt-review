@@ -5,7 +5,7 @@ const state = {
   route: 'home', dashboard: null,
   activeCollection: Number(localStorage.getItem('activeCollection') || 0),
   draft: null, selectedChunks: [], editing: null, practice: null, report: null,
-  routeMeta: {},
+  routeMeta: {}, homeDuePicker: false,
 };
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
@@ -77,10 +77,26 @@ async function ensureDashboard() {
   return state.dashboard;
 }
 function collectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join(''); }
+function setActiveCollection(collectionId) { state.activeCollection = Number(collectionId) || 0; localStorage.setItem('activeCollection', state.activeCollection); }
+function dueCollectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)} · ${c.due} 待复习</option>`).join(''); }
+function dueCountOptions(due) { return [5,10,20].filter(count => count <= due).map(count => `<button class="count-option due-count-option" data-action="set-due-count" data-count="${count}">${count} 句</button>`).join(''); }
+function renderDuePicker(data, active) {
+  const due = active?.due || 0;
+  return `<div class="card practice-picker home-practice-picker"><div><h2>选择本轮复习</h2><p>先选句集，再决定本轮练习数量。</p><label class="field">练习句集<select id="due-collection" aria-label="练习句集">${dueCollectionOptions(active?.id)}</select></label></div><div class="count-options" role="group" aria-label="本轮待复习数量">${due ? `${dueCountOptions(due)}<button class="count-option due-count-option active" data-action="set-due-count" data-count="all">全部</button><label class="custom-count">自定义<input id="due-custom-count" type="number" min="1" max="${due}" placeholder="1-${due}"></label><button class="btn primary" data-action="start-due-practice">开始复习</button>` : '<span class="status-note">该句集当前没有待复习句子。</span><button class="btn primary" data-action="start-due-practice" disabled>开始复习</button>'}</div><p id="due-count-hint" class="status-note">${due ? `本句集有 ${due} 句待复习，可从到期最早的句子开始。` : '请选择有待复习句子的句集后再开始。'}</p></div>`;
+}
+function updateDueCountHint() {
+  const input = $('#due-custom-count'), hint = $('#due-count-hint'), start = $('[data-action="start-due-practice"]', view);
+  if (!input || !hint || !start) return;
+  const due = Number(input.max), value = input.value.trim();
+  if (!value) { start.disabled = false; hint.textContent = `本句集有 ${due} 句待复习，可从到期最早的句子开始。`; return; }
+  const count = Number(value), valid = Number.isInteger(count) && count >= 1 && count <= due;
+  start.disabled = !valid;
+  hint.textContent = valid ? `将复习 ${count} 句。` : `请输入 1 到 ${due} 之间的整数。`;
+}
 
 async function renderHome() {
   const data = await ensureDashboard(); const active = data.collections.find(c => c.id === state.activeCollection) || data.collections[0]; const progress = active?.total ? Math.round(active.learned * 100 / active.total) : 0;
-  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>今天也来背一句</h1><p>从中文出发，把日语句子拼回完整模样。</p></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><button class="link-button" data-action="switch-collection">切换句集 ›</button><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom"><div class="metric"><strong>${active?.due || 0}</strong><span>待复习</span></div><div class="metric"><strong>${active?.today || 0}</strong><span>今日学习</span></div></div><button class="btn primary" data-action="start-due" ${!active?.due ? 'disabled' : ''}>开始背句子</button></div><div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div></section>`;
+  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>今天也来背一句</h1><p>从中文出发，把日语句子拼回完整模样。</p></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom"><div class="metric"><strong>${active?.due || 0}</strong><span>待复习</span></div><div class="metric"><strong>${active?.today || 0}</strong><span>今日学习</span></div></div><button class="btn primary" data-action="start-due" ${!active?.due ? 'disabled' : ''}>开始背句子</button></div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div></section>`;
   setChrome();
 }
 
@@ -103,25 +119,45 @@ async function reloadLibrary() { const query = new URLSearchParams({collectionId
 async function startPractice(payload) {
   const result = await api('/api/practice/sessions', {method:'POST', body:JSON.stringify(payload)});
   if (result.notice) toast(result.notice);
-  state.practice = {sessionId:result.sessionId, sentences:result.sentences, index:0, selected:[], checked:false, result:null, candidates:[]};
+  state.practice = {sessionId:result.sessionId, sentences:result.sentences, index:0, selected:[], checked:false, result:null, candidates:[], submitting:false};
   prepareQuestion(); route('practice');
 }
 function shuffle(items) { const result = [...items]; for (let i = result.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [result[i], result[j]] = [result[j], result[i]]; } return result; }
-function prepareQuestion() { const p = state.practice, s = p.sentences[p.index]; p.selected = []; p.checked = false; p.result = null; p.candidates = shuffle(s.chunks.map(c => c.id)); }
+function prepareQuestion() { const p = state.practice, s = p.sentences[p.index]; p.selected = []; p.checked = false; p.result = null; p.submitting = false; p.candidates = shuffle(s.chunks.map(c => c.id)); }
 function selectionHtml(s, p, map) { return p.selected.length ? `<div class="chosen-list">${p.selected.map((id, i) => `<button class="chosen ${p.checked ? (id === s.correctOrder[i] ? 'good' : 'bad') : ''}" data-action="unchoose" data-index="${i}" ${p.checked ? 'disabled' : ''}>${esc(map[id]?.text || '')}</button>`).join('')}</div>` : `<div class="placeholder">看中文翻译，点击下方词块，组成句子</div>`; }
+function practiceReadyToCheck(p = state.practice) { return Boolean(p) && !p.checked && !p.submitting && p.selected.length === p.candidates.length; }
 function updatePracticeSelection() {
   const p = state.practice, s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const composer = $('#practice-composer'); if (!composer) return;
   composer.innerHTML = selectionHtml(s, p, map);
-  $$('.candidate', view).forEach(button => { const used = p.selected.includes(button.dataset.id); button.disabled = used || p.checked; button.classList.toggle('used', used); });
+  $$('.candidate', view).forEach(button => { const used = p.selected.includes(button.dataset.id); button.disabled = used || p.checked || p.submitting; button.classList.toggle('used', used); });
+  const checkButton = $('[data-action="check"]', view);
+  if (checkButton) checkButton.disabled = !practiceReadyToCheck(p);
 }
 function renderPractice() {
-  const p = state.practice; if (!p) return route('home', {replace:true}); const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c])); const pct = Math.round(p.index * 100 / p.sentences.length);
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　背句子</button><div class="thin-progress"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子拼写</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, p, map)}</div><div class="candidate-area"><div class="chunk-list">${p.candidates.map(id => `<button class="candidate ${p.selected.includes(id) ? 'used' : ''}" data-action="choose" data-id="${id}" ${p.selected.includes(id) || p.checked ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${p.checked ? answerDetails(s, map, p) : ''}<div class="practice-actions"><button class="btn outline" data-action="skip" ${p.checked ? 'disabled' : ''}>跳过练习</button><button class="btn ghost" data-action="reset" ${p.checked ? 'disabled' : ''}>重置</button>${p.checked ? '<button class="btn outline retry-current" data-action="retry-current">重新练习本题</button>' : ''}<button class="btn primary" data-action="${p.checked ? 'next' : 'check'}">${p.checked ? '下一题' : '核对答案'}</button></div></section>`;
+  const p = state.practice; if (!p) return route('home', {replace:true}); const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c])); const pct = Math.round(p.index * 100 / p.sentences.length), ready = practiceReadyToCheck(p), busy = p.submitting;
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　背句子</button><div class="thin-progress"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子拼写</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, p, map)}</div><div class="candidate-area"><div class="chunk-list">${p.candidates.map(id => `<button class="candidate ${p.selected.includes(id) ? 'used' : ''}" data-action="choose" data-id="${id}" ${p.selected.includes(id) || p.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${p.checked ? answerDetails(s, map, p) : ''}<div class="practice-actions"><button class="btn outline" data-action="skip" ${p.checked || busy ? 'disabled' : ''}>跳过练习</button><button class="btn ghost" data-action="reset" ${p.checked || busy ? 'disabled' : ''}>重置</button>${p.checked ? '<button class="btn outline retry-current" data-action="retry-current">重新练习本题</button>' : ''}<button class="btn primary" data-action="${p.checked ? 'next' : 'check'}" ${!p.checked && !ready ? 'disabled' : ''}>${p.checked ? '下一题' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, p) { const user = p.selected.map(id => map[id]?.text || '').join(''); return `<div class="card answer-card"><h3>${p.result?.correct ? '回答正确' : '正确答案'}</h3>${!p.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${esc(s.japanese)}</div><p>${esc(s.chinese)}</p></div>`; }
-async function record(action) { const p = state.practice, s = p.sentences[p.index]; p.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:p.selected})}); p.checked = true; renderPractice(); }
+async function record(action) {
+  const p = state.practice;
+  if (!p || p.submitting) return;
+  if (action === 'check' && !practiceReadyToCheck(p)) { toast('请先把所有词块摆放完整'); return; }
+  const s = p.sentences[p.index];
+  p.submitting = true;
+  renderPractice();
+  try {
+    p.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:p.selected})});
+    p.checked = true;
+  } catch (error) {
+    p.submitting = false;
+    renderPractice();
+    throw error;
+  }
+  p.submitting = false;
+  renderPractice();
+}
 async function nextQuestion() { const p = state.practice; if (p.index < p.sentences.length - 1) { p.index++; prepareQuestion(); renderPractice(); return; } await api(`/api/practice/sessions/${p.sessionId}/complete`, {method:'POST', body:'{}'}); state.report = (await api(`/api/reports/${p.sessionId}`)).report; route('report', {reportId:p.sessionId}); }
 
 async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<button class="history-row" data-action="open-report" data-id="${r.id}"><span class="row-icon">${r.accuracy}%</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>共 ${r.total} · 对 ${r.correct} · 错 ${r.wrong} · 跳过 ${r.skipped}</small></span><span class="arrow">›</span></button>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
@@ -141,10 +177,11 @@ document.addEventListener('click', async event => {
   try {
     if (action === 'home') route('home');
     else if (action === 'back') navigateBack();
-    else if (action === 'switch-collection') { const next = prompt('输入要切换的句集名称：', state.dashboard.collections.find(c => c.id === state.activeCollection)?.name || ''); const found = state.dashboard.collections.find(c => c.name === next); if (found) { state.activeCollection = found.id; localStorage.setItem('activeCollection', found.id); renderHome(); } else if (next) toast('没有找到这个句集', true); }
     else if (action === 'new-collection') { const name = prompt('新句集名称：'); if (name) { await api('/api/collections', {method:'POST', body:JSON.stringify({name})}); state.dashboard = null; await renderHome(); } }
     else if (action === 'open-collection') { state.activeCollection = Number(button.dataset.id); route('library', {collectionId:state.activeCollection}); }
-    else if (action === 'start-due') await startPractice({collectionId:state.activeCollection});
+    else if (action === 'start-due') { const active = state.dashboard?.collections.find(c => c.id === state.activeCollection); if (!active?.due) { toast('当前句集没有待复习句子'); return; } state.homeDuePicker = true; await renderHome(); }
+    else if (action === 'set-due-count') { $$('.due-count-option', view).forEach(option => option.classList.toggle('active', option === button)); $('#due-custom-count').value = ''; updateDueCountHint(); }
+    else if (action === 'start-due-practice') { const collectionId = Number($('#due-collection')?.value), active = state.dashboard?.collections.find(c => c.id === collectionId); if (!active?.due) { toast('所选句集当前没有待复习句子'); return; } const custom = $('#due-custom-count')?.value.trim(); if (custom) { const count = Number(custom); if (!Number.isInteger(count) || count < 1 || count > active.due) { toast(`请输入 1 到 ${active.due} 之间的整数`); return; } } const selected = $('.due-count-option.active', view)?.dataset.count || 'all'; state.homeDuePicker = false; await startPractice({collectionId, count:custom || selected}); }
     else if (action === 'set-count') { $$('.count-option').forEach(x => x.classList.toggle('active', x === button)); $('#custom-count').value = ''; }
     else if (action === 'start-collection') { const custom = $('#custom-count').value; const selected = $('.count-option.active')?.dataset.count || 'all'; await startPractice({scope:'collection', collectionId:state.activeCollection, count:custom || selected}); }
     else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分块…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
@@ -157,12 +194,12 @@ document.addEventListener('click', async event => {
     else if (action === 'edit-sentence') { state.editing = (await api(`/api/sentences/${button.dataset.id}`)).sentence; route('add', {editingId:state.editing.id}); }
     else if (action === 'delete-sentence') { if (confirm('确定删除这条句子吗？')) { await api(`/api/sentences/${button.dataset.id}`, {method:'DELETE'}); reloadLibrary(); } }
     else if (action === 'manage-collection') { const current = state.dashboard.collections.find(c => c.id === state.activeCollection), choice = prompt('输入“重命名”或“删除”：', '重命名'); if (choice === '重命名') { const name = prompt('新名称：', current.name); if (name) { await api(`/api/collections/${current.id}`, {method:'PATCH', body:JSON.stringify({name})}); state.dashboard = null; await renderLibrary(current.id); } } if (choice === '删除' && confirm(`确定删除空句集“${current.name}”吗？`)) { await api(`/api/collections/${current.id}`, {method:'DELETE'}); state.dashboard = null; await renderLibrary(); } }
-    else if (action === 'choose') { state.practice.selected.push(button.dataset.id); updatePracticeSelection(); }
-    else if (action === 'unchoose') { state.practice.selected.splice(Number(button.dataset.index), 1); updatePracticeSelection(); }
-    else if (action === 'reset') { state.practice.selected = []; updatePracticeSelection(); }
-    else if (action === 'check') await record('check');
+    else if (action === 'choose') { const p = state.practice, id = button.dataset.id; if (!p || p.checked || p.submitting || !p.candidates.includes(id) || p.selected.includes(id) || p.selected.length >= p.candidates.length) return; p.selected.push(id); updatePracticeSelection(); }
+    else if (action === 'unchoose') { const p = state.practice, index = Number(button.dataset.index); if (!p || p.checked || p.submitting || !Number.isInteger(index) || index < 0 || index >= p.selected.length) return; p.selected.splice(index, 1); updatePracticeSelection(); }
+    else if (action === 'reset') { const p = state.practice; if (!p || p.checked || p.submitting) return; p.selected = []; updatePracticeSelection(); }
+    else if (action === 'check') { if (!practiceReadyToCheck()) { toast('请先把所有词块摆放完整'); return; } await record('check'); }
     else if (action === 'skip') await record('skip');
-    else if (action === 'retry-current') { state.practice.selected = []; state.practice.checked = false; state.practice.result = null; renderPractice(); }
+    else if (action === 'retry-current') { state.practice.selected = []; state.practice.checked = false; state.practice.result = null; state.practice.submitting = false; renderPractice(); }
     else if (action === 'next') await nextQuestion();
     else if (action === 'exit-practice') { if (confirm('退出后，本轮未完成的题目不会生成完整报告。确定退出吗？')) route('home'); }
     else if (action === 'open-report') { state.report = (await api(`/api/reports/${button.dataset.id}`)).report; route('report', {reportId:state.report.id}); }
@@ -173,12 +210,14 @@ document.addEventListener('click', async event => {
 });
 
 document.addEventListener('change', event => {
+  if (event.target.id === 'home-collection' || event.target.id === 'due-collection') { setActiveCollection(event.target.value); if (event.target.id === 'due-collection') state.homeDuePicker = true; renderHome().catch(error => toast(error.message, true)); return; }
   if (event.target.id === 'library-collection') { state.activeCollection = Number(event.target.value); localStorage.setItem('activeCollection', state.activeCollection); route('library', {collectionId:state.activeCollection, replace:true}); }
   if (event.target.id === 'library-sort') reloadLibrary();
 });
 document.addEventListener('input', event => {
   if (event.target.id === 'library-search') { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(reloadLibrary, 250); }
   if (event.target.id === 'custom-count' && event.target.value) { $$('.count-option').forEach(x => x.classList.remove('active')); const total = Number(event.target.max); if (Number(event.target.value) > total) $('#count-hint').textContent = `当前句集只有 ${total} 句，开始时将自动调整为全部。`; else $('#count-hint').textContent = `将随机练习 ${Math.max(1, Number(event.target.value) || 1)} 句。`; }
+  if (event.target.id === 'due-custom-count') { $$('.due-count-option', view).forEach(option => option.classList.remove('active')); updateDueCountHint(); }
 });
 document.addEventListener('submit', async event => {
   event.preventDefault();
