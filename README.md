@@ -31,8 +31,8 @@
 ### 用 Docker 运行
 
 ```bash
-git clone https://github.com/Kairitsu/jlpt-ai-tutor.git
-cd jlpt-ai-tutor
+git clone https://github.com/Kairitsu/jlpt-review.git
+cd jlpt-review
 
 cp secrets/app.env.example secrets/app.env
 # 编辑 secrets/app.env：设置强随机 APP_SECRET、初始用户名与密码
