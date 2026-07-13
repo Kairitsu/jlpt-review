@@ -1,0 +1,4 @@
+Flask==3.1.1
+gunicorn==23.0.0
+SudachiPy==0.6.11
+SudachiDict-full==20260428

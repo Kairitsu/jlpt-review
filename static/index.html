@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#edf8f5">
+  <title>背句子 · 日语句子背诵</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header id="main-header" class="main-header">
+      <button class="brand plain-button" data-route="home" aria-label="返回首页"><span class="brand-mark">文</span><strong>背句子</strong></button>
+      <button class="icon-button" data-route="settings" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
+    </header>
+    <main id="view" tabindex="-1"></main>
+    <nav id="bottom-nav" class="bottom-nav" aria-label="主导航">
+      <button data-route="home"><span>⌂</span>首页</button>
+      <button data-route="library"><span>▦</span>题库</button>
+      <button data-route="reports"><span>▤</span>报告</button>
+    </nav>
+    <button id="fab" class="fab" data-route="add" aria-label="添加句子">＋</button>
+  </div>
+  <div id="login-modal" class="modal-backdrop hidden">
+    <form id="login-form" class="modal login-card">
+      <span class="brand-mark large">文</span>
+      <h1>欢迎回来</h1><p>登录后继续今天的日语句子练习</p>
+      <label>用户名<input name="username" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <p class="form-error" id="login-error" role="alert"></p>
+      <button class="btn primary wide" type="submit">登录</button>
+    </form>
+  </div>
+  <div id="dialog" class="modal-backdrop hidden"></div>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

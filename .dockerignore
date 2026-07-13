@@ -1,0 +1,14 @@
+.git
+.venv
+.pytest_cache
+.playwright-cli
+data
+backups
+secrets
+tests
+__pycache__
+*.sqlite*
+*.log
+.env
+.env.*
+

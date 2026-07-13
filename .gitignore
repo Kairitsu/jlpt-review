@@ -1,0 +1,37 @@
+# Runtime data & secrets (never commit)
+data/
+backups/
+secrets/app.env
+secrets/basic-auth.*
+secrets/*
+!secrets/app.env.example
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local tooling / debug artifacts
+.playwright-cli/
+*.log
+*.sqlite*
+*.db
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
