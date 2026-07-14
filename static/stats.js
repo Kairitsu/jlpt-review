@@ -15,10 +15,27 @@ const STATS_COLORS = {
   known: '#53a88f',
   fuzzy: '#e0b35a',
   forgotten: '#b94848',
-  mastered: '#287a54',
   muted: '#68827d',
   grid: 'rgba(23,59,53,.08)',
 };
+
+/** Match page CJK stack so canvas labels don't fall back to Helvetica/Arial. */
+const STATS_FONT_FAMILY = '"Noto Sans SC", system-ui, -apple-system, sans-serif';
+
+function ensureStatsChartDefaults() {
+  if (typeof Chart === 'undefined' || Chart.__statsFontReady) return;
+  Chart.defaults.font.family = STATS_FONT_FAMILY;
+  Chart.defaults.font.size = 12;
+  Chart.__statsFontReady = true;
+}
+
+/** Format seconds as "39m47s" (no leading zero on minutes; no hours). */
+function formatDurationSec(sec) {
+  const total = Math.max(0, Math.round(Number(sec) || 0));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}m${s}s`;
+}
 
 /** One-screen bucket caps; mid-gap empty buckets count. */
 const VISIBLE_BUCKETS = { day: 14, week: 12, month: 12 };
@@ -50,6 +67,8 @@ function destroyStatsCharts() {
 
 function statsChartOptions(yMax, yTitle) {
   const narrow = isNarrowStatsViewport();
+  ensureStatsChartDefaults();
+  const tickFont = { size: narrow ? 10 : 11, family: STATS_FONT_FAMILY };
   return {
     responsive: true,
     maintainAspectRatio: false,
@@ -57,7 +76,7 @@ function statsChartOptions(yMax, yTitle) {
     plugins: {
       legend: {
         position: 'bottom',
-        labels: { boxWidth: 12, padding: 14, color: STATS_COLORS.muted, font: { size: 12 } },
+        labels: { boxWidth: 12, padding: 14, color: STATS_COLORS.muted, font: { size: 12, family: STATS_FONT_FAMILY } },
       },
       tooltip: { callbacks: {} },
     },
@@ -69,15 +88,15 @@ function statsChartOptions(yMax, yTitle) {
           maxRotation: narrow ? 45 : 0,
           minRotation: narrow ? 30 : 0,
           autoSkip: true,
-          font: { size: narrow ? 10 : 11 },
+          font: tickFont,
         },
       },
       y: {
         beginAtZero: true,
         max: yMax,
-        title: yTitle ? { display: true, text: yTitle, color: STATS_COLORS.muted } : undefined,
+        title: yTitle ? { display: true, text: yTitle, color: STATS_COLORS.muted, font: { size: 12, family: STATS_FONT_FAMILY } } : undefined,
         grid: { color: STATS_COLORS.grid },
-        ticks: { color: STATS_COLORS.muted, font: { size: 11 } },
+        ticks: { color: STATS_COLORS.muted, font: { size: 11, family: STATS_FONT_FAMILY } },
       },
     },
   };
@@ -229,14 +248,14 @@ async function renderLearningStats(panel) {
         <div class="stats-chart-wrap tall" id="learning-wrap"><canvas id="chart-learning" aria-label="学习情况图"></canvas></div>
       </div>
       <div class="stats-today-grid" aria-label="今日汇总">
-        <div><strong>${t.mastered || 0}</strong><span>今日熟知</span></div>
         <div><strong>${t.known || 0}</strong><span>今日认识</span></div>
         <div><strong>${t.fuzzy || 0}</strong><span>今日模糊</span></div>
         <div><strong>${t.forgotten || 0}</strong><span>今日忘记</span></div>
         <div><strong>${t.dueTotal || 0}</strong><span>今日待学</span></div>
-        <div><strong>${t.durationSec || 0}s</strong><span>今日时长</span></div>
+        <div><strong>${formatDurationSec(t.durationSec || 0)}</strong><span>今日时长</span></div>
       </div>
       ${data.pressureHint ? `<button type="button" class="stats-pressure" data-action="stats-go-review">${esc(data.pressureMessage || '待复习句子较多，可分散复习减轻压力')}</button>` : ''}
+      ${mode === 'cognitive' ? `<p class="status-note stats-grade-hint">认识：本场第一次就拼对。<br>模糊：本场曾拼错过再拼对。<br>忘记：本场最终仍未拼对。</p>` : ''}
     </div>`;
 
   const labels = series.map(s => s.label);
@@ -248,7 +267,6 @@ async function renderLearningStats(panel) {
     ];
   } else {
     datasets = [
-      { label: '熟知', data: series.map(s => s.mastered), backgroundColor: STATS_COLORS.mastered, stack: 'a' },
       { label: '认识', data: series.map(s => s.known), backgroundColor: STATS_COLORS.known, stack: 'a' },
       { label: '模糊', data: series.map(s => s.fuzzy), backgroundColor: STATS_COLORS.fuzzy, stack: 'a' },
       { label: '忘记', data: series.map(s => s.forgotten), backgroundColor: STATS_COLORS.forgotten, stack: 'a' },

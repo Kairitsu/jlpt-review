@@ -183,6 +183,17 @@ def init_db():
         _backfill_review_events(db)
         # Purge history left by older ON DELETE SET NULL behavior (hard-delete is now app policy).
         _purge_orphaned_sentence_history(db)
+        _migrate_mastered_to_known(db)
+
+
+def _migrate_mastered_to_known(db):
+    """One-shot: fold legacy mastered grades into known (new taxonomy).
+
+    Old "熟知" + "认识" both map to "认识". CHECK still allows 'mastered' so we
+    avoid rebuilding the table; new code never writes mastered.
+    """
+    db.execute("UPDATE review_events SET result='known' WHERE result='mastered'")
+    db.execute("UPDATE attempts SET grade='known' WHERE grade='mastered'")
 
 
 def _purge_orphaned_sentence_history(db):

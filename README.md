@@ -1,6 +1,6 @@
 # JLPT AI Tutor / Japanese Sentence Review
 
-面向中文母语者的**日语句子背诵与间隔复习** Web 应用。
+面向中文母语者的**日语句子重组与间隔复习** Web 应用。
 
 用中文提示回忆日语原句，通过拖拽词块还原语序；本机 **SudachiPy（full 词典）** 完成多粒度分词与词块合并，无需外接 LLM。数据默认保存在本机 SQLite。
 

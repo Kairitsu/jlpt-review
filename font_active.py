@@ -42,10 +42,14 @@ WEIGHT_CSS = {400: "100 500", 700: "600 900"}
 
 # Extra UI / system strings that may not appear in static files as CJK.
 EXTRA_UI_TEXT = (
-    "背句子今天也来背一句待复习今日学习开始背句子开始复习选择本轮复习"
+    "句子重组待复习今日学习开始句子重组开始复习选择本轮复习"
     "句集详情题库报告设置欢迎回来登录用户名密码添加句子编辑句子自动分块"
     "保存正确答案回答正确跳过练习重置核对答案下一题重新练习本题"
     "练习历史本轮练习报告正确错误跳过正确率访问认证使用说明"
+    # Stats page (also scanned from stats.js; kept as fallback for deploy races).
+    "认识模糊忘记本场第一次就拼对曾拼错过最终仍未拼对"
+    "认知情况复习新学记忆持久度今日汇总今日认识今日模糊今日忘记今日待学今日时长"
+    "遗忘曲线学习情况周月日待学时长句子数已加入记忆规划"
 )
 
 _state_lock = threading.Lock()
@@ -66,7 +70,8 @@ def sources_available() -> bool:
 
 def ui_charset() -> set[str]:
     chars: set[str] = set(EXTRA_UI_TEXT)
-    for path in (STATIC_DIR / "index.html", STATIC_DIR / "app.js"):
+    for name in ("index.html", "app.js", "stats.js"):
+        path = STATIC_DIR / name
         if not path.is_file():
             continue
         try:

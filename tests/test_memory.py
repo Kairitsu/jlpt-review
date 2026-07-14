@@ -2,7 +2,6 @@
 import math
 
 from memory import (
-    FAST_MS,
     FIXED_INTERVALS,
     INITIAL_S,
     S_REF,
@@ -24,23 +23,26 @@ def test_grade_mapping_rules():
     assert grade_attempt("skipped") == "skipped"
     assert grade_attempt("wrong") == "forgotten"
     assert grade_attempt("correct", attempt_n=2) == "fuzzy"
-    assert grade_attempt("correct", attempt_n=1, duration_ms=5_000) == "mastered"
-    assert grade_attempt("correct", attempt_n=1, duration_ms=FAST_MS) == "mastered"
-    assert grade_attempt("correct", attempt_n=1, duration_ms=FAST_MS + 1) == "known"
+    # First correct is known regardless of duration
+    assert grade_attempt("correct", attempt_n=1, duration_ms=5_000) == "known"
+    assert grade_attempt("correct", attempt_n=1, duration_ms=15_000) == "known"
+    assert grade_attempt("correct", attempt_n=1, duration_ms=20_000) == "known"
     assert grade_attempt("correct", attempt_n=1, duration_ms=0) == "known"
+    # retry_wrong sessions force fuzzy on first correct
+    assert grade_attempt("correct", attempt_n=1, duration_ms=1_000, force_fuzzy=True) == "fuzzy"
+    assert grade_attempt("wrong", force_fuzzy=True) == "forgotten"
 
 
 def test_stability_updates_and_clamp():
     s0 = INITIAL_S
-    s_mastered = update_stability(s0, "mastered")
     s_known = update_stability(s0, "known")
     s_fuzzy = update_stability(s0, "fuzzy")
     s_forgot = update_stability(10.0, "forgotten")
-    assert s_mastered > s_known > s_fuzzy > s0
+    assert s_known > s_fuzzy > s0
     assert s_forgot == INITIAL_S
     assert update_stability(s0, "skipped") == s0
     # clamp upper
-    assert update_stability(300.0, "mastered") <= 365.0
+    assert update_stability(300.0, "known") <= 365.0
 
 
 def test_interval_and_retention_math():

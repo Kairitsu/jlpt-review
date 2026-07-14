@@ -122,6 +122,7 @@ def apply_attempt_stats(
     session_id=None,
     attempt_n=1,
     duration_ms=0,
+    force_fuzzy=False,
 ):
     """Update sentence SRS fields and upsert a review_events row for this attempt."""
     base = base or stats_snapshot(row)
@@ -135,7 +136,9 @@ def apply_attempt_stats(
     stability_before = float(base.get("stability") if base.get("stability") is not None else INITIAL_S)
     is_new = 1 if int(base["study_count"] or 0) == 0 and status != "skipped" else 0
 
-    result = grade_attempt(status, attempt_n=attempt_n, duration_ms=duration_ms)
+    result = grade_attempt(
+        status, attempt_n=attempt_n, duration_ms=duration_ms, force_fuzzy=force_fuzzy,
+    )
     due = base["next_review_at"]
     interval = 0.0
     stability_after = stability_before
@@ -533,7 +536,8 @@ def create_app(test_config=None):
                 placeholders = ",".join("?" for _ in clean)
                 rows = db.execute(f"SELECT id FROM sentences WHERE id IN ({placeholders})", clean).fetchall()
                 selected = [row["id"] for row in rows]
-                source = "selected"
+                # retryWrong: report-page "练习本轮错题" — grade first correct as fuzzy
+                source = "retry_wrong" if body.get("retryWrong") else "selected"
             elif body.get("scope") == "collection" and body.get("collectionId"):
                 collection_id = int(body["collectionId"])
                 available = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection_id,)).fetchone()["n"]
@@ -600,12 +604,15 @@ def create_app(test_config=None):
                 return jsonify(error="练习或句子不存在"), 404
             item = sentence_dict(row)
             status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"], item["chunks"]) else "wrong")
+            force_fuzzy = practice["source"] == "retry_wrong"
             previous = db.execute("SELECT * FROM attempts WHERE session_id=? AND sentence_id=? ORDER BY id LIMIT 1", (session_id, sentence_id)).fetchone()
             if previous:
                 base = json_load(previous["stats_before_json"], None) or stats_snapshot(row)
                 prev = dict(previous)
                 attempt_n = int(prev.get("attempt_n") or 0) + 1
-                grade = grade_attempt(status, attempt_n=attempt_n, duration_ms=duration_ms)
+                grade = grade_attempt(
+                    status, attempt_n=attempt_n, duration_ms=duration_ms, force_fuzzy=force_fuzzy,
+                )
                 db.execute(
                     """UPDATE attempts SET status=?,answer_order_json=?,sentence_snapshot_json=?,created_at=?,
                        duration_ms=?,attempt_n=?,grade=? WHERE id=?""",
@@ -617,7 +624,9 @@ def create_app(test_config=None):
             else:
                 base = stats_snapshot(row)
                 attempt_n = 1
-                grade = grade_attempt(status, attempt_n=attempt_n, duration_ms=duration_ms)
+                grade = grade_attempt(
+                    status, attempt_n=attempt_n, duration_ms=duration_ms, force_fuzzy=force_fuzzy,
+                )
                 db.execute(
                     """INSERT INTO attempts(
                          session_id,sentence_id,status,answer_order_json,sentence_snapshot_json,
@@ -632,6 +641,7 @@ def create_app(test_config=None):
             grade = apply_attempt_stats(
                 db, row, sentence_id, status, stamp, base,
                 session_id=session_id, attempt_n=attempt_n, duration_ms=duration_ms,
+                force_fuzzy=force_fuzzy,
             )
         return jsonify(
             status=status,
@@ -841,7 +851,7 @@ def create_app(test_config=None):
             by_date.setdefault(d, []).append(ev)
 
         today = local_date()
-        today_counts = {"mastered": 0, "known": 0, "fuzzy": 0, "forgotten": 0, "skipped": 0}
+        today_counts = {"known": 0, "fuzzy": 0, "forgotten": 0, "skipped": 0}
         today_duration_ms = 0
         for ev in by_date.get(today, []):
             r = ev["result"]
@@ -851,7 +861,7 @@ def create_app(test_config=None):
 
         for label, start, end in buckets:
             counts = {
-                "mastered": 0, "known": 0, "fuzzy": 0, "forgotten": 0,
+                "known": 0, "fuzzy": 0, "forgotten": 0,
                 "new": 0, "review": 0,
             }
             d = start
@@ -870,8 +880,7 @@ def create_app(test_config=None):
 
         def _learning_bucket_has_data(item: dict) -> bool:
             return (
-                item.get("mastered", 0)
-                + item.get("known", 0)
+                item.get("known", 0)
                 + item.get("fuzzy", 0)
                 + item.get("forgotten", 0)
                 + item.get("new", 0)
@@ -885,7 +894,6 @@ def create_app(test_config=None):
             granularity=g,
             series=series,
             today={
-                "mastered": today_counts["mastered"],
                 "known": today_counts["known"],
                 "fuzzy": today_counts["fuzzy"],
                 "forgotten": today_counts["forgotten"],

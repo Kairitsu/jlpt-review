@@ -43,7 +43,7 @@ def test_dynamic_srs_updates_stability_and_due(tmp_path, monkeypatch):
     sentence = make_sentence(client, collection, "あ")
     practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
     endpoint = f'/api/practice/sessions/{practice["sessionId"]}/attempts'
-    # Fast first correct → mastered
+    # First correct → known (duration no longer affects grade)
     res = client.post(endpoint, json={
         "sentenceId": sentence["id"],
         "action": "check",
@@ -51,7 +51,7 @@ def test_dynamic_srs_updates_stability_and_due(tmp_path, monkeypatch):
         "durationMs": 3000,
     })
     assert res.status_code == 200
-    assert res.get_json()["grade"] == "mastered"
+    assert res.get_json()["grade"] == "known"
     refreshed = client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]
     assert refreshed["stability"] > 1.0
     assert refreshed["review_count"] == 1
@@ -63,7 +63,7 @@ def test_dynamic_srs_updates_stability_and_due(tmp_path, monkeypatch):
             (sentence["id"],),
         ).fetchall()
     assert len(events) == 1
-    assert events[0]["result"] == "mastered"
+    assert events[0]["result"] == "known"
 
 
 def test_retry_grades_as_fuzzy_and_upserts_event(tmp_path, monkeypatch):
@@ -123,8 +123,8 @@ def test_learning_stats_buckets_and_today(tmp_path, monkeypatch):
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with db.get_db() as connection:
         for sid, result, is_new, ms in [
-            (s1["id"], "mastered", 1, 5000),
-            (s1["id"], "known", 0, 8000),  # will be separate rows for historical
+            (s1["id"], "known", 1, 5000),
+            (s1["id"], "fuzzy", 0, 8000),  # will be separate rows for historical
             (s2["id"], "forgotten", 1, 12000),
         ]:
             connection.execute(
@@ -140,11 +140,13 @@ def test_learning_stats_buckets_and_today(tmp_path, monkeypatch):
     assert len(data["series"]) == 1
     assert data["series"][0]["label"] == "今天"
     today = data["today"]
-    assert today["mastered"] >= 1
+    assert "mastered" not in today
+    assert today["known"] >= 1
+    assert today["fuzzy"] >= 1
     assert today["forgotten"] >= 1
     assert today["durationSec"] >= 5
     assert "dueTotal" in today
-    assert data["series"][-1]["mastered"] >= 1
+    assert data["series"][-1]["known"] >= 1
 
 
 def test_learning_stats_trims_leading_keeps_mid_gap(tmp_path, monkeypatch):
@@ -176,7 +178,7 @@ def test_learning_stats_trims_leading_keeps_mid_gap(tmp_path, monkeypatch):
     assert len(mid) == 4
     for bucket in mid:
         activity = (
-            bucket["mastered"] + bucket["known"] + bucket["fuzzy"]
+            bucket["known"] + bucket["fuzzy"]
             + bucket["forgotten"] + bucket["new"] + bucket["review"]
         )
         assert activity == 0
@@ -244,7 +246,7 @@ def test_retention_stats_thresholds(tmp_path, monkeypatch):
                  sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
                  is_new, stability_before, stability_after, interval_days, created_at
                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (s["id"], None, stamp, "mastered", 1000, 1, 1, 1.0, 100.0, 10.0, stamp),
+            (s["id"], None, stamp, "known", 1000, 1, 1, 1.0, 100.0, 10.0, stamp),
         )
     data = client.get("/api/stats/retention?granularity=week").get_json()
     assert data["granularity"] == "week"
@@ -361,3 +363,132 @@ def test_migration_adds_columns_and_backfills(tmp_path, monkeypatch):
     with db.get_db() as connection:
         n2 = connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"]
     assert n1 == n2
+
+
+def test_retry_wrong_session_first_correct_is_fuzzy(tmp_path, monkeypatch):
+    """retryWrong sessions grade first correct as fuzzy (not known)."""
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "さ")
+    practice = client.post(
+        "/api/practice/sessions",
+        json={"sentenceIds": [sentence["id"]], "retryWrong": True},
+    ).get_json()
+    with db.get_db() as connection:
+        source = connection.execute(
+            "SELECT source FROM practice_sessions WHERE id=?",
+            (practice["sessionId"],),
+        ).fetchone()["source"]
+    assert source == "retry_wrong"
+    res = client.post(
+        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
+        json={
+            "sentenceId": sentence["id"],
+            "action": "check",
+            "answerOrder": sentence["correctOrder"],
+            "durationMs": 4000,
+        },
+    )
+    assert res.status_code == 200
+    assert res.get_json()["grade"] == "fuzzy"
+    with db.get_db() as connection:
+        row = connection.execute(
+            "SELECT result, attempt_n FROM review_events WHERE sentence_id=?",
+            (sentence["id"],),
+        ).fetchone()
+    assert row["result"] == "fuzzy"
+    assert row["attempt_n"] == 1
+
+
+def test_retry_wrong_e2e_after_failed_round(tmp_path, monkeypatch):
+    """Complete a round with wrongs → open retry_wrong session → correct → fuzzy."""
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "し")
+    practice1 = client.post(
+        "/api/practice/sessions", json={"sentenceIds": [sentence["id"]]},
+    ).get_json()
+    sid1 = practice1["sessionId"]
+    wrong = client.post(
+        f"/api/practice/sessions/{sid1}/attempts",
+        json={
+            "sentenceId": sentence["id"],
+            "action": "check",
+            "answerOrder": [],
+            "durationMs": 1000,
+        },
+    )
+    assert wrong.get_json()["status"] == "wrong"
+    assert wrong.get_json()["grade"] == "forgotten"
+    assert client.post(f"/api/practice/sessions/{sid1}/complete").status_code == 200
+
+    practice2 = client.post(
+        "/api/practice/sessions",
+        json={"sentenceIds": [sentence["id"]], "retryWrong": True},
+    ).get_json()
+    sid2 = practice2["sessionId"]
+    assert sid2 != sid1
+    final = client.post(
+        f"/api/practice/sessions/{sid2}/attempts",
+        json={
+            "sentenceId": sentence["id"],
+            "action": "check",
+            "answerOrder": sentence["correctOrder"],
+            "durationMs": 2000,
+        },
+    )
+    assert final.get_json()["grade"] == "fuzzy"
+    with db.get_db() as connection:
+        # Latest event for this sentence in the retry session is fuzzy
+        row = connection.execute(
+            """SELECT result FROM review_events
+               WHERE sentence_id=? AND session_id=? ORDER BY id DESC LIMIT 1""",
+            (sentence["id"], sid2),
+        ).fetchone()
+    assert row["result"] == "fuzzy"
+
+
+def test_migrate_mastered_to_known(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "す")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db.get_db() as connection:
+        connection.execute(
+            """INSERT INTO review_events(
+                 sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
+                 is_new, stability_before, stability_after, interval_days, created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (sentence["id"], None, stamp, "mastered", 1000, 1, 1, 1.0, 2.0, 1.0, stamp),
+        )
+        practice = connection.execute(
+            "INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at) VALUES(?,?,?,?)",
+            ("selected", json.dumps([sentence["id"]]), 1, stamp),
+        )
+        session_id = practice.lastrowid
+        connection.execute(
+            """INSERT INTO attempts(
+                 session_id,sentence_id,status,answer_order_json,sentence_snapshot_json,
+                 stats_before_json,duration_ms,attempt_n,grade,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                session_id, sentence["id"], "correct", "[]", "{}",
+                "{}", 1000, 1, "mastered", stamp,
+            ),
+        )
+    db.init_db()
+    with db.get_db() as connection:
+        ev = connection.execute(
+            "SELECT result FROM review_events WHERE sentence_id=?",
+            (sentence["id"],),
+        ).fetchone()
+        att = connection.execute(
+            "SELECT grade FROM attempts WHERE sentence_id=?",
+            (sentence["id"],),
+        ).fetchone()
+        leftover = connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE result='mastered'"
+        ).fetchone()["n"]
+    assert ev["result"] == "known"
+    assert att["grade"] == "known"
+    assert leftover == 0

@@ -1,12 +1,13 @@
 """Exponential forgetting model and grade mapping for sentence review.
 
-Grade mapping from practice outcomes (documented for stats UI 熟知/认识/模糊/忘记):
+Grade mapping from practice outcomes (documented for stats UI 认识/模糊/忘记):
 
   - skipped  → skipped     (不计入认知堆叠 / 遗忘拟合)
-  - wrong    → forgotten   (忘记)
-  - correct & attempt_n > 1 → fuzzy     (模糊：多次尝试后对)
-  - correct & attempt_n == 1 & duration_ms ≤ FAST_MS → mastered  (熟知)
-  - correct & attempt_n == 1 & slower / no duration → known     (认识)
+  - wrong    → forgotten   (忘记：本 session 最终仍未拼对)
+  - correct & (force_fuzzy or attempt_n > 1) → fuzzy  (模糊：曾拼错过再对，或错题重练拼对)
+  - correct & attempt_n == 1 → known   (认识：本场第一次就拼对；不看用时)
+
+duration_ms is still recorded for stats (e.g. 今日时长) but does not affect grade.
 
 Memory model: R(t) = exp(-t / S)
 Next interval: t = -S * ln(TARGET_R)  so review lands near the target retention.
@@ -21,7 +22,6 @@ TARGET_R = 0.90
 INITIAL_S = 1.0
 MIN_S = 0.3
 MAX_S = 365.0
-FAST_MS = 15_000
 FIXED_INTERVALS = [1, 3, 7, 14, 30]
 DEFAULT_SCHEDULER_MODE = "dynamic"
 MIN_CURVE_SAMPLES = 3
@@ -34,15 +34,14 @@ HOLD_THRESHOLDS = (10, 30, 60, 90)
 DUE_PRESSURE_THRESHOLD = 30
 
 RESULT_LABELS = {
-    "mastered": "熟知",
     "known": "认识",
     "fuzzy": "模糊",
     "forgotten": "忘记",
     "skipped": "跳过",
 }
 
-SUCCESS_RESULTS = frozenset({"mastered", "known", "fuzzy"})
-COGNITIVE_RESULTS = frozenset({"mastered", "known", "fuzzy", "forgotten"})
+SUCCESS_RESULTS = frozenset({"known", "fuzzy"})
+COGNITIVE_RESULTS = frozenset({"known", "fuzzy", "forgotten"})
 
 
 def clamp_stability(s: float) -> float:
@@ -71,8 +70,6 @@ def hold_days(stability: float, target_r: float = TARGET_R) -> float:
 def update_stability(stability: float, result: str) -> float:
     """Update S after a graded review. skipped leaves S unchanged (caller should skip)."""
     s = clamp_stability(stability if stability is not None else INITIAL_S)
-    if result == "mastered":
-        return clamp_stability(s * 2.5 + 0.5)
     if result == "known":
         return clamp_stability(s * 2.0)
     if result == "fuzzy":
@@ -84,11 +81,22 @@ def update_stability(stability: float, result: str) -> float:
     raise ValueError(f"unknown result: {result}")
 
 
-def grade_attempt(status: str, attempt_n: int = 1, duration_ms: int = 0) -> str:
+def grade_attempt(
+    status: str,
+    attempt_n: int = 1,
+    duration_ms: int = 0,
+    force_fuzzy: bool = False,
+) -> str:
     """Map status + attempt metadata to a cognitive grade.
+
+    duration_ms is accepted for call-site compatibility / stats recording but
+    does not affect the grade. force_fuzzy is set for retry_wrong sessions so
+    a first correct in that new session still counts as fuzzy.
 
     See module docstring for the full mapping table.
     """
+    # duration_ms intentionally unused for classification (still recorded for stats)
+    _ = duration_ms
     status = (status or "").lower()
     if status == "skipped":
         return "skipped"
@@ -96,12 +104,8 @@ def grade_attempt(status: str, attempt_n: int = 1, duration_ms: int = 0) -> str:
         return "forgotten"
     if status != "correct":
         raise ValueError(f"unknown status: {status}")
-    n = max(1, int(attempt_n or 1))
-    if n > 1:
+    if force_fuzzy or max(1, int(attempt_n or 1)) > 1:
         return "fuzzy"
-    ms = int(duration_ms or 0)
-    if ms > 0 and ms <= FAST_MS:
-        return "mastered"
     return "known"
 
 
