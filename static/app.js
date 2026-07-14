@@ -124,7 +124,17 @@ async function startPractice(payload) {
 }
 function shuffle(items) { const result = [...items]; for (let i = result.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [result[i], result[j]] = [result[j], result[i]]; } return result; }
 function prepareQuestion() { const p = state.practice, s = p.sentences[p.index]; p.selected = []; p.checked = false; p.result = null; p.submitting = false; p.candidates = shuffle(s.chunks.map(c => c.id)); }
-function selectionHtml(s, p, map) { return p.selected.length ? `<div class="chosen-list">${p.selected.map((id, i) => `<button class="chosen ${p.checked ? (id === s.correctOrder[i] ? 'good' : 'bad') : ''}" data-action="unchoose" data-index="${i}" ${p.checked ? 'disabled' : ''}>${esc(map[id]?.text || '')}</button>`).join('')}</div>` : `<div class="placeholder">看中文翻译，点击下方词块，组成句子</div>`; }
+function selectionHtml(s, p, map) {
+  // Grade by chunk text so duplicate surfaces (e.g. two 「し」) match regardless of which id instance was used.
+  const correctTexts = (s.correctOrder || []).map(id => map[id]?.text || '');
+  return p.selected.length
+    ? `<div class="chosen-list">${p.selected.map((id, i) => {
+        const text = map[id]?.text || '';
+        const cls = p.checked ? (text === correctTexts[i] ? 'good' : 'bad') : '';
+        return `<button class="chosen ${cls}" data-action="unchoose" data-index="${i}" ${p.checked ? 'disabled' : ''}>${esc(text)}</button>`;
+      }).join('')}</div>`
+    : `<div class="placeholder">看中文翻译，点击下方词块，组成句子</div>`;
+}
 function practiceReadyToCheck(p = state.practice) { return Boolean(p) && !p.checked && !p.submitting && p.selected.length === p.candidates.length; }
 function updatePracticeSelection() {
   const p = state.practice, s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));

@@ -81,6 +81,16 @@ def test_login_rate_limit_is_sqlite_backed(tmp_path, monkeypatch):
     assert locked.status_code == 429
 
 
+# b 与 d 文字都为「に」，id 不同；按 text 判对时对调 id 仍应正确。
+_MATCH_CHUNKS = [
+    {"id": "a", "text": "私"},
+    {"id": "b", "text": "に"},
+    {"id": "c", "text": "は"},
+    {"id": "d", "text": "に"},
+]
+_MATCH_CORRECT = ["a", "b", "c", "d"]
+
+
 @pytest.mark.parametrize(
     "answer,expected",
     [
@@ -88,15 +98,14 @@ def test_login_rate_limit_is_sqlite_backed(tmp_path, monkeypatch):
         (["a", "b"], False),                   # 只答开头部分
         (["a", "b", "c"], False),            # 少一个词块
         (["a", "b", "c", "d", "extra"], False),  # 多一个词块
-        (["a", "c", "b", "d"], False),     # 顺序错误
-        (["a", "d", "c", "b"], False),     # 相同文字词块 ID 对调
+        (["a", "c", "b", "d"], False),     # 真正顺序错误（「に」与「は」对调）
+        (["a", "d", "c", "b"], True),      # 相同文字词块 ID 对调 → 按 text 仍正确
         (["a", "b", "c", "d"], True),      # 完整正确答案
     ],
 )
 def test_strict_answer_matching(answer, expected):
     from app import answers_match
-    # b 与 d 可代表两个文字都为“に”、但位置和唯一 ID 不同的词块。
-    assert answers_match(answer, ["a", "b", "c", "d"]) is expected
+    assert answers_match(answer, _MATCH_CORRECT, _MATCH_CHUNKS) is expected
 
 
 def test_retry_current_replaces_attempt_and_final_result(tmp_path, monkeypatch):
@@ -121,6 +130,45 @@ def test_retry_current_replaces_attempt_and_final_result(tmp_path, monkeypatch):
     report = client.get(f'/api/reports/{practice["sessionId"]}').get_json()["report"]
     assert report["correct"] == 1 and report["wrong"] == 0
     assert len(report["items"]) == 1 and report["items"][0]["status"] == "correct"
+
+
+def test_duplicate_chunk_text_matching_via_record_attempt(tmp_path, monkeypatch):
+    """Same-surface chunks with different ids: swapped instances still grade correct."""
+    client = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    chunks = [
+        {"id": "first-ni", "text": "に", "kana": ""},
+        {"id": "middle", "text": "猫", "kana": ""},
+        {"id": "second-ni", "text": "に", "kana": ""},
+    ]
+    sentence = client.post("/api/sentences", json={
+        "collectionId": collection,
+        "chinese": "给猫",
+        "japanese": "に猫に",
+        "chunks": chunks,
+        "correctOrder": [x["id"] for x in chunks],
+    }).get_json()["sentence"]
+    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
+    endpoint = f'/api/practice/sessions/{practice["sessionId"]}/attempts'
+
+    # Id instances of the two 「に」 swapped; text sequence still に猫に.
+    swapped = client.post(endpoint, json={
+        "sentenceId": sentence["id"],
+        "action": "check",
+        "answerOrder": ["second-ni", "middle", "first-ni"],
+    })
+    body = swapped.get_json()
+    assert swapped.status_code == 200
+    assert body["status"] == "correct"
+    assert body["correct"] is True
+
+    # Real order error must still fail.
+    wrong = client.post(endpoint, json={
+        "sentenceId": sentence["id"],
+        "action": "check",
+        "answerOrder": ["middle", "first-ni", "second-ni"],
+    })
+    assert wrong.get_json()["status"] == "wrong"
 
 
 def test_collection_count_is_clamped_and_random_scope_uses_all_sentences(tmp_path, monkeypatch):
