@@ -382,16 +382,24 @@ def create_app(test_config=None):
 
     @app.delete("/api/collections/<int:collection_id>")
     def delete_collection(collection_id):
+        cascade = str(request.args.get("cascade", "")).lower() in ("1", "true", "yes")
         with get_db() as db:
-            count = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection_id,)).fetchone()["n"]
-            if count:
-                return jsonify(error="请先移动或删除句集中的句子"), 409
+            exists = db.execute("SELECT id FROM collections WHERE id=?", (collection_id,)).fetchone()
+            if not exists:
+                return jsonify(error="句集不存在"), 404
             if db.execute("SELECT COUNT(*) n FROM collections").fetchone()["n"] <= 1:
                 return jsonify(error="至少保留一个句集"), 409
-            changed = db.execute("DELETE FROM collections WHERE id=?", (collection_id,)).rowcount
-        if changed:
-            schedule_font_rebuild()
-        return (jsonify(ok=True) if changed else (jsonify(error="句集不存在"), 404))
+            ids = [row["id"] for row in db.execute("SELECT id FROM sentences WHERE collection_id=?", (collection_id,)).fetchall()]
+            if ids and not cascade:
+                return jsonify(error="请先移动或删除句集中的句子"), 409
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                db.execute(f"DELETE FROM review_events WHERE sentence_id IN ({placeholders})", ids)
+                db.execute(f"DELETE FROM attempts WHERE sentence_id IN ({placeholders})", ids)
+                db.execute(f"DELETE FROM sentences WHERE id IN ({placeholders})", ids)
+            db.execute("DELETE FROM collections WHERE id=?", (collection_id,))
+        schedule_font_rebuild()
+        return jsonify(ok=True)
 
     @app.post("/api/sentences/organize")
     def organize():
@@ -477,6 +485,29 @@ def create_app(test_config=None):
         if changed:
             schedule_font_rebuild()
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
+
+    @app.post("/api/sentences/move")
+    def move_sentences():
+        body = request.get_json(silent=True) or {}
+        raw_ids = body.get("sentenceIds")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return jsonify(error="请选择要转移的句子"), 400
+        try:
+            sentence_ids = [int(value) for value in raw_ids]
+            target_id = int(body.get("targetCollectionId"))
+        except (ValueError, TypeError):
+            return jsonify(error="参数无效"), 400
+        with get_db() as db:
+            if not db.execute("SELECT id FROM collections WHERE id=?", (target_id,)).fetchone():
+                return jsonify(error="目标句集不存在"), 404
+            placeholders = ",".join("?" for _ in sentence_ids)
+            moved = db.execute(
+                f"UPDATE sentences SET collection_id=?,updated_at=? WHERE id IN ({placeholders})",
+                [target_id, now_iso(), *sentence_ids],
+            ).rowcount
+        if moved:
+            schedule_font_rebuild()
+        return jsonify(ok=True, moved=moved)
 
     @app.delete("/api/sentences/<int:sentence_id>")
     def delete_sentence(sentence_id):

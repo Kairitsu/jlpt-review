@@ -125,9 +125,6 @@ function renderStatsShell() {
       <div class="stats-tabs" role="tablist" aria-label="统计子页">
         ${tabs.map(t => `<button type="button" role="tab" class="stats-tab ${statsState.tab === t.id ? 'active' : ''}" data-action="stats-tab" data-tab="${t.id}" aria-selected="${statsState.tab === t.id}">${t.label}</button>`).join('')}
       </div>
-      <button type="button" class="icon-button stats-share" data-action="stats-share" aria-label="分享或导出（即将推出）" title="分享/导出">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v7a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-7"/><path d="M12 3v12"/><path d="m8 7 4-4 4 4"/></svg>
-      </button>
     </div>
     <div id="stats-panel" class="stats-panel"></div>
   </section>`;
@@ -350,10 +347,6 @@ function handleStatsAction(action, button) {
   if (action === 'stats-tab') {
     statsState.tab = button.dataset.tab || 'curve';
     return renderStats();
-  }
-  if (action === 'stats-share') {
-    toast('分享/导出功能即将推出');
-    return Promise.resolve();
   }
   if (action === 'stats-learning-mode') {
     statsState.learningMode = button.dataset.mode || 'cognitive';

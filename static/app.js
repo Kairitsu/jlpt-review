@@ -26,6 +26,29 @@ async function api(url, options = {}) {
 }
 function showLogin() { $('#login-modal').classList.remove('hidden'); }
 function hideLogin() { $('#login-modal').classList.add('hidden'); }
+function openDialog(html) { const el = $('#dialog'); el.innerHTML = `<div class="modal">${html}</div>`; el.classList.remove('hidden'); }
+function closeDialog() { const el = $('#dialog'); el.classList.add('hidden'); el.innerHTML = ''; }
+function updateMoveSelectedBtn() { const btn = $('#move-selected-btn'); if (btn) btn.disabled = !$$('.sentence-check:checked').length; }
+function openManageCollectionDialog() {
+  const current = state.dashboard.collections.find(c => c.id === state.activeCollection);
+  if (!current) return;
+  const onlyOne = state.dashboard.collections.length <= 1;
+  const n = current.total || 0;
+  openDialog(`<h1>管理句集</h1><p>${esc(current.name)} · 共 ${n} 句</p><label>重命名<input id="rename-collection-name" value="${esc(current.name)}"></label><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="rename-collection">保存名称</button></div><div style="margin-top:22px;padding-top:18px;border-top:1px solid var(--border)"><p class="status-note" style="text-align:left;margin:0 0 12px">删除前可用「转移选中句子」把有用的句子移到别处。</p>${onlyOne ? '<p class="status-note" style="text-align:left;margin:0 0 12px">至少保留一个句集，无法删除。</p>' : ''}<div class="form-actions"><button class="btn danger" data-action="delete-collection-ask" ${onlyOne ? 'disabled' : ''}>删除句集</button></div></div>`);
+}
+function openDeleteCollectionConfirm() {
+  const current = state.dashboard.collections.find(c => c.id === state.activeCollection);
+  if (!current) return;
+  const n = current.total || 0;
+  openDialog(`<h1>确认删除</h1><p style="text-align:left">删除句集会同时删除其中的全部 ${n} 句句子，以及这些句子的练习记录和记忆数据（正确/错误次数、连续答对、下次复习时间等复习历史），且不可恢复。</p><p class="status-note" style="text-align:left;margin-top:12px">可以先用批量转移把有用的句子移到别处。</p><div class="form-actions"><button class="btn outline" data-action="manage-collection">返回</button><button class="btn danger" data-action="delete-collection-confirm">确定删除</button></div>`);
+}
+function openMoveSentencesDialog(ids) {
+  const options = (state.dashboard?.collections || []).filter(c => c.id !== state.activeCollection)
+    .map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+  if (!options) { toast('没有可转移的目标句集', true); return; }
+  openDialog(`<h1>转移句子</h1><p>将选中的 ${ids.length} 句转移到目标句集。</p><label>目标句集<select id="move-target-collection">${options}</select></label><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-move-sentences">确认转移</button></div>`);
+  $('#dialog').dataset.moveIds = ids.join(',');
+}
 
 const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats']);
 function setChrome(practice = false) {
@@ -123,10 +146,10 @@ function renderPreview() {
 async function renderLibrary(collectionId = state.activeCollection) {
   await ensureDashboard(); state.activeCollection = Number(collectionId) || state.activeCollection; localStorage.setItem('activeCollection', state.activeCollection);
   const data = await api(`/api/sentences?collectionId=${state.activeCollection}`); const total = data.sentences.length;
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>句集详情</h1><p>筛选、查找，或勾选句子开始专项练习。</p></div><button class="btn primary" data-route="add">＋ 添加句子</button></div><div class="card practice-picker"><div><h2>开始练习</h2><p>从本句集中随机抽取题目。</p></div><div class="count-options" role="group" aria-label="本轮题目数量">${[5,10,20].map(n => `<button class="count-option" data-action="set-count" data-count="${n}">${n} 句</button>`).join('')}<button class="count-option active" data-action="set-count" data-count="all">全部</button><label class="custom-count">自定义<input id="custom-count" type="number" min="1" max="${Math.max(total, 1)}" placeholder="1-${total}"></label><button class="btn primary" data-action="start-collection" ${!total ? 'disabled' : ''}>开始练习</button></div><p id="count-hint" class="status-note">本句集共 ${total} 句。</p></div><div class="toolbar"><select id="library-collection">${collectionOptions(state.activeCollection)}</select><input id="library-search" type="search" placeholder="搜索中文或日语"><select id="library-sort"><option value="created">按创建时间</option><option value="error">按错误率</option><option value="recent">按最近练习</option></select></div><div class="section-title"><h2>共 <span id="library-count">${total}</span> 条</h2><div><button class="btn outline" data-action="manage-collection">管理句集</button> <button class="btn primary" data-action="practice-selected">专项练习</button></div></div><div id="library-list" class="card library-list"></div></section>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>句集详情</h1><p>筛选、查找，或勾选句子开始专项练习。</p></div><button class="btn primary" data-route="add">＋ 添加句子</button></div><div class="card practice-picker"><div><h2>开始练习</h2><p>从本句集中随机抽取题目。</p></div><div class="count-options" role="group" aria-label="本轮题目数量">${[5,10,20].map(n => `<button class="count-option" data-action="set-count" data-count="${n}">${n} 句</button>`).join('')}<button class="count-option active" data-action="set-count" data-count="all">全部</button><label class="custom-count">自定义<input id="custom-count" type="number" min="1" max="${Math.max(total, 1)}" placeholder="1-${total}"></label><button class="btn primary" data-action="start-collection" ${!total ? 'disabled' : ''}>开始练习</button></div><p id="count-hint" class="status-note">本句集共 ${total} 句。</p></div><div class="toolbar"><select id="library-collection">${collectionOptions(state.activeCollection)}</select><input id="library-search" type="search" placeholder="搜索中文或日语"><select id="library-sort"><option value="created">按创建时间</option><option value="error">按错误率</option><option value="recent">按最近练习</option></select></div><div class="section-title"><h2>共 <span id="library-count">${total}</span> 条</h2><div><button class="btn outline" data-action="manage-collection">管理句集</button> <button class="btn outline" data-action="move-selected" id="move-selected-btn" disabled>转移选中句子</button> <button class="btn primary" data-action="practice-selected">专项练习</button></div></div><div id="library-list" class="card library-list"></div></section>`;
   renderLibraryRows(data.sentences); setChrome();
 }
-function renderLibraryRows(items) { const list = $('#library-list'); $('#library-count').textContent = items.length; list.innerHTML = items.length ? items.map(s => `<div class="library-row"><input type="checkbox" class="sentence-check" value="${s.id}" aria-label="选择句子"><div><div class="library-jp" lang="ja">${esc(s.japanese)}</div><div>${esc(s.chinese)}</div><div class="row-stats"><span>练习 ${s.study_count}</span><span>正确 ${s.correct_count}</span><span>错误 ${s.wrong_count}</span><span>连续 ${s.correct_streak}</span><span>下次 ${formatDate(s.next_review_at)}</span></div></div><div class="row-actions"><button class="small-btn" data-action="edit-sentence" data-id="${s.id}">编辑</button><button class="small-btn" data-action="delete-sentence" data-id="${s.id}">删除</button></div></div>`).join('') : `<div class="empty">这个句集还没有句子，先添加第一句吧。</div>`; }
+function renderLibraryRows(items) { const list = $('#library-list'); $('#library-count').textContent = items.length; list.innerHTML = items.length ? items.map(s => `<div class="library-row"><input type="checkbox" class="sentence-check" value="${s.id}" aria-label="选择句子"><div><div class="library-jp" lang="ja">${esc(s.japanese)}</div><div>${esc(s.chinese)}</div><div class="row-stats"><span>练习 ${s.study_count}</span><span>正确 ${s.correct_count}</span><span>错误 ${s.wrong_count}</span><span>连续 ${s.correct_streak}</span><span>下次 ${formatDate(s.next_review_at)}</span></div></div><div class="row-actions"><button class="small-btn" data-action="edit-sentence" data-id="${s.id}">编辑</button><button class="small-btn" data-action="delete-sentence" data-id="${s.id}">删除</button></div></div>`).join('') : `<div class="empty">这个句集还没有句子，先添加第一句吧。</div>`; updateMoveSelectedBtn(); }
 async function reloadLibrary() { const query = new URLSearchParams({collectionId:$('#library-collection').value, search:$('#library-search').value, sort:$('#library-sort').value}); renderLibraryRows((await api('/api/sentences?' + query)).sentences); }
 
 async function startPractice(payload) {
@@ -200,6 +223,7 @@ async function renderSettings() {
 }
 
 document.addEventListener('click', async event => {
+  if (event.target.id === 'dialog') { closeDialog(); return; }
   const button = event.target.closest('button'); if (!button) return;
   if (button.dataset.route) { if (button.dataset.route === state.route) return; state.editing = null; route(button.dataset.route); return; }
   const action = button.dataset.action;
@@ -222,7 +246,13 @@ document.addEventListener('click', async event => {
     else if (action === 'practice-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await startPractice({sentenceIds:ids}); }
     else if (action === 'edit-sentence') { state.editing = (await api(`/api/sentences/${button.dataset.id}`)).sentence; route('add', {editingId:state.editing.id}); }
     else if (action === 'delete-sentence') { if (confirm('确定删除这条句子吗？')) { await api(`/api/sentences/${button.dataset.id}`, {method:'DELETE'}); reloadLibrary(); } }
-    else if (action === 'manage-collection') { const current = state.dashboard.collections.find(c => c.id === state.activeCollection), choice = prompt('输入“重命名”或“删除”：', '重命名'); if (choice === '重命名') { const name = prompt('新名称：', current.name); if (name) { await api(`/api/collections/${current.id}`, {method:'PATCH', body:JSON.stringify({name})}); state.dashboard = null; await renderLibrary(current.id); } } if (choice === '删除' && confirm(`确定删除空句集“${current.name}”吗？`)) { await api(`/api/collections/${current.id}`, {method:'DELETE'}); state.dashboard = null; await renderLibrary(); } }
+    else if (action === 'close-dialog') closeDialog();
+    else if (action === 'manage-collection') { await ensureDashboard(); openManageCollectionDialog(); }
+    else if (action === 'rename-collection') { const name = $('#rename-collection-name')?.value.trim(); if (!name) throw new Error('句集名称不能为空'); const id = state.activeCollection; await api(`/api/collections/${id}`, {method:'PATCH', body:JSON.stringify({name})}); state.dashboard = null; closeDialog(); toast('句集已重命名'); await renderLibrary(id); }
+    else if (action === 'delete-collection-ask') openDeleteCollectionConfirm();
+    else if (action === 'delete-collection-confirm') { const id = state.activeCollection; await api(`/api/collections/${id}?cascade=1`, {method:'DELETE'}); state.dashboard = null; closeDialog(); toast('句集已删除'); await renderLibrary(); }
+    else if (action === 'move-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await ensureDashboard(); openMoveSentencesDialog(ids); }
+    else if (action === 'confirm-move-sentences') { const ids = ($('#dialog').dataset.moveIds || '').split(',').filter(Boolean).map(Number); const targetCollectionId = Number($('#move-target-collection')?.value); if (!ids.length) throw new Error('请至少勾选一条句子'); if (!targetCollectionId) throw new Error('请选择目标句集'); const result = await api('/api/sentences/move', {method:'POST', body:JSON.stringify({sentenceIds:ids, targetCollectionId})}); state.dashboard = null; closeDialog(); toast(`已转移 ${result.moved} 句`); await renderLibrary(state.activeCollection); }
     else if (action === 'choose') { const p = state.practice, id = button.dataset.id; if (!p || p.checked || p.submitting || !p.candidates.includes(id) || p.selected.includes(id) || p.selected.length >= p.candidates.length) return; p.selected.push(id); updatePracticeSelection(); }
     else if (action === 'unchoose') { const p = state.practice, index = Number(button.dataset.index); if (!p || p.checked || p.submitting || !Number.isInteger(index) || index < 0 || index >= p.selected.length) return; p.selected.splice(index, 1); updatePracticeSelection(); }
     else if (action === 'reset') { const p = state.practice; if (!p || p.checked || p.submitting) return; p.selected = []; updatePracticeSelection(); }
@@ -243,6 +273,7 @@ document.addEventListener('click', async event => {
 });
 
 document.addEventListener('change', event => {
+  if (event.target.classList.contains('sentence-check')) { updateMoveSelectedBtn(); return; }
   if (event.target.id === 'home-collection' || event.target.id === 'due-collection') { setActiveCollection(event.target.value); if (event.target.id === 'due-collection') state.homeDuePicker = true; renderHome().catch(error => toast(error.message, true)); return; }
   if (event.target.id === 'library-collection') { state.activeCollection = Number(event.target.value); localStorage.setItem('activeCollection', state.activeCollection); route('library', {collectionId:state.activeCollection, replace:true}); }
   if (event.target.id === 'library-sort') reloadLibrary();

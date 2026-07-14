@@ -270,3 +270,108 @@ def test_migration_removes_only_legacy_remote_settings_and_keeps_saved_chunks(tm
         assert connection.execute("SELECT key FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')").fetchall() == []
         stored = json.loads(connection.execute("SELECT chunks_json FROM sentences WHERE id=?", (sentence_id,)).fetchone()[0])
     assert stored == saved_chunks
+
+
+def _make_sentence(client, collection, chinese, japanese):
+    chunks = client.post("/api/sentences/organize", json={"chinese": chinese, "japanese": japanese}).get_json()["chunks"]
+    created = client.post("/api/sentences", json={
+        "collectionId": collection,
+        "chinese": chinese,
+        "japanese": japanese,
+        "chunks": chunks,
+        "correctOrder": [x["id"] for x in chunks],
+    })
+    assert created.status_code == 201
+    return created.get_json()["sentence"]
+
+
+def _practice_once(client, sentence):
+    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
+    client.post(
+        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
+        json={"sentenceId": sentence["id"], "action": "check", "answerOrder": sentence["correctOrder"], "durationMs": 3000},
+    )
+    return practice["sessionId"]
+
+
+def test_delete_collection_cascade_clears_sentences_and_memory(tmp_path, monkeypatch):
+    client = load_app(tmp_path, monkeypatch)
+    import db
+    default_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    other = client.post("/api/collections", json={"name": "待删句集"})
+    assert other.status_code == 201
+    other_id = other.get_json()["id"]
+    sentence = _make_sentence(client, other_id, "你好。", "こんにちは。")
+    _practice_once(client, sentence)
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] >= 1
+        assert connection.execute("SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] >= 1
+
+    res = client.delete(f"/api/collections/{other_id}?cascade=1")
+    assert res.status_code == 200
+
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM collections WHERE id=?", (other_id,)).fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM sentences WHERE id=?", (sentence["id"],)).fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM collections WHERE id=?", (default_id,)).fetchone()["n"] == 1
+
+
+def test_delete_collection_nonempty_without_cascade_is_409(tmp_path, monkeypatch):
+    client = load_app(tmp_path, monkeypatch)
+    default_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    other_id = client.post("/api/collections", json={"name": "非空句集"}).get_json()["id"]
+    sentence = _make_sentence(client, other_id, "谢谢。", "ありがとう。")
+    res = client.delete(f"/api/collections/{other_id}")
+    assert res.status_code == 409
+    assert "移动或删除" in res.get_json()["error"]
+    still = client.get(f"/api/sentences/{sentence['id']}")
+    assert still.status_code == 200
+    assert client.get("/api/dashboard").get_json()
+    names = {c["name"] for c in client.get("/api/dashboard").get_json()["collections"]}
+    assert "非空句集" in names
+    assert any(c["id"] == default_id for c in client.get("/api/dashboard").get_json()["collections"])
+
+
+def test_delete_last_collection_rejected(tmp_path, monkeypatch):
+    client = load_app(tmp_path, monkeypatch)
+    only_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    res = client.delete(f"/api/collections/{only_id}?cascade=1")
+    assert res.status_code == 409
+    assert "至少保留一个句集" in res.get_json()["error"]
+    assert client.get("/api/dashboard").get_json()["collections"][0]["id"] == only_id
+
+
+def test_move_sentences_between_collections(tmp_path, monkeypatch):
+    client = load_app(tmp_path, monkeypatch)
+    import db
+    source_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    target_id = client.post("/api/collections", json={"name": "目标句集"}).get_json()["id"]
+    sentence = _make_sentence(client, source_id, "再见。", "さようなら。")
+    _practice_once(client, sentence)
+    before = client.get(f"/api/sentences/{sentence['id']}").get_json()["sentence"]
+    with db.get_db() as connection:
+        event_n = connection.execute("SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"]
+        attempt_n = connection.execute("SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"]
+    assert event_n >= 1 and attempt_n >= 1
+
+    missing = client.post("/api/sentences/move", json={"sentenceIds": [sentence["id"]], "targetCollectionId": 99999})
+    assert missing.status_code == 404
+    empty = client.post("/api/sentences/move", json={"sentenceIds": [], "targetCollectionId": target_id})
+    assert empty.status_code == 400
+
+    moved = client.post("/api/sentences/move", json={"sentenceIds": [sentence["id"]], "targetCollectionId": target_id})
+    assert moved.status_code == 200
+    assert moved.get_json()["moved"] == 1
+
+    after = client.get(f"/api/sentences/{sentence['id']}").get_json()["sentence"]
+    assert after["collection_id"] == target_id
+    assert after["study_count"] == before["study_count"]
+    assert after["correct_count"] == before["correct_count"]
+    assert after["wrong_count"] == before["wrong_count"]
+    assert after["correct_streak"] == before["correct_streak"]
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] == event_n
+        assert connection.execute("SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] == attempt_n
+        assert connection.execute("SELECT collection_id FROM sentences WHERE id=?", (sentence["id"],)).fetchone()["collection_id"] == target_id

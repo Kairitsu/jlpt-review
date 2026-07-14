@@ -19,8 +19,6 @@
 .stats-tabs{display:flex;flex:1;gap:4px;background:rgba(255,255,255,.75);border:1px solid var(--border);border-radius:999px;padding:4px;overflow-x:auto}
 .stats-tab{flex:1;min-width:max-content;border:0;background:transparent;border-radius:999px;min-height:40px;padding:8px 12px;color:var(--muted);font-weight:700;font-size:13px;white-space:nowrap}
 .stats-tab.active{background:var(--mint);color:var(--primary);box-shadow:0 1px 0 rgba(20,107,90,.06)}
-.stats-share{flex-shrink:0;width:42px;height:42px}
-.stats-share svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .stats-card{padding:18px 16px 20px;width:100%;max-width:100%}
 .stats-panel{width:100%}
 /* Chart area: full card width; height driven by viewport, not fixed canvas pixels */
