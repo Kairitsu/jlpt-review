@@ -35,13 +35,38 @@ def sentence_snapshot(row):
     return {key: item[key] for key in ("id", "chinese", "japanese", "chunks", "correctOrder")}
 
 
-def answers_match(answer, correct):
-    return (
-        isinstance(answer, list)
-        and isinstance(correct, list)
-        and len(answer) == len(correct)
-        and all(isinstance(value, str) and value == correct[index] for index, value in enumerate(answer))
-    )
+def answers_match(answer, correct, chunks):
+    """Compare answer order to correct order by chunk text, not by chunk id.
+
+    Duplicate texts (e.g. two 「し」 with different ids) match when placed in the
+    right positions even if the specific id instances are swapped.
+    """
+    if not isinstance(answer, list) or not isinstance(correct, list):
+        return False
+    if len(answer) != len(correct):
+        return False
+    by_id = {
+        item["id"]: item.get("text")
+        for item in (chunks or [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+    def to_texts(order):
+        texts = []
+        for chunk_id in order:
+            if not isinstance(chunk_id, str):
+                return None
+            text = by_id.get(chunk_id)
+            if not isinstance(text, str):
+                return None
+            texts.append(text)
+        return texts
+
+    answer_texts = to_texts(answer)
+    correct_texts = to_texts(correct)
+    if answer_texts is None or correct_texts is None:
+        return False
+    return answer_texts == correct_texts
 
 
 def stats_snapshot(row):
@@ -335,7 +360,22 @@ def create_app(test_config=None):
                 params, where = [now_iso()], "next_review_at<=?"
                 if body.get("collectionId"):
                     where += " AND collection_id=?"; params.append(int(body["collectionId"]))
-                selected = [row["id"] for row in db.execute(f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at", params)]
+                requested = body.get("count")
+                if requested in (None, "all"):
+                    query, query_params = f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at", params
+                else:
+                    available = db.execute(f"SELECT COUNT(*) n FROM sentences WHERE {where}", params).fetchone()["n"]
+                    try:
+                        limit = max(1, int(requested))
+                    except (TypeError, ValueError):
+                        return jsonify(error="题目数量必须是正整数"), 400
+                    if limit >= available:
+                        if limit > available:
+                            subject = "当前句集待复习" if body.get("collectionId") else "当前待复习"
+                            notice = f"{subject}只有 {available} 句，已调整为全部"
+                        limit = available
+                    query, query_params = f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at LIMIT ?", [*params, limit]
+                selected = [row["id"] for row in db.execute(query, query_params)]
                 source = "due"
             if not selected:
                 return jsonify(error="当前没有待复习句子"), 400
@@ -358,7 +398,7 @@ def create_app(test_config=None):
             if not practice or not row or sentence_id not in json_load(practice["sentence_ids_json"], []):
                 return jsonify(error="练习或句子不存在"), 404
             item = sentence_dict(row)
-            status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"]) else "wrong")
+            status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"], item["chunks"]) else "wrong")
             previous = db.execute("SELECT * FROM attempts WHERE session_id=? AND sentence_id=? ORDER BY id LIMIT 1", (session_id, sentence_id)).fetchone()
             if previous:
                 base = json_load(previous["stats_before_json"], None) or stats_snapshot(row)
