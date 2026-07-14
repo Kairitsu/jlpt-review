@@ -480,11 +480,16 @@ def create_app(test_config=None):
 
     @app.delete("/api/sentences/<int:sentence_id>")
     def delete_sentence(sentence_id):
+        # Hard-delete related stats/history first (before FK SET NULL would orphan them).
         with get_db() as db:
-            changed = db.execute("DELETE FROM sentences WHERE id=?", (sentence_id,)).rowcount
-        if changed:
-            schedule_font_rebuild()
-        return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
+            exists = db.execute("SELECT id FROM sentences WHERE id=?", (sentence_id,)).fetchone()
+            if not exists:
+                return jsonify(error="句子不存在"), 404
+            db.execute("DELETE FROM review_events WHERE sentence_id=?", (sentence_id,))
+            db.execute("DELETE FROM attempts WHERE sentence_id=?", (sentence_id,))
+            db.execute("DELETE FROM sentences WHERE id=?", (sentence_id,))
+        schedule_font_rebuild()
+        return jsonify(ok=True)
 
     @app.post("/api/practice/sessions")
     def start_session():

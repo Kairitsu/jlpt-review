@@ -298,6 +298,46 @@ def test_learning_series_can_exceed_visible_bucket_threshold(tmp_path, monkeypat
     assert len(data["series"]) > 14  # exceeds VISIBLE_BUCKETS.day
 
 
+def test_delete_sentence_hard_deletes_review_history(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "け")
+    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
+    client.post(
+        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
+        json={
+            "sentenceId": sentence["id"],
+            "action": "check",
+            "answerOrder": sentence["correctOrder"],
+            "durationMs": 5000,
+        },
+    )
+    with db.get_db() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)
+        ).fetchone()["n"] >= 1
+
+    assert client.delete(f'/api/sentences/{sentence["id"]}').status_code == 200
+
+    with db.get_db() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM sentences WHERE id=?", (sentence["id"],)
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)
+        ).fetchone()["n"] == 0
+        # No orphaned NULL sentence_id rows from this delete path
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE sentence_id IS NULL"
+        ).fetchone()["n"] == 0
+
+
 def test_migration_adds_columns_and_backfills(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]

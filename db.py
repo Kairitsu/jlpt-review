@@ -181,6 +181,28 @@ def init_db():
         stamp = now_iso()
         db.execute("INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)", (stamp, stamp))
         _backfill_review_events(db)
+        # Purge history left by older ON DELETE SET NULL behavior (hard-delete is now app policy).
+        _purge_orphaned_sentence_history(db)
+
+
+def _purge_orphaned_sentence_history(db):
+    """Remove review_events/attempts that no longer belong to any sentence.
+
+    The API hard-deletes these rows when a sentence is removed; this cleans
+    leftovers from older SET NULL FK behavior and any dangling FKs.
+    """
+    db.execute("DELETE FROM review_events WHERE sentence_id IS NULL")
+    db.execute(
+        """DELETE FROM review_events
+           WHERE sentence_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM sentences s WHERE s.id = review_events.sentence_id)"""
+    )
+    db.execute("DELETE FROM attempts WHERE sentence_id IS NULL")
+    db.execute(
+        """DELETE FROM attempts
+           WHERE sentence_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM sentences s WHERE s.id = attempts.sentence_id)"""
+    )
 
 
 def setting(db, key, default=""):
