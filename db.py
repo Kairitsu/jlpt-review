@@ -23,6 +23,53 @@ def get_db():
     return db
 
 
+def _add_column_if_missing(db, table: str, column: str, ddl: str):
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _backfill_review_events(db):
+    """One-shot: map legacy attempts into review_events when the table is empty.
+
+    Orphaned FKs (deleted sentence/session) are nulled so backfill never crashes
+    older production databases.
+    """
+    event_count = db.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"]
+    if event_count:
+        return
+    attempt_count = db.execute("SELECT COUNT(*) n FROM attempts").fetchone()["n"]
+    if not attempt_count:
+        return
+    # Legacy mapping: correct→known, wrong→forgotten, skipped→skipped
+    # Null out sentence_id / session_id when the referenced row is gone.
+    db.execute("""
+        INSERT INTO review_events(
+          sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
+          is_new, stability_before, stability_after, interval_days, created_at
+        )
+        SELECT
+          CASE WHEN s.id IS NULL THEN NULL ELSE a.sentence_id END,
+          CASE WHEN p.id IS NULL THEN NULL ELSE a.session_id END,
+          a.created_at,
+          CASE a.status
+            WHEN 'correct' THEN 'known'
+            WHEN 'wrong' THEN 'forgotten'
+            ELSE 'skipped'
+          END,
+          0,
+          1,
+          0,
+          NULL,
+          NULL,
+          NULL,
+          a.created_at
+        FROM attempts a
+        LEFT JOIN sentences s ON s.id = a.sentence_id
+        LEFT JOIN practice_sessions p ON p.id = a.session_id
+    """)
+
+
 def init_db():
     with get_db() as db:
         db.executescript("""
@@ -50,6 +97,9 @@ def init_db():
           wrong_count INTEGER NOT NULL DEFAULT 0,
           skip_count INTEGER NOT NULL DEFAULT 0,
           correct_streak INTEGER NOT NULL DEFAULT 0,
+          stability REAL NOT NULL DEFAULT 1.0,
+          review_count INTEGER NOT NULL DEFAULT 0,
+          lapse_count INTEGER NOT NULL DEFAULT 0,
           next_review_at TEXT NOT NULL,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
@@ -74,6 +124,25 @@ def init_db():
           answer_order_json TEXT NOT NULL DEFAULT '[]',
           sentence_snapshot_json TEXT NOT NULL,
           stats_before_json TEXT NOT NULL DEFAULT '{}',
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          attempt_n INTEGER NOT NULL DEFAULT 1,
+          grade TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS review_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sentence_id INTEGER REFERENCES sentences(id) ON DELETE SET NULL,
+          session_id INTEGER REFERENCES practice_sessions(id) ON DELETE SET NULL,
+          reviewed_at TEXT NOT NULL,
+          result TEXT NOT NULL CHECK(result IN (
+            'mastered','known','fuzzy','forgotten','skipped'
+          )),
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          attempt_n INTEGER NOT NULL DEFAULT 1,
+          is_new INTEGER NOT NULL DEFAULT 0,
+          stability_before REAL,
+          stability_after REAL,
+          interval_days REAL,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS login_attempts (
@@ -87,13 +156,21 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_attempts_session ON attempts(session_id);
         CREATE INDEX IF NOT EXISTS idx_attempts_sentence ON attempts(sentence_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_created ON practice_sessions(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_review_events_reviewed ON review_events(reviewed_at);
+        CREATE INDEX IF NOT EXISTS idx_review_events_sentence ON review_events(sentence_id, reviewed_at);
+        CREATE INDEX IF NOT EXISTS idx_review_events_session_sentence
+          ON review_events(session_id, sentence_id);
         """)
-        columns = {row["name"] for row in db.execute("PRAGMA table_info(attempts)")}
-        if "stats_before_json" not in columns:
-            db.execute("ALTER TABLE attempts ADD COLUMN stats_before_json TEXT NOT NULL DEFAULT '{}'")
-        sentence_columns = {row["name"] for row in db.execute("PRAGMA table_info(sentences)")}
-        if "furigana_json" not in sentence_columns:
-            db.execute("ALTER TABLE sentences ADD COLUMN furigana_json TEXT NOT NULL DEFAULT '[]'")
+        # Idempotent ALTERs for existing databases
+        _add_column_if_missing(db, "attempts", "stats_before_json", "stats_before_json TEXT NOT NULL DEFAULT '{}'")
+        _add_column_if_missing(db, "attempts", "duration_ms", "duration_ms INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(db, "attempts", "attempt_n", "attempt_n INTEGER NOT NULL DEFAULT 1")
+        _add_column_if_missing(db, "attempts", "grade", "grade TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(db, "sentences", "furigana_json", "furigana_json TEXT NOT NULL DEFAULT '[]'")
+        _add_column_if_missing(db, "sentences", "stability", "stability REAL NOT NULL DEFAULT 1.0")
+        _add_column_if_missing(db, "sentences", "review_count", "review_count INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(db, "sentences", "lapse_count", "lapse_count INTEGER NOT NULL DEFAULT 0")
+
         db.execute("DELETE FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')")
         for row in db.execute("SELECT id,chunks_json FROM sentences").fetchall():
             chunks = json_load(row["chunks_json"], [])
@@ -103,6 +180,7 @@ def init_db():
         db.execute("UPDATE sentences SET kana='',romaji='',explanation='' WHERE kana<>'' OR romaji<>'' OR explanation<>''")
         stamp = now_iso()
         db.execute("INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)", (stamp, stamp))
+        _backfill_review_events(db)
 
 
 def setting(db, key, default=""):

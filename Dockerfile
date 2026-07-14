@@ -4,7 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --disable-pip-version-check -r requirements.txt
-COPY app.py db.py security.py auth.py tokenizer.py chunk_rules.py font_active.py ./
+COPY app.py db.py memory.py security.py auth.py tokenizer.py chunk_rules.py font_active.py ./
 COPY static ./static
 COPY font-sources ./font-sources
 RUN useradd -u 1000 -m appuser \

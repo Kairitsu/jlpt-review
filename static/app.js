@@ -27,7 +27,7 @@ async function api(url, options = {}) {
 function showLogin() { $('#login-modal').classList.remove('hidden'); }
 function hideLogin() { $('#login-modal').classList.add('hidden'); }
 
-const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings']);
+const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats']);
 function setChrome(practice = false) {
   const header = $('#main-header');
   header.classList.toggle('hidden', practice);
@@ -36,15 +36,16 @@ function setChrome(practice = false) {
     header.innerHTML = `<button class="brand plain-button" data-action="${secondary ? 'back' : 'home'}" aria-label="${secondary ? '返回上一页' : '返回首页'}">${secondary ? '<span class="back-arrow" aria-hidden="true">←</span>' : '<span class="brand-mark">文</span>'}<strong>背句子</strong></button><button class="icon-button" data-route="settings" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>`;
   }
   $('#bottom-nav').classList.toggle('hidden', practice);
-  $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'settings');
+  $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'settings' || state.route === 'stats');
   $$('#bottom-nav button').forEach(button => button.classList.toggle('active', button.dataset.route === state.route));
 }
 function historyEntry(name) {
   return {route:name, collectionId:state.activeCollection, reportId:state.report?.id, editingId:state.editing?.id};
 }
 async function route(name, options = {}) {
-  const allowed = new Set(['home','library','add','reports','report','settings','practice']);
+  const allowed = new Set(['home','library','add','reports','report','settings','practice','stats']);
   if (!allowed.has(name)) name = 'home';
+  if (state.route === 'stats' && name !== 'stats' && typeof destroyStatsCharts === 'function') destroyStatsCharts();
   state.route = name; state.routeMeta = options;
   if (!options.fromPop) history[options.replace ? 'replaceState' : 'pushState'](historyEntry(name), '', `#${name}`);
   setChrome(name === 'practice');
@@ -57,6 +58,10 @@ async function route(name, options = {}) {
       await renderAdd();
     } else if (name === 'reports') await renderReports();
     else if (name === 'settings') await renderSettings();
+    else if (name === 'stats') {
+      if (typeof renderStats === 'function') await renderStats();
+      else view.innerHTML = '<section class="page"><p class="error-text">统计模块未加载</p></section>';
+    }
     else if (name === 'practice') renderPractice();
     else if (name === 'report') {
       const id = options.reportId || state.report?.id;
@@ -67,7 +72,7 @@ async function route(name, options = {}) {
   } catch (error) { toast(error.message, true); if (!view.children.length) route('home', {replace:true}); }
 }
 function navigateBack() {
-  if (state.route === 'settings') return route('home');
+  if (state.route === 'settings' || state.route === 'stats') return route('home');
   if (state.route === 'add') { state.editing = null; state.draft = null; return route('library'); }
   if (state.route === 'report') return route('reports');
   if (state.route === 'reports' || state.route === 'library') return route('home');
@@ -102,7 +107,7 @@ function updateDueCountHint() {
 
 async function renderHome() {
   const data = await ensureDashboard(); const active = data.collections.find(c => c.id === state.activeCollection) || data.collections[0]; const progress = active?.total ? Math.round(active.learned * 100 / active.total) : 0;
-  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>今天也来背一句</h1><p>从中文出发，把日语句子拼回完整模样。</p></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom"><div class="metric"><strong>${active?.due || 0}</strong><span>待复习</span></div><div class="metric"><strong>${active?.today || 0}</strong><span>今日学习</span></div></div><button class="btn primary" data-action="start-due" ${!active?.due ? 'disabled' : ''}>开始背句子</button></div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div></section>`;
+  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>今天也来背一句</h1><p>从中文出发，把日语句子拼回完整模样。</p></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom"><div class="metric"><strong>${active?.due || 0}</strong><span>待复习</span></div><div class="metric"><strong>${active?.today || 0}</strong><span>今日学习</span></div></div><button class="btn primary" data-action="start-due" ${!active?.due ? 'disabled' : ''}>开始背句子</button></div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div><button class="card section-card home-stats-entry" data-route="stats"><div class="section-title"><h2>数据统计</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">遗忘曲线 · 学习情况 · 记忆持久度</p></button></section>`;
   setChrome();
 }
 
@@ -131,7 +136,7 @@ async function startPractice(payload) {
   prepareQuestion(); route('practice');
 }
 function shuffle(items) { const result = [...items]; for (let i = result.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [result[i], result[j]] = [result[j], result[i]]; } return result; }
-function prepareQuestion() { const p = state.practice, s = p.sentences[p.index]; p.selected = []; p.checked = false; p.result = null; p.submitting = false; p.candidates = shuffle(s.chunks.map(c => c.id)); }
+function prepareQuestion() { const p = state.practice, s = p.sentences[p.index]; p.selected = []; p.checked = false; p.result = null; p.submitting = false; p.candidates = shuffle(s.chunks.map(c => c.id)); p.questionStartedAt = Date.now(); }
 function selectionHtml(s, p, map) {
   // Grade by chunk text so duplicate surfaces (e.g. two 「し」) match regardless of which id instance was used.
   const correctTexts = (s.correctOrder || []).map(id => map[id]?.text || '');
@@ -167,10 +172,11 @@ async function record(action) {
   if (!p || p.submitting) return;
   if (action === 'check' && !practiceReadyToCheck(p)) { toast('请先把所有词块摆放完整'); return; }
   const s = p.sentences[p.index];
+  const durationMs = Math.max(0, Date.now() - (p.questionStartedAt || Date.now()));
   p.submitting = true;
   renderPractice();
   try {
-    p.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:p.selected})});
+    p.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:p.selected, durationMs})});
     p.checked = true;
   } catch (error) {
     p.submitting = false;
@@ -187,8 +193,9 @@ function renderReport() { const r = state.report; if (!r) return route('reports'
 function reportItems(items) { return items.map(item => `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${{correct:'正确',wrong:'错误',skipped:'跳过'}[item.status]}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div></article>`).join(''); }
 
 async function renderSettings() {
-  const authCfg = await api('/api/settings/auth');
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证并查看使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>连续答对后的复习间隔为 1、3、7、14、30 天；答错会立即回到待复习。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
+  const [authCfg, schedCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/scheduler')]);
+  const mode = schedCfg.mode || 'dynamic';
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form><form id="scheduler-form" class="card"><div class="settings-title"><div><h2>复习调度</h2><p>动态调度按遗忘曲线估算下次复习时间；也可回退到固定间隔。</p></div><span class="config-status ok">${mode === 'dynamic' ? '动态' : '固定'}</span></div><label class="check-row"><input type="radio" name="mode" value="dynamic" ${mode === 'dynamic' ? 'checked' : ''}>动态遗忘曲线调度（推荐）</label><label class="check-row"><input type="radio" name="mode" value="fixed" ${mode === 'fixed' ? 'checked' : ''}>固定间隔 1 · 3 · 7 · 14 · 30 天</label><p class="status-note">答错会立即到期。动态模式根据记忆稳定度计算间隔；固定模式与旧版行为一致。</p><div class="form-actions"><button class="btn primary" type="submit">保存调度设置</button></div></form><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看遗忘曲线、学习情况与记忆持久度。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
 
@@ -221,13 +228,17 @@ document.addEventListener('click', async event => {
     else if (action === 'reset') { const p = state.practice; if (!p || p.checked || p.submitting) return; p.selected = []; updatePracticeSelection(); }
     else if (action === 'check') { if (!practiceReadyToCheck()) { toast('请先把所有词块摆放完整'); return; } await record('check'); }
     else if (action === 'skip') await record('skip');
-    else if (action === 'retry-current') { state.practice.selected = []; state.practice.checked = false; state.practice.result = null; state.practice.submitting = false; renderPractice(); }
+    else if (action === 'retry-current') { state.practice.selected = []; state.practice.checked = false; state.practice.result = null; state.practice.submitting = false; state.practice.questionStartedAt = Date.now(); renderPractice(); }
     else if (action === 'next') await nextQuestion();
     else if (action === 'exit-practice') { if (confirm('退出后，本轮未完成的题目不会生成完整报告。确定退出吗？')) route('home'); }
     else if (action === 'open-report') { state.report = (await api(`/api/reports/${button.dataset.id}`)).report; route('report', {reportId:state.report.id}); }
     else if (action === 'retry-report') await startPractice({sentenceIds:state.report.items.map(x => x.id)});
     else if (action === 'toggle-wrong') { const only = button.dataset.active !== '1'; button.dataset.active = only ? '1' : '0'; button.textContent = only ? '显示全部' : '只看错误'; $$('.report-item').forEach(x => x.classList.toggle('hidden', only && x.dataset.status !== 'wrong')); }
     else if (action === 'logout') { await api('/api/auth/logout', {method:'POST', body:'{}'}); showLogin(); }
+    else if (action && action.startsWith('stats-') && typeof handleStatsAction === 'function') {
+      const handled = handleStatsAction(action, button);
+      if (handled) await handled;
+    }
   } catch (error) { toast(error.message, true); }
 });
 
@@ -246,6 +257,7 @@ document.addEventListener('submit', async event => {
   try {
     if (event.target.id === 'login-form') { const body = Object.fromEntries(new FormData(event.target)); await api('/api/auth/login', {method:'POST', body:JSON.stringify(body)}); hideLogin(); route('home', {replace:true}); }
     else if (event.target.id === 'auth-form') { const form = new FormData(event.target), clearAuth = form.get('clearAuth') === 'on'; const body = {username:form.get('username'), password:form.get('password'), clearAuth}; await api('/api/settings/auth', {method:'PUT', body:JSON.stringify(body)}); toast(clearAuth ? '应用认证已关闭' : '访问认证已保存并立即生效'); await renderSettings(); }
+    else if (event.target.id === 'scheduler-form') { const form = new FormData(event.target); const mode = form.get('mode') || 'dynamic'; await api('/api/settings/scheduler', {method:'PUT', body:JSON.stringify({mode})}); toast(mode === 'dynamic' ? '已切换为动态遗忘曲线调度' : '已切换为固定间隔调度'); await renderSettings(); }
   } catch (error) { if (event.target.id === 'login-form') $('#login-error').textContent = error.message; else toast(error.data?.details?.join('；') || error.message, true); }
 });
 window.addEventListener('popstate', event => { const entry = event.state || {route:'home'}; route(entry.route || 'home', {...entry, fromPop:true}); });

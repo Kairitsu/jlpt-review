@@ -16,7 +16,8 @@
 - **句集管理**：创建 / 重命名 / 删除句集（删除前需清空句子）
 - **句子导入**：中文 + 日语；一键本机分块；可编辑词块后保存
 - **练习模式**：待复习 / 句集练习；拖拽排序作答；跳过与对错统计
-- **间隔复习**：答对按 1 → 3 → 7 → 14 → 30 天推进；答错立即到期
+- **间隔复习（默认动态）**：指数遗忘模型 `R(t)=exp(-t/S)`，下次复习落在目标保持率（约 90%）附近；设置中可回退到固定间隔 1 → 3 → 7 → 14 → 30 天
+- **数据统计**：遗忘曲线 / 学习情况 / 记忆持久度（底栏「统计」入口）
 - **练习报告**：会话正确 / 错误 / 跳过记录与句子快照
 - **访问控制**：会话登录、密码 PBKDF2 哈希、失败锁定；可在设置页修改账号密码
 - **安全头**：CSP、HSTS（HTTPS 时）、禁缓存等默认开启
@@ -84,13 +85,14 @@ SudachiDict-full 在**镜像构建**时经 `requirements.txt` 安装；容器运
 ## 项目结构
 
 ```text
-app.py                 Flask 路由与练习 / 复习逻辑
+app.py                 Flask 路由、练习 / 复习、统计 API
 auth.py                登录锁定与会话鉴权
 security.py            密码哈希 / 校验（PBKDF2）
-db.py                  SQLite schema 与设置读写
+db.py                  SQLite schema、幂等迁移与设置读写
+memory.py              遗忘模型、四档认知映射、调度间隔
 tokenizer.py           Sudachi 分词封装
 chunk_rules.py         词块合并规则
-static/                前端 HTML / CSS / JS
+static/                前端 HTML / CSS / JS（含 stats.js、vendor/chart.js）
 font_active.py         按 UI+句库生成预置字体子集（保存句子后后台重建）
 font-sources/          Noto Sans SC/JP 源 OTF（仅供 subset，不直出浏览器）
 scripts/backup-db.sh   SQLite 一致性备份
@@ -100,6 +102,45 @@ tests/                 pytest
 docker-compose.yml
 Dockerfile
 ```
+
+## 统计与动态复习
+
+### 数据库（`init_db` 幂等）
+
+| 变更 | 说明 |
+|------|------|
+| `sentences.stability` | 记忆稳定度 S（天），默认 `1.0` |
+| `sentences.review_count` / `lapse_count` | 有效复习次数 / 遗忘次数 |
+| `review_events` | 每次最终答题明细（result、duration_ms、S 前后、间隔等） |
+| `attempts.duration_ms` / `attempt_n` / `grade` | 作答时长、本会话核对次数、四档认知结果 |
+
+旧库启动时自动 `ALTER` 加列；若 `review_events` 为空且已有 `attempts`，会按 `correct→known / wrong→forgotten / skipped→skipped` 回填一次。
+
+### 认知四档映射
+
+| 条件 | 结果 |
+|------|------|
+| 跳过 | skipped |
+| 答错 | forgotten（忘记） |
+| 答对且本会话第 2+ 次核对 | fuzzy（模糊） |
+| 答对、首次、时长 ≤15s | mastered（熟知） |
+| 答对、首次、更慢或无时长 | known（认识） |
+
+### 调度模式（设置页）
+
+- `GET/PUT /api/settings/scheduler` → `{ "mode": "dynamic" | "fixed" }`
+- **dynamic**（默认）：`t = -S · ln(0.9)`；答对增大 S，答错重置 S 并立即到期
+- **fixed**：沿用 `correct_streak` 与 1/3/7/14/30 天阶梯
+
+### 统计 API（只读 JSON）
+
+| 接口 | 内容 |
+|------|------|
+| `GET /api/stats/forgetting-curve` | 艾宾浩斯理论曲线 + 用户实测保持率（按距上次复习天数分桶） |
+| `GET /api/stats/learning?granularity=day\|week\|month` | 时间桶内熟知/认识/模糊/忘记与新学/复习计数 + 今日汇总 |
+| `GET /api/stats/retention?granularity=day\|week\|month` | 记忆持久度 ≥10/30/60/90 天的累计句子数与占比 |
+
+图表库为本地 `static/vendor/chart.umd.min.js`（无 CDN）。
 
 ## 数据与备份
 

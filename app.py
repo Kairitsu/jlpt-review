@@ -21,10 +21,26 @@ from font_active import (
     schedule_font_rebuild,
     status as font_status,
 )
+from memory import (
+    COGNITIVE_RESULTS,
+    DEFAULT_SCHEDULER_MODE,
+    DUE_PRESSURE_THRESHOLD,
+    HOLD_THRESHOLDS,
+    INITIAL_S,
+    MIN_CURVE_SAMPLES,
+    SUCCESS_RESULTS,
+    FIXED_INTERVALS as INTERVALS,
+    blend_user_rate,
+    grade_attempt,
+    hold_days,
+    local_date,
+    parse_iso,
+    schedule_next,
+    theory_curve_points,
+    update_stability,
+)
 from security import hash_password, verify_password
 from tokenizer import furigana_segments, local_tokenize, validate_chunks
-
-INTERVALS = [1, 3, 7, 14, 30]
 
 
 def truthy(name: str, default=False):
@@ -79,25 +95,109 @@ def answers_match(answer, correct, chunks):
 
 
 def stats_snapshot(row):
-    return {key: row[key] for key in ("study_count", "correct_count", "wrong_count", "skip_count", "correct_streak", "next_review_at", "last_practiced_at")}
+    keys = (
+        "study_count", "correct_count", "wrong_count", "skip_count", "correct_streak",
+        "next_review_at", "last_practiced_at", "stability", "review_count", "lapse_count",
+    )
+    data = dict(row)
+    return {
+        key: data.get(key, INITIAL_S if key == "stability" else (0 if key in ("review_count", "lapse_count") else None))
+        for key in keys
+    }
 
 
-def apply_attempt_stats(db, row, sentence_id, status, stamp, base=None):
+def scheduler_mode(db) -> str:
+    mode = (setting(db, "scheduler_mode", DEFAULT_SCHEDULER_MODE) or DEFAULT_SCHEDULER_MODE).lower()
+    return mode if mode in {"dynamic", "fixed"} else DEFAULT_SCHEDULER_MODE
+
+
+def apply_attempt_stats(
+    db,
+    row,
+    sentence_id,
+    status,
+    stamp,
+    base=None,
+    *,
+    session_id=None,
+    attempt_n=1,
+    duration_ms=0,
+):
+    """Update sentence SRS fields and upsert a review_events row for this attempt."""
     base = base or stats_snapshot(row)
-    study = int(base["study_count"]) + (status != "skipped")
-    correct = int(base["correct_count"]) + (status == "correct")
-    wrong = int(base["wrong_count"]) + (status == "wrong")
-    skipped = int(base["skip_count"]) + (status == "skipped")
-    streak = int(base["correct_streak"])
+    study = int(base["study_count"] or 0) + (status != "skipped")
+    correct = int(base["correct_count"] or 0) + (status == "correct")
+    wrong = int(base["wrong_count"] or 0) + (status == "wrong")
+    skipped = int(base["skip_count"] or 0) + (status == "skipped")
+    streak = int(base["correct_streak"] or 0)
+    review_count = int(base.get("review_count") or 0)
+    lapse_count = int(base.get("lapse_count") or 0)
+    stability_before = float(base.get("stability") if base.get("stability") is not None else INITIAL_S)
+    is_new = 1 if int(base["study_count"] or 0) == 0 and status != "skipped" else 0
+
+    result = grade_attempt(status, attempt_n=attempt_n, duration_ms=duration_ms)
     due = base["next_review_at"]
+    interval = 0.0
+    stability_after = stability_before
+    mode = scheduler_mode(db)
+
     if status == "correct":
         streak += 1
-        days = INTERVALS[min(streak - 1, len(INTERVALS) - 1)]
-        due = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat(timespec="seconds")
+        stability_after = update_stability(stability_before, result)
+        review_count += 1
+        due, interval = schedule_next(
+            mode=mode, result=result, stability_after=stability_after, streak_after=streak,
+        )
     elif status == "wrong":
-        streak, due = 0, stamp
-    db.execute("""UPDATE sentences SET study_count=?,correct_count=?,wrong_count=?,skip_count=?,correct_streak=?,next_review_at=?,last_practiced_at=?,updated_at=? WHERE id=?""",
-               (study, correct, wrong, skipped, streak, due, stamp, stamp, sentence_id))
+        streak = 0
+        stability_after = update_stability(stability_before, "forgotten")
+        review_count += 1
+        lapse_count += 1
+        due, interval = schedule_next(
+            mode=mode, result="forgotten", stability_after=stability_after, streak_after=streak,
+        )
+    else:
+        # skipped: keep due and stability
+        stability_after = stability_before
+        due = base["next_review_at"]
+        interval = 0.0
+
+    db.execute(
+        """UPDATE sentences SET study_count=?,correct_count=?,wrong_count=?,skip_count=?,correct_streak=?,
+           stability=?,review_count=?,lapse_count=?,next_review_at=?,last_practiced_at=?,updated_at=? WHERE id=?""",
+        (
+            study, correct, wrong, skipped, streak,
+            stability_after, review_count, lapse_count, due, stamp, stamp, sentence_id,
+        ),
+    )
+
+    # Upsert one review_event per (session, sentence) so retries don't double-count
+    if session_id is not None:
+        existing = db.execute(
+            "SELECT id FROM review_events WHERE session_id=? AND sentence_id=? ORDER BY id LIMIT 1",
+            (session_id, sentence_id),
+        ).fetchone()
+        if existing:
+            db.execute(
+                """UPDATE review_events SET reviewed_at=?, result=?, duration_ms=?, attempt_n=?,
+                   is_new=?, stability_before=?, stability_after=?, interval_days=?, created_at=? WHERE id=?""",
+                (
+                    stamp, result, int(duration_ms or 0), int(attempt_n or 1),
+                    is_new, stability_before, stability_after, interval, stamp, existing["id"],
+                ),
+            )
+        else:
+            db.execute(
+                """INSERT INTO review_events(
+                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
+                     is_new, stability_before, stability_after, interval_days, created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    sentence_id, session_id, stamp, result, int(duration_ms or 0), int(attempt_n or 1),
+                    is_new, stability_before, stability_after, interval, stamp,
+                ),
+            )
+    return result
 
 
 def create_app(test_config=None):
@@ -452,6 +552,10 @@ def create_app(test_config=None):
         answer = body.get("answerOrder")
         if not isinstance(answer, list):
             answer = []
+        try:
+            duration_ms = max(0, int(body.get("durationMs") or 0))
+        except (TypeError, ValueError):
+            duration_ms = 0
         stamp = now_iso()
         with get_db() as db:
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
@@ -463,12 +567,42 @@ def create_app(test_config=None):
             previous = db.execute("SELECT * FROM attempts WHERE session_id=? AND sentence_id=? ORDER BY id LIMIT 1", (session_id, sentence_id)).fetchone()
             if previous:
                 base = json_load(previous["stats_before_json"], None) or stats_snapshot(row)
-                db.execute("UPDATE attempts SET status=?,answer_order_json=?,sentence_snapshot_json=?,created_at=? WHERE id=?", (status, json.dumps(answer), json.dumps(sentence_snapshot(row), ensure_ascii=False), stamp, previous["id"]))
+                prev = dict(previous)
+                attempt_n = int(prev.get("attempt_n") or 0) + 1
+                grade = grade_attempt(status, attempt_n=attempt_n, duration_ms=duration_ms)
+                db.execute(
+                    """UPDATE attempts SET status=?,answer_order_json=?,sentence_snapshot_json=?,created_at=?,
+                       duration_ms=?,attempt_n=?,grade=? WHERE id=?""",
+                    (
+                        status, json.dumps(answer), json.dumps(sentence_snapshot(row), ensure_ascii=False), stamp,
+                        duration_ms, attempt_n, grade, previous["id"],
+                    ),
+                )
             else:
                 base = stats_snapshot(row)
-                db.execute("INSERT INTO attempts(session_id,sentence_id,status,answer_order_json,sentence_snapshot_json,stats_before_json,created_at) VALUES(?,?,?,?,?,?,?)", (session_id, sentence_id, status, json.dumps(answer), json.dumps(sentence_snapshot(row), ensure_ascii=False), json.dumps(base), stamp))
-            apply_attempt_stats(db, row, sentence_id, status, stamp, base)
-        return jsonify(status=status, correctOrder=item["correctOrder"], correct=status == "correct")
+                attempt_n = 1
+                grade = grade_attempt(status, attempt_n=attempt_n, duration_ms=duration_ms)
+                db.execute(
+                    """INSERT INTO attempts(
+                         session_id,sentence_id,status,answer_order_json,sentence_snapshot_json,
+                         stats_before_json,duration_ms,attempt_n,grade,created_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        session_id, sentence_id, status, json.dumps(answer),
+                        json.dumps(sentence_snapshot(row), ensure_ascii=False), json.dumps(base),
+                        duration_ms, attempt_n, grade, stamp,
+                    ),
+                )
+            grade = apply_attempt_stats(
+                db, row, sentence_id, status, stamp, base,
+                session_id=session_id, attempt_n=attempt_n, duration_ms=duration_ms,
+            )
+        return jsonify(
+            status=status,
+            correctOrder=item["correctOrder"],
+            correct=status == "correct",
+            grade=grade,
+        )
 
     @app.post("/api/practice/sessions/<int:session_id>/complete")
     def complete_session(session_id):
@@ -536,6 +670,260 @@ def create_app(test_config=None):
         session["username"] = username
         session.permanent = True
         return jsonify(ok=True, configured=True, username=username)
+
+    @app.get("/api/settings/scheduler")
+    def get_scheduler_settings():
+        with get_db() as db:
+            mode = scheduler_mode(db)
+        return jsonify(mode=mode, intervals=list(INTERVALS), defaultMode=DEFAULT_SCHEDULER_MODE)
+
+    @app.put("/api/settings/scheduler")
+    def save_scheduler_settings():
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("mode", "")).strip().lower()
+        if mode not in {"dynamic", "fixed"}:
+            return jsonify(error="mode 必须是 dynamic 或 fixed"), 400
+        with get_db() as db:
+            set_setting(db, "scheduler_mode", mode)
+        return jsonify(ok=True, mode=mode)
+
+    # ---- Stats APIs ----
+
+    def _bucket_specs(granularity: str):
+        """Return (granularity, list of (label, start_date, end_date exclusive))."""
+        today = local_date()
+        g = (granularity or "day").lower()
+        if g not in {"day", "week", "month"}:
+            g = "day"
+        buckets = []
+        if g == "day":
+            for i in range(89, -1, -1):
+                d = today - timedelta(days=i)
+                label = "今天" if i == 0 else f"{i}天前"
+                buckets.append((label, d, d + timedelta(days=1)))
+        elif g == "week":
+            # Monday-based weeks; 26 weeks ending this week
+            weekday = today.weekday()  # Mon=0
+            this_week_start = today - timedelta(days=weekday)
+            for i in range(25, -1, -1):
+                start = this_week_start - timedelta(weeks=i)
+                end = start + timedelta(weeks=1)
+                label = "本周" if i == 0 else f"{i}周前"
+                buckets.append((label, start, end))
+        else:
+            # 12 calendar months ending current month
+            y, m = today.year, today.month
+            for i in range(11, -1, -1):
+                mm = m - i
+                yy = y
+                while mm <= 0:
+                    mm += 12
+                    yy -= 1
+                start = datetime(yy, mm, 1).date()
+                if mm == 12:
+                    end = datetime(yy + 1, 1, 1).date()
+                else:
+                    end = datetime(yy, mm + 1, 1).date()
+                label = "本月" if i == 0 else f"{i}月前"
+                buckets.append((label, start, end))
+        return g, buckets
+
+    def _trim_leading_empty(series: list, has_data) -> list:
+        """Drop leading empty buckets; keep mid-gap zeros. No data → last bucket only."""
+        if not series:
+            return series
+        for i, item in enumerate(series):
+            if has_data(item):
+                return series[i:]
+        return series[-1:]
+
+    @app.get("/api/stats/forgetting-curve")
+    def stats_forgetting_curve():
+        points = theory_curve_points(11)
+        # Empirical retention by gap days between consecutive non-skip reviews of same sentence
+        buckets = {d: {"success": 0, "total": 0} for d in range(12)}
+        with get_db() as db:
+            rows = db.execute(
+                """SELECT sentence_id, reviewed_at, result FROM review_events
+                   WHERE result != 'skipped' AND sentence_id IS NOT NULL
+                   ORDER BY sentence_id, reviewed_at, id"""
+            ).fetchall()
+        by_sentence: dict[int, list] = {}
+        for row in rows:
+            by_sentence.setdefault(row["sentence_id"], []).append(row)
+        for events in by_sentence.values():
+            for i in range(1, len(events)):
+                prev_dt = parse_iso(events[i - 1]["reviewed_at"])
+                cur_dt = parse_iso(events[i]["reviewed_at"])
+                if not prev_dt or not cur_dt:
+                    continue
+                gap = max(0, (cur_dt - prev_dt).total_seconds() / 86400.0)
+                gap_day = int(gap)  # floor
+                if gap_day > 11:
+                    continue
+                buckets[gap_day]["total"] += 1
+                if events[i]["result"] in SUCCESS_RESULTS:
+                    buckets[gap_day]["success"] += 1
+        ready_count = 0
+        for point in points:
+            d = point["offsetDays"]
+            total = buckets[d]["total"]
+            point["userSampleSize"] = total
+            empirical = None
+            if total > 0:
+                empirical = buckets[d]["success"] / total * 100
+            if total >= MIN_CURVE_SAMPLES:
+                ready_count += 1
+            # Always emit a user value: prior = theory when samples are sparse.
+            point["user"] = blend_user_rate(point["theory"], empirical, total)
+        return jsonify(points=points, dataReady=ready_count >= 3, minSamples=MIN_CURVE_SAMPLES)
+
+    @app.get("/api/stats/learning")
+    def stats_learning():
+        granularity = request.args.get("granularity", "day")
+        g, buckets = _bucket_specs(granularity)
+        series = []
+        with get_db() as db:
+            events = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT reviewed_at, result, is_new, duration_ms FROM review_events ORDER BY reviewed_at"
+                ).fetchall()
+            ]
+            now = now_iso()
+            due_total = db.execute(
+                "SELECT COUNT(*) n FROM sentences WHERE next_review_at<=?", (now,)
+            ).fetchone()["n"]
+
+        # Pre-group events by local date
+        by_date: dict = {}
+        for ev in events:
+            dt = parse_iso(ev["reviewed_at"])
+            if not dt:
+                continue
+            d = local_date(dt)
+            by_date.setdefault(d, []).append(ev)
+
+        today = local_date()
+        today_counts = {"mastered": 0, "known": 0, "fuzzy": 0, "forgotten": 0, "skipped": 0}
+        today_duration_ms = 0
+        for ev in by_date.get(today, []):
+            r = ev["result"]
+            if r in today_counts:
+                today_counts[r] += 1
+            today_duration_ms += int(ev.get("duration_ms") or 0)
+
+        for label, start, end in buckets:
+            counts = {
+                "mastered": 0, "known": 0, "fuzzy": 0, "forgotten": 0,
+                "new": 0, "review": 0,
+            }
+            d = start
+            while d < end:
+                for ev in by_date.get(d, []):
+                    r = ev["result"]
+                    if r in COGNITIVE_RESULTS:
+                        counts[r] += 1
+                    if r != "skipped":
+                        if int(ev.get("is_new") or 0):
+                            counts["new"] += 1
+                        else:
+                            counts["review"] += 1
+                d += timedelta(days=1)
+            series.append({"label": label, "start": start.isoformat(), "end": end.isoformat(), **counts})
+
+        def _learning_bucket_has_data(item: dict) -> bool:
+            return (
+                item.get("mastered", 0)
+                + item.get("known", 0)
+                + item.get("fuzzy", 0)
+                + item.get("forgotten", 0)
+                + item.get("new", 0)
+                + item.get("review", 0)
+            ) > 0
+
+        series = _trim_leading_empty(series, _learning_bucket_has_data)
+
+        pressure = due_total >= DUE_PRESSURE_THRESHOLD
+        return jsonify(
+            granularity=g,
+            series=series,
+            today={
+                "mastered": today_counts["mastered"],
+                "known": today_counts["known"],
+                "fuzzy": today_counts["fuzzy"],
+                "forgotten": today_counts["forgotten"],
+                "dueTotal": due_total,
+                "durationSec": round(today_duration_ms / 1000),
+            },
+            pressureHint=pressure,
+            pressureMessage="待复习句子较多，可分散复习减轻压力" if pressure else "",
+        )
+
+    @app.get("/api/stats/retention")
+    def stats_retention():
+        granularity = request.args.get("granularity", "week")
+        g, buckets = _bucket_specs(granularity)
+        with get_db() as db:
+            sentences = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id, created_at, stability FROM sentences"
+                ).fetchall()
+            ]
+            events = [
+                dict(row)
+                for row in db.execute(
+                    """SELECT sentence_id, reviewed_at, stability_after FROM review_events
+                       WHERE sentence_id IS NOT NULL AND result != 'skipped'
+                       ORDER BY reviewed_at, id"""
+                ).fetchall()
+            ]
+
+        # Build per-sentence event timelines
+        timelines: dict[int, list] = {}
+        for ev in events:
+            timelines.setdefault(ev["sentence_id"], []).append(ev)
+
+        series = []
+        for label, start, end in buckets:
+            # Snapshot exclusive end date: include events with local_date < end
+            cutoff = end
+            total = 0
+            counts = {n: 0 for n in HOLD_THRESHOLDS}
+            for sent in sentences:
+                created = parse_iso(sent["created_at"])
+                if not created or local_date(created) >= cutoff:
+                    continue
+                total += 1
+                s = None
+                for ev in timelines.get(sent["id"], []):
+                    dt = parse_iso(ev["reviewed_at"])
+                    if not dt or local_date(dt) >= cutoff:
+                        continue
+                    if ev.get("stability_after") is not None:
+                        s = float(ev["stability_after"])
+                if s is None:
+                    s = INITIAL_S
+                hd = hold_days(s)
+                for n in HOLD_THRESHOLDS:
+                    if hd >= n:
+                        counts[n] += 1
+            item = {
+                "label": label,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "all": total,
+                "allPct": 100.0 if total else 0.0,
+            }
+            for n in HOLD_THRESHOLDS:
+                item[f"d{n}"] = counts[n]
+                item[f"d{n}Pct"] = round(counts[n] * 100 / total, 1) if total else 0.0
+            series.append(item)
+
+        series = _trim_leading_empty(series, lambda item: (item.get("all") or 0) > 0)
+
+        return jsonify(granularity=g, series=series, thresholds=list(HOLD_THRESHOLDS))
 
     # Build content-subset fonts at startup (no-op if sources missing / already current).
     try:
