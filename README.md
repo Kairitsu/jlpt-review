@@ -7,7 +7,7 @@
 | 项目 | 说明 |
 |------|------|
 | 技术栈 | Flask · Gunicorn · SQLite · SudachiPy + SudachiDict-full |
-| 前端 | 单页静态资源（`static/`），无额外前端构建 |
+| 前端 | 单页静态资源（`static/`）；中日文为自托管 Noto **内容子集**（UI+已导入句子） |
 | 部署 | Docker Compose，默认仅监听 `127.0.0.1:3220` |
 | 许可证 | [AGPL-3.0](LICENSE) |
 
@@ -91,7 +91,10 @@ db.py                  SQLite schema 与设置读写
 tokenizer.py           Sudachi 分词封装
 chunk_rules.py         词块合并规则
 static/                前端 HTML / CSS / JS
+font_active.py         按 UI+句库生成预置字体子集（保存句子后后台重建）
+font-sources/          Noto Sans SC/JP 源 OTF（仅供 subset，不直出浏览器）
 scripts/backup-db.sh   SQLite 一致性备份
+scripts/build_font_subsets.py  （可选）离线 unicode-range 全量分片工具
 secrets/app.env.example
 tests/                 pytest
 docker-compose.yml

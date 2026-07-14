@@ -33,12 +33,12 @@
 
 ### Typography
 
-- **Heading Font:** Inter / Noto Sans JP
-- **Body Font:** Inter / Noto Sans JP / system-ui
+- **Heading Font:** Inter / Noto Sans SC (UI) / Noto Sans JP (`lang="ja"`)
+- **Body Font:** Inter / Noto Sans SC (UI) / Noto Sans JP (`lang="ja"`) / system-ui
 - **Mood:** friendly, clear, touch-first, calm learning
 
 **CSS Import:**
-No remote font import; use local system fonts for privacy and performance.
+Self-hosted Noto Sans SC + Noto Sans JP under `static/fonts/` (no Google Fonts / CDN at runtime). Latin keeps Inter/system-ui first in the stack.
 
 ### Spacing Variables
 

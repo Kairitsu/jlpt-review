@@ -13,6 +13,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 from auth import authed, clear, configured as auth_configured, fail, keys, lock_remaining
 from db import get_db, init_db, json_load, now_iso, set_setting, setting
+from font_active import (
+    active_dir,
+    ensure_active_fonts,
+    faces_css_text,
+    safe_font_filename,
+    schedule_font_rebuild,
+    status as font_status,
+)
 from security import hash_password, verify_password
 from tokenizer import furigana_segments, local_tokenize, validate_chunks
 
@@ -118,7 +126,19 @@ def create_app(test_config=None):
 
     @app.before_request
     def protect_api():
-        if not request.path.startswith("/api/") or request.path in {"/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/logout"}:
+        public = {
+            "/api/health",
+            "/api/auth/status",
+            "/api/auth/login",
+            "/api/auth/logout",
+            "/api/fonts/faces.css",
+            "/api/fonts/status",
+        }
+        if (
+            not request.path.startswith("/api/")
+            or request.path in public
+            or request.path.startswith("/api/fonts/files/")
+        ):
             return None
         with get_db() as db:
             if not auth_configured(db) or authed():
@@ -135,6 +155,9 @@ def create_app(test_config=None):
             "Cache-Control": "no-store",
             "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
         })
+        # Hashed active font files are content-addressed; cache forever.
+        if request.path.startswith("/api/fonts/files/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         if request.is_secure:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
@@ -154,6 +177,26 @@ def create_app(test_config=None):
     @app.get("/")
     def index():
         return send_from_directory(app.static_folder, "index.html")
+
+    @app.get("/api/fonts/faces.css")
+    def font_faces_css():
+        css = faces_css_text()
+        if not css:
+            # Attempt a one-shot build if files are missing.
+            ensure_active_fonts()
+            css = faces_css_text() or "/* active fonts not ready */\n"
+        return app.response_class(css, mimetype="text/css")
+
+    @app.get("/api/fonts/files/<path:name>")
+    def font_file(name):
+        safe = safe_font_filename(name)
+        if not safe:
+            return jsonify(error="字体不存在"), 404
+        return send_from_directory(active_dir(), safe, mimetype="font/woff2")
+
+    @app.get("/api/fonts/status")
+    def fonts_status():
+        return jsonify(font_status())
 
     @app.get("/api/health")
     def health():
@@ -218,7 +261,9 @@ def create_app(test_config=None):
         try:
             with get_db() as db:
                 cursor = db.execute("INSERT INTO collections(name,created_at,updated_at) VALUES(?,?,?)", (name, stamp, stamp))
-                return jsonify(id=cursor.lastrowid, name=name), 201
+                new_id = cursor.lastrowid
+            schedule_font_rebuild()
+            return jsonify(id=new_id, name=name), 201
         except Exception as exc:
             if "UNIQUE" in str(exc):
                 return jsonify(error="句集名称已存在"), 409
@@ -231,6 +276,8 @@ def create_app(test_config=None):
             return jsonify(error="句集名称不能为空"), 400
         with get_db() as db:
             changed = db.execute("UPDATE collections SET name=?,updated_at=? WHERE id=?", (name, now_iso(), collection_id)).rowcount
+        if changed:
+            schedule_font_rebuild()
         return (jsonify(ok=True) if changed else (jsonify(error="句集不存在"), 404))
 
     @app.delete("/api/collections/<int:collection_id>")
@@ -242,6 +289,8 @@ def create_app(test_config=None):
             if db.execute("SELECT COUNT(*) n FROM collections").fetchone()["n"] <= 1:
                 return jsonify(error="至少保留一个句集"), 409
             changed = db.execute("DELETE FROM collections WHERE id=?", (collection_id,)).rowcount
+        if changed:
+            schedule_font_rebuild()
         return (jsonify(ok=True) if changed else (jsonify(error="句集不存在"), 404))
 
     @app.post("/api/sentences/organize")
@@ -291,6 +340,7 @@ def create_app(test_config=None):
                 cursor = db.execute("""INSERT INTO sentences(collection_id,chinese,japanese,chunks_json,correct_order_json,furigana_json,kana,romaji,explanation,next_review_at,created_at,updated_at)
                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, "", "", "", stamp, stamp, stamp))
                 row = db.execute("SELECT * FROM sentences WHERE id=?", (cursor.lastrowid,)).fetchone()
+            schedule_font_rebuild()
             return jsonify(sentence=sentence_dict(row)), 201
         except Exception as exc:
             if "FOREIGN KEY" in str(exc):
@@ -324,12 +374,16 @@ def create_app(test_config=None):
         furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
         with get_db() as db:
             changed = db.execute("""UPDATE sentences SET collection_id=?,chinese=?,japanese=?,chunks_json=?,correct_order_json=?,furigana_json=?,kana='',romaji='',explanation='',updated_at=? WHERE id=?""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, now_iso(), sentence_id)).rowcount
+        if changed:
+            schedule_font_rebuild()
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
 
     @app.delete("/api/sentences/<int:sentence_id>")
     def delete_sentence(sentence_id):
         with get_db() as db:
             changed = db.execute("DELETE FROM sentences WHERE id=?", (sentence_id,)).rowcount
+        if changed:
+            schedule_font_rebuild()
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
 
     @app.post("/api/practice/sessions")
@@ -482,6 +536,12 @@ def create_app(test_config=None):
         session["username"] = username
         session.permanent = True
         return jsonify(ok=True, configured=True, username=username)
+
+    # Build content-subset fonts at startup (no-op if sources missing / already current).
+    try:
+        ensure_active_fonts()
+    except Exception:
+        app.logger.exception("Initial active font build failed")
 
     return app
 

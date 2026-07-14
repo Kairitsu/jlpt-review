@@ -24,6 +24,7 @@ htmlcov/
 
 # Local tooling / debug artifacts
 .playwright-cli/
+.font-build-cache/
 *.log
 *.sqlite*
 *.db
