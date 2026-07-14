@@ -41,6 +41,7 @@ def init_db():
           japanese TEXT NOT NULL,
           chunks_json TEXT NOT NULL,
           correct_order_json TEXT NOT NULL,
+          furigana_json TEXT NOT NULL DEFAULT '[]',
           kana TEXT NOT NULL DEFAULT '',
           romaji TEXT NOT NULL DEFAULT '',
           explanation TEXT NOT NULL DEFAULT '',
@@ -90,6 +91,9 @@ def init_db():
         columns = {row["name"] for row in db.execute("PRAGMA table_info(attempts)")}
         if "stats_before_json" not in columns:
             db.execute("ALTER TABLE attempts ADD COLUMN stats_before_json TEXT NOT NULL DEFAULT '{}'")
+        sentence_columns = {row["name"] for row in db.execute("PRAGMA table_info(sentences)")}
+        if "furigana_json" not in sentence_columns:
+            db.execute("ALTER TABLE sentences ADD COLUMN furigana_json TEXT NOT NULL DEFAULT '[]'")
         db.execute("DELETE FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')")
         for row in db.execute("SELECT id,chunks_json FROM sentences").fetchall():
             chunks = json_load(row["chunks_json"], [])

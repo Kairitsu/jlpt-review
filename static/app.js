@@ -9,6 +9,12 @@ const state = {
 };
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function rubyHtml(segments) {
+  if (!Array.isArray(segments) || !segments.length) return '';
+  return segments.map(seg => seg.ruby
+    ? `<ruby>${esc(seg.text)}<rt>${esc(seg.ruby)}</rt></ruby>`
+    : esc(seg.text)).join('');
+}
 function formatDate(value) { if (!value) return '从未'; return new Intl.DateTimeFormat('zh-CN', {dateStyle:'medium', timeStyle:'short'}).format(new Date(value)); }
 function toast(message, error = false) { const el = $('#toast'); el.textContent = message; el.className = `toast${error ? ' error' : ''}`; clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.add('hidden'), 3600); }
 async function api(url, options = {}) {
@@ -101,10 +107,12 @@ async function renderHome() {
 }
 
 function addForm(data = {}) { return `<section class="page"><div class="page-head"><div><h1>${state.editing ? '编辑句子' : '添加句子'}</h1><p>输入中文和完整原句，再检查自动生成的词块。</p></div></div><div class="card form-card"><div class="form-grid"><label class="field full">所属句集<select id="collection">${collectionOptions(data.collection_id || state.activeCollection)}</select></label><label class="field">中文翻译<textarea id="chinese" placeholder="例如：即使下雨，我也想去散步。">${esc(data.chinese || '')}</textarea></label><label class="field">完整日语原句<textarea id="japanese" lang="ja" placeholder="例如：雨が降っても、散歩に行きたいです。">${esc(data.japanese || '')}</textarea></label></div><div class="form-actions"><button class="btn primary" data-action="organize">自动分块</button></div></div><div id="preview-slot"></div></section>`; }
-async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { state.draft = {chunks:state.editing.chunks.map(x => ({...x})), source:'saved'}; renderPreview(); } setChrome(); }
+async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { state.draft = {chunks:state.editing.chunks.map(x => ({...x})), source:'saved', sentenceFurigana:state.editing.furigana}; renderPreview(); } setChrome(); }
 function renderPreview() {
   const slot = $('#preview-slot'); if (!slot || !state.draft) return;
-  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>确认原句与词块顺序后保存。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div><div><span>日语原句</span><p class="preview-jp" lang="ja">${esc($('#japanese').value)}</p></div></div><div class="chunk-list preview-chunks" aria-label="按原顺序排列的词块">${state.draft.chunks.map((c, i) => `<button class="chunk ${state.selectedChunks.includes(i) ? 'selected' : ''}" data-action="select-chunk" data-index="${i}">${esc(c.text)}</button>`).join('')}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button><button class="btn outline" data-action="edit-chunk">修改词块</button></div><p class="status-note">分块方式：SudachiPy + SudachiDict-full 多粒度分析</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
+  const previewJp = (Array.isArray(state.draft.sentenceFurigana) && state.draft.sentenceFurigana.length)
+    ? rubyHtml(state.draft.sentenceFurigana) : esc($('#japanese').value);
+  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>确认原句与词块顺序后保存。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div><div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="chunk-list preview-chunks" aria-label="按原顺序排列的词块">${state.draft.chunks.map((c, i) => `<button class="chunk ${state.selectedChunks.includes(i) ? 'selected' : ''}" data-action="select-chunk" data-index="${i}">${esc(c.text)}</button>`).join('')}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button><button class="btn outline" data-action="edit-chunk">修改词块</button></div><p class="status-note">分块方式：SudachiPy + SudachiDict-full 多粒度分析</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
 }
 
 async function renderLibrary(collectionId = state.activeCollection) {
@@ -149,7 +157,11 @@ function renderPractice() {
   view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　背句子</button><div class="thin-progress"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子拼写</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, p, map)}</div><div class="candidate-area"><div class="chunk-list">${p.candidates.map(id => `<button class="candidate ${p.selected.includes(id) ? 'used' : ''}" data-action="choose" data-id="${id}" ${p.selected.includes(id) || p.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${p.checked ? answerDetails(s, map, p) : ''}<div class="practice-actions"><button class="btn outline" data-action="skip" ${p.checked || busy ? 'disabled' : ''}>跳过练习</button><button class="btn ghost" data-action="reset" ${p.checked || busy ? 'disabled' : ''}>重置</button>${p.checked ? '<button class="btn outline retry-current" data-action="retry-current">重新练习本题</button>' : ''}<button class="btn primary" data-action="${p.checked ? 'next' : 'check'}" ${!p.checked && !ready ? 'disabled' : ''}>${p.checked ? '下一题' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
-function answerDetails(s, map, p) { const user = p.selected.map(id => map[id]?.text || '').join(''); return `<div class="card answer-card"><h3>${p.result?.correct ? '回答正确' : '正确答案'}</h3>${!p.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${esc(s.japanese)}</div><p>${esc(s.chinese)}</p></div>`; }
+function answerDetails(s, map, p) {
+  const user = p.selected.map(id => map[id]?.text || '').join('');
+  const correctJp = (Array.isArray(s.furigana) && s.furigana.length) ? rubyHtml(s.furigana) : esc(s.japanese);
+  return `<div class="card answer-card"><h3>${p.result?.correct ? '回答正确' : '正确答案'}</h3>${!p.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${correctJp}</div><p>${esc(s.chinese)}</p></div>`;
+}
 async function record(action) {
   const p = state.practice;
   if (!p || p.submitting) return;

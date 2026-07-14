@@ -14,7 +14,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from auth import authed, clear, configured as auth_configured, fail, keys, lock_remaining
 from db import get_db, init_db, json_load, now_iso, set_setting, setting
 from security import hash_password, verify_password
-from tokenizer import local_tokenize, validate_chunks
+from tokenizer import furigana_segments, local_tokenize, validate_chunks
 
 INTERVALS = [1, 3, 7, 14, 30]
 
@@ -27,12 +27,13 @@ def sentence_dict(row):
     data = dict(row)
     data["chunks"] = json_load(data.pop("chunks_json"), [])
     data["correctOrder"] = json_load(data.pop("correct_order_json"), [])
+    data["furigana"] = json_load(data.pop("furigana_json", "[]"), [])
     return data
 
 
 def sentence_snapshot(row):
     item = sentence_dict(row)
-    return {key: item[key] for key in ("id", "chinese", "japanese", "chunks", "correctOrder")}
+    return {key: item[key] for key in ("id", "chinese", "japanese", "chunks", "correctOrder", "furigana")}
 
 
 def answers_match(answer, correct, chunks):
@@ -251,7 +252,11 @@ def create_app(test_config=None):
         japanese, chinese = body["japanese"], body["chinese"].strip()
         if not japanese.strip() or not chinese:
             return jsonify(error="中文翻译和日语原句都不能为空"), 400
-        return jsonify(chunks=local_tokenize(japanese), source="sudachi")
+        return jsonify(
+            chunks=local_tokenize(japanese),
+            source="sudachi",
+            sentenceFurigana=furigana_segments(japanese),
+        )
 
     def validate_sentence_payload(body):
         if not isinstance(body.get("chinese"), str) or not isinstance(body.get("japanese"), str):
@@ -281,9 +286,10 @@ def create_app(test_config=None):
             return jsonify(error=error), 400
         stamp = now_iso()
         try:
+            furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
             with get_db() as db:
-                cursor = db.execute("""INSERT INTO sentences(collection_id,chinese,japanese,chunks_json,correct_order_json,kana,romaji,explanation,next_review_at,created_at,updated_at)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), "", "", "", stamp, stamp, stamp))
+                cursor = db.execute("""INSERT INTO sentences(collection_id,chinese,japanese,chunks_json,correct_order_json,furigana_json,kana,romaji,explanation,next_review_at,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, "", "", "", stamp, stamp, stamp))
                 row = db.execute("SELECT * FROM sentences WHERE id=?", (cursor.lastrowid,)).fetchone()
             return jsonify(sentence=sentence_dict(row)), 201
         except Exception as exc:
@@ -315,8 +321,9 @@ def create_app(test_config=None):
         item, error = validate_sentence_payload(request.get_json(silent=True) or {})
         if error:
             return jsonify(error=error), 400
+        furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
         with get_db() as db:
-            changed = db.execute("""UPDATE sentences SET collection_id=?,chinese=?,japanese=?,chunks_json=?,correct_order_json=?,kana='',romaji='',explanation='',updated_at=? WHERE id=?""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), now_iso(), sentence_id)).rowcount
+            changed = db.execute("""UPDATE sentences SET collection_id=?,chinese=?,japanese=?,chunks_json=?,correct_order_json=?,furigana_json=?,kana='',romaji='',explanation='',updated_at=? WHERE id=?""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, now_iso(), sentence_id)).rowcount
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
 
     @app.delete("/api/sentences/<int:sentence_id>")

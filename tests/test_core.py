@@ -32,12 +32,44 @@ def test_organize_is_local_sudachi_only(tmp_path, monkeypatch):
     data = response.get_json()
     assert response.status_code == 200
     assert data["source"] == "sudachi"
-    assert set(data) == {"chunks", "source"}
+    assert set(data) == {"chunks", "source", "sentenceFurigana"}
     assert "".join(x["text"] for x in data["chunks"]) == "こんにちは。"
+    assert "".join(x["text"] for x in data["sentenceFurigana"]) == "こんにちは。"
     assert client.get("/api/settings").status_code == 404
     assert client.post("/api/settings/test", json={}).status_code == 404
     assert client.post("/api/sentences/organize", json={"chinese": [], "japanese": 123}).status_code == 400
     assert client.post("/api/sentences/organize", json={"chinese": "", "japanese": ""}).status_code == 400
+
+
+def test_furigana_segments_plain_kana():
+    from tokenizer import furigana_segments
+    sentence = "これはペンです。"
+    segments = furigana_segments(sentence)
+    assert "".join(seg["text"] for seg in segments) == sentence
+    assert all("ruby" not in seg for seg in segments)
+
+
+def test_furigana_segments_with_kanji():
+    from tokenizer import furigana_segments
+    sentence = "電気が消えた。"
+    segments = furigana_segments(sentence)
+    assert "".join(seg["text"] for seg in segments) == sentence
+    ruby_segs = [seg for seg in segments if seg.get("ruby")]
+    assert ruby_segs
+    denki = next((seg for seg in segments if seg["text"] == "電気"), None)
+    assert denki is not None
+    assert denki["ruby"] == "でんき"
+    # 消えた may be split as 消え+た; 消 should get き if peeled, or whole ruby if not.
+    kie = next((seg for seg in segments if "消" in seg["text"] and seg.get("ruby")), None)
+    assert kie is not None
+
+
+def test_furigana_segments_mixed_names_numbers_punctuation():
+    from tokenizer import furigana_segments
+    sentence = "田中さんは2024年、東京に行った。"
+    segments = furigana_segments(sentence)
+    assert "".join(seg["text"] for seg in segments) == sentence
+    assert isinstance(segments, list)
 
 
 def test_crud_practice_srs_report(tmp_path, monkeypatch):
