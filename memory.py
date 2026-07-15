@@ -33,13 +33,6 @@ CURVE_BLEND_K = MIN_CURVE_SAMPLES
 HOLD_THRESHOLDS = (10, 30, 60, 90)
 DUE_PRESSURE_THRESHOLD = 30
 
-RESULT_LABELS = {
-    "known": "认识",
-    "fuzzy": "模糊",
-    "forgotten": "忘记",
-    "skipped": "跳过",
-}
-
 SUCCESS_RESULTS = frozenset({"known", "fuzzy"})
 COGNITIVE_RESULTS = frozenset({"known", "fuzzy", "forgotten"})
 

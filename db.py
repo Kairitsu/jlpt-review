@@ -29,6 +29,19 @@ def _add_column_if_missing(db, table: str, column: str, ddl: str):
         db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
+def _drop_column_if_exists(db, table: str, column: str):
+    """Drop a column if present. Safe under concurrent gunicorn workers."""
+    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        return
+    try:
+        db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    except sqlite3.OperationalError as exc:
+        # Another worker may have dropped it between PRAGMA and ALTER.
+        if "no such column" not in str(exc).lower():
+            raise
+
+
 def _backfill_review_events(db):
     """One-shot: map legacy attempts into review_events when the table is empty.
 
@@ -89,9 +102,6 @@ def init_db():
           chunks_json TEXT NOT NULL,
           correct_order_json TEXT NOT NULL,
           furigana_json TEXT NOT NULL DEFAULT '[]',
-          kana TEXT NOT NULL DEFAULT '',
-          romaji TEXT NOT NULL DEFAULT '',
-          explanation TEXT NOT NULL DEFAULT '',
           study_count INTEGER NOT NULL DEFAULT 0,
           correct_count INTEGER NOT NULL DEFAULT 0,
           wrong_count INTEGER NOT NULL DEFAULT 0,
@@ -170,6 +180,10 @@ def init_db():
         _add_column_if_missing(db, "sentences", "stability", "stability REAL NOT NULL DEFAULT 1.0")
         _add_column_if_missing(db, "sentences", "review_count", "review_count INTEGER NOT NULL DEFAULT 0")
         _add_column_if_missing(db, "sentences", "lapse_count", "lapse_count INTEGER NOT NULL DEFAULT 0")
+        # Drop legacy unused sentence metadata columns (always empty in practice).
+        _drop_column_if_exists(db, "sentences", "kana")
+        _drop_column_if_exists(db, "sentences", "romaji")
+        _drop_column_if_exists(db, "sentences", "explanation")
 
         db.execute("DELETE FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')")
         for row in db.execute("SELECT id,chunks_json FROM sentences").fetchall():
@@ -177,7 +191,6 @@ def init_db():
             compact = [{"id": item.get("id"), "text": item.get("text")} for item in chunks if isinstance(item, dict)]
             if compact != chunks:
                 db.execute("UPDATE sentences SET chunks_json=? WHERE id=?", (json.dumps(compact, ensure_ascii=False), row["id"]))
-        db.execute("UPDATE sentences SET kana='',romaji='',explanation='' WHERE kana<>'' OR romaji<>'' OR explanation<>''")
         stamp = now_iso()
         db.execute("INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)", (stamp, stamp))
         _backfill_review_events(db)

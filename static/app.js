@@ -113,19 +113,118 @@ async function ensureDashboard() {
 function collectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join(''); }
 function setActiveCollection(collectionId) { state.activeCollection = Number(collectionId) || 0; localStorage.setItem('activeCollection', state.activeCollection); }
 function dueCollectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)} · ${c.due} 待复习</option>`).join(''); }
-function dueCountOptions(due) { return [5,10,20].filter(count => count <= due).map(count => `<button class="count-option due-count-option" data-action="set-due-count" data-count="${count}">${count} 句</button>`).join(''); }
+
+/** Shared practice-count picker (library + home due). idPrefix keeps DOM ids distinct. */
+function countPickerIds(idPrefix) {
+  if (idPrefix === 'due-count') {
+    return {
+      inputId: 'due-custom-count',
+      hintId: 'due-count-hint',
+      optionClass: 'count-option due-count-option',
+      optionSelector: '.due-count-option',
+      setAction: 'set-due-count',
+      scope: view,
+    };
+  }
+  return {
+    inputId: 'custom-count',
+    hintId: 'count-hint',
+    optionClass: 'count-option',
+    optionSelector: '.count-option',
+    setAction: 'set-count',
+    scope: document,
+  };
+}
+
+function renderCountPicker({
+  idPrefix,
+  max,
+  quickOptions = [5, 10, 20],
+  filterQuick = false,
+  startAction,
+  startLabel,
+  groupAriaLabel,
+  initialHint,
+  emptyHtml = null,
+}) {
+  const cfg = countPickerIds(idPrefix);
+  let optionsInner;
+  if (emptyHtml != null && !max) {
+    optionsInner = emptyHtml;
+  } else {
+    const nums = filterQuick ? quickOptions.filter(n => n <= max) : quickOptions;
+    const buttons = nums.map(n => `<button class="${cfg.optionClass}" data-action="${cfg.setAction}" data-count="${n}">${n} 句</button>`).join('');
+    const inputMax = idPrefix === 'count' ? Math.max(max, 1) : max;
+    optionsInner = `${buttons}<button class="${cfg.optionClass} active" data-action="${cfg.setAction}" data-count="all">全部</button><label class="custom-count">自定义<input id="${cfg.inputId}" type="number" min="1" max="${inputMax}" placeholder="1-${max}"></label><button class="btn primary" data-action="${startAction}" ${!max ? 'disabled' : ''}>${startLabel}</button>`;
+  }
+  return `<div class="count-options" role="group" aria-label="${groupAriaLabel}">${optionsInner}</div><p id="${cfg.hintId}" class="status-note">${initialHint}</p>`;
+}
+
+function selectCountOption(idPrefix, button) {
+  const cfg = countPickerIds(idPrefix);
+  $$(cfg.optionSelector, cfg.scope).forEach(option => option.classList.toggle('active', option === button));
+  const input = $(`#${cfg.inputId}`);
+  if (input) input.value = '';
+}
+
+/**
+ * Sync hint / start disabled from custom input (document-level input handler calls this).
+ * clearActive: when true (typing in custom field), deselect quick options first.
+ * set-due-count calls with clearActive false so the clicked button stays active.
+ */
+function bindCountPicker(idPrefix, max, { mode = 'soft', defaultHint = '', startAction, clearActive = false } = {}) {
+  const cfg = countPickerIds(idPrefix);
+  const input = $(`#${cfg.inputId}`);
+  const hint = $(`#${cfg.hintId}`);
+  if (!input || !hint) return;
+
+  if (mode === 'strict') {
+    if (clearActive) $$(cfg.optionSelector, cfg.scope).forEach(option => option.classList.remove('active'));
+    const start = startAction ? $(`[data-action="${startAction}"]`, view) : null;
+    const value = input.value.trim();
+    if (!value) {
+      if (start) start.disabled = false;
+      hint.textContent = defaultHint || `本句集有 ${max} 句待复习，可从到期最早的句子开始。`;
+      return;
+    }
+    const count = Number(value);
+    const valid = Number.isInteger(count) && count >= 1 && count <= max;
+    if (start) start.disabled = !valid;
+    hint.textContent = valid ? `将复习 ${count} 句。` : `请输入 1 到 ${max} 之间的整数。`;
+    return;
+  }
+
+  // soft (collection practice): only react when input has a value; never disable start
+  if (!input.value) return;
+  if (clearActive) $$(cfg.optionSelector, cfg.scope).forEach(option => option.classList.remove('active'));
+  if (Number(input.value) > max) {
+    hint.textContent = `当前句集只有 ${max} 句，开始时将自动调整为全部。`;
+  } else {
+    hint.textContent = `将随机练习 ${Math.max(1, Number(input.value) || 1)} 句。`;
+  }
+}
+
+function readCountPickerSelection(idPrefix, { trimCustom = false } = {}) {
+  const cfg = countPickerIds(idPrefix);
+  const raw = $(`#${cfg.inputId}`)?.value ?? '';
+  const custom = trimCustom ? raw.trim() : raw;
+  const selected = $(`${cfg.optionSelector}.active`, cfg.scope)?.dataset.count || 'all';
+  return { custom, selected, count: custom || selected };
+}
+
 function renderDuePicker(data, active) {
   const due = active?.due || 0;
-  return `<div class="card practice-picker home-practice-picker"><div><h2>选择本轮复习</h2><p>先选句集，再决定本轮练习数量。</p><label class="field">练习句集<select id="due-collection" aria-label="练习句集">${dueCollectionOptions(active?.id)}</select></label></div><div class="count-options" role="group" aria-label="本轮待复习数量">${due ? `${dueCountOptions(due)}<button class="count-option due-count-option active" data-action="set-due-count" data-count="all">全部</button><label class="custom-count">自定义<input id="due-custom-count" type="number" min="1" max="${due}" placeholder="1-${due}"></label><button class="btn primary" data-action="start-due-practice">开始复习</button>` : '<span class="status-note">该句集当前没有待复习句子。</span><button class="btn primary" data-action="start-due-practice" disabled>开始复习</button>'}</div><p id="due-count-hint" class="status-note">${due ? `本句集有 ${due} 句待复习，可从到期最早的句子开始。` : '请选择有待复习句子的句集后再开始。'}</p></div>`;
-}
-function updateDueCountHint() {
-  const input = $('#due-custom-count'), hint = $('#due-count-hint'), start = $('[data-action="start-due-practice"]', view);
-  if (!input || !hint || !start) return;
-  const due = Number(input.max), value = input.value.trim();
-  if (!value) { start.disabled = false; hint.textContent = `本句集有 ${due} 句待复习，可从到期最早的句子开始。`; return; }
-  const count = Number(value), valid = Number.isInteger(count) && count >= 1 && count <= due;
-  start.disabled = !valid;
-  hint.textContent = valid ? `将复习 ${count} 句。` : `请输入 1 到 ${due} 之间的整数。`;
+  const picker = renderCountPicker({
+    idPrefix: 'due-count',
+    max: due,
+    filterQuick: true,
+    startAction: 'start-due-practice',
+    startLabel: '开始复习',
+    groupAriaLabel: '本轮待复习数量',
+    initialHint: due ? `本句集有 ${due} 句待复习，可从到期最早的句子开始。` : '请选择有待复习句子的句集后再开始。',
+    emptyHtml: '<span class="status-note">该句集当前没有待复习句子。</span><button class="btn primary" data-action="start-due-practice" disabled>开始复习</button>',
+  });
+  return `<div class="card practice-picker home-practice-picker"><div><h2>选择本轮复习</h2><p>先选句集，再决定本轮练习数量。</p><label class="field">练习句集<select id="due-collection" aria-label="练习句集">${dueCollectionOptions(active?.id)}</select></label></div>${picker}</div>`;
 }
 
 async function renderHome() {
@@ -146,7 +245,16 @@ function renderPreview() {
 async function renderLibrary(collectionId = state.activeCollection) {
   await ensureDashboard(); state.activeCollection = Number(collectionId) || state.activeCollection; localStorage.setItem('activeCollection', state.activeCollection);
   const data = await api(`/api/sentences?collectionId=${state.activeCollection}`); const total = data.sentences.length;
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>句集详情</h1><p>筛选、查找，或勾选句子开始专项练习。</p></div><button class="btn primary" data-route="add">＋ 添加句子</button></div><div class="card practice-picker"><div><h2>开始练习</h2><p>从本句集中随机抽取题目。</p></div><div class="count-options" role="group" aria-label="本轮题目数量">${[5,10,20].map(n => `<button class="count-option" data-action="set-count" data-count="${n}">${n} 句</button>`).join('')}<button class="count-option active" data-action="set-count" data-count="all">全部</button><label class="custom-count">自定义<input id="custom-count" type="number" min="1" max="${Math.max(total, 1)}" placeholder="1-${total}"></label><button class="btn primary" data-action="start-collection" ${!total ? 'disabled' : ''}>开始练习</button></div><p id="count-hint" class="status-note">本句集共 ${total} 句。</p></div><div class="toolbar"><select id="library-collection">${collectionOptions(state.activeCollection)}</select><input id="library-search" type="search" placeholder="搜索中文或日语"><select id="library-sort"><option value="created">按创建时间</option><option value="error">按错误率</option><option value="recent">按最近练习</option></select></div><div class="section-title"><h2>共 <span id="library-count">${total}</span> 条</h2><div><button class="btn outline" data-action="manage-collection">管理句集</button> <button class="btn outline" data-action="move-selected" id="move-selected-btn" disabled>转移选中句子</button> <button class="btn primary" data-action="practice-selected">专项练习</button></div></div><div id="library-list" class="card library-list"></div></section>`;
+  const countPicker = renderCountPicker({
+    idPrefix: 'count',
+    max: total,
+    filterQuick: false,
+    startAction: 'start-collection',
+    startLabel: '开始练习',
+    groupAriaLabel: '本轮题目数量',
+    initialHint: `本句集共 ${total} 句。`,
+  });
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>句集详情</h1><p>筛选、查找，或勾选句子开始专项练习。</p></div><button class="btn primary" data-route="add">＋ 添加句子</button></div><div class="card practice-picker"><div><h2>开始练习</h2><p>从本句集中随机抽取题目。</p></div>${countPicker}</div><div class="toolbar"><select id="library-collection">${collectionOptions(state.activeCollection)}</select><input id="library-search" type="search" placeholder="搜索中文或日语"><select id="library-sort"><option value="created">按创建时间</option><option value="error">按错误率</option><option value="recent">按最近练习</option></select></div><div class="section-title"><h2>共 <span id="library-count">${total}</span> 条</h2><div><button class="btn outline" data-action="manage-collection">管理句集</button> <button class="btn outline" data-action="move-selected" id="move-selected-btn" disabled>转移选中句子</button> <button class="btn primary" data-action="practice-selected">专项练习</button></div></div><div id="library-list" class="card library-list"></div></section>`;
   renderLibraryRows(data.sentences); setChrome();
 }
 function renderLibraryRows(items) { const list = $('#library-list'); $('#library-count').textContent = items.length; list.innerHTML = items.length ? items.map(s => `<div class="library-row"><input type="checkbox" class="sentence-check" value="${s.id}" aria-label="选择句子"><div><div class="library-jp" lang="ja">${esc(s.japanese)}</div><div>${esc(s.chinese)}</div><div class="row-stats"><span>练习 ${s.study_count}</span><span>正确 ${s.correct_count}</span><span>错误 ${s.wrong_count}</span><span>连续 ${s.correct_streak}</span><span>下次 ${formatDate(s.next_review_at)}</span></div></div><div class="row-actions"><button class="small-btn" data-action="edit-sentence" data-id="${s.id}">编辑</button><button class="small-btn" data-action="delete-sentence" data-id="${s.id}">删除</button></div></div>`).join('') : `<div class="empty">这个句集还没有句子，先添加第一句吧。</div>`; updateMoveSelectedBtn(); }
@@ -233,10 +341,27 @@ document.addEventListener('click', async event => {
     else if (action === 'new-collection') { const name = prompt('新句集名称：'); if (name) { await api('/api/collections', {method:'POST', body:JSON.stringify({name})}); state.dashboard = null; await renderHome(); } }
     else if (action === 'open-collection') { state.activeCollection = Number(button.dataset.id); route('library', {collectionId:state.activeCollection}); }
     else if (action === 'start-due') { const active = state.dashboard?.collections.find(c => c.id === state.activeCollection); if (!active?.due) { toast('当前句集没有待复习句子'); return; } state.homeDuePicker = true; await renderHome(); }
-    else if (action === 'set-due-count') { $$('.due-count-option', view).forEach(option => option.classList.toggle('active', option === button)); $('#due-custom-count').value = ''; updateDueCountHint(); }
-    else if (action === 'start-due-practice') { const collectionId = Number($('#due-collection')?.value), active = state.dashboard?.collections.find(c => c.id === collectionId); if (!active?.due) { toast('所选句集当前没有待复习句子'); return; } const custom = $('#due-custom-count')?.value.trim(); if (custom) { const count = Number(custom); if (!Number.isInteger(count) || count < 1 || count > active.due) { toast(`请输入 1 到 ${active.due} 之间的整数`); return; } } const selected = $('.due-count-option.active', view)?.dataset.count || 'all'; state.homeDuePicker = false; await startPractice({collectionId, count:custom || selected}); }
-    else if (action === 'set-count') { $$('.count-option').forEach(x => x.classList.toggle('active', x === button)); $('#custom-count').value = ''; }
-    else if (action === 'start-collection') { const custom = $('#custom-count').value; const selected = $('.count-option.active')?.dataset.count || 'all'; await startPractice({scope:'collection', collectionId:state.activeCollection, count:custom || selected}); }
+    else if (action === 'set-due-count') {
+      selectCountOption('due-count', button);
+      const due = Number($('#due-custom-count')?.max || 0);
+      bindCountPicker('due-count', due, { mode: 'strict', startAction: 'start-due-practice', defaultHint: `本句集有 ${due} 句待复习，可从到期最早的句子开始。` });
+    }
+    else if (action === 'start-due-practice') {
+      const collectionId = Number($('#due-collection')?.value), active = state.dashboard?.collections.find(c => c.id === collectionId);
+      if (!active?.due) { toast('所选句集当前没有待复习句子'); return; }
+      const { custom, selected } = readCountPickerSelection('due-count', { trimCustom: true });
+      if (custom) {
+        const count = Number(custom);
+        if (!Number.isInteger(count) || count < 1 || count > active.due) { toast(`请输入 1 到 ${active.due} 之间的整数`); return; }
+      }
+      state.homeDuePicker = false;
+      await startPractice({ collectionId, count: custom || selected });
+    }
+    else if (action === 'set-count') { selectCountOption('count', button); }
+    else if (action === 'start-collection') {
+      const { custom, selected } = readCountPickerSelection('count', { trimCustom: false });
+      await startPractice({ scope: 'collection', collectionId: state.activeCollection, count: custom || selected });
+    }
     else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分块…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
     else if (action === 'select-chunk') { const i = Number(button.dataset.index), at = state.selectedChunks.indexOf(i); if (at >= 0) state.selectedChunks.splice(at, 1); else { if (state.selectedChunks.length >= 2) state.selectedChunks.shift(); state.selectedChunks.push(i); } state.selectedChunks.sort((a,b) => a-b); renderPreview(); }
     else if (action === 'split-chunk') { if (state.selectedChunks.length !== 1) throw new Error('请先选中一个要拆分的词块'); const i = state.selectedChunks[0], item = state.draft.chunks[i], pos = Number(prompt(`“${item.text}” 在第几个字符后拆分？`, Math.max(1, Math.floor(item.text.length / 2)))); if (!Number.isInteger(pos) || pos <= 0 || pos >= item.text.length) throw new Error('拆分位置必须位于词块内部'); state.draft.chunks.splice(i, 1, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(0,pos)}, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(pos)}); state.selectedChunks = []; renderPreview(); }
@@ -285,8 +410,18 @@ document.addEventListener('change', event => {
 });
 document.addEventListener('input', event => {
   if (event.target.id === 'library-search') { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(reloadLibrary, 250); }
-  if (event.target.id === 'custom-count' && event.target.value) { $$('.count-option').forEach(x => x.classList.remove('active')); const total = Number(event.target.max); if (Number(event.target.value) > total) $('#count-hint').textContent = `当前句集只有 ${total} 句，开始时将自动调整为全部。`; else $('#count-hint').textContent = `将随机练习 ${Math.max(1, Number(event.target.value) || 1)} 句。`; }
-  if (event.target.id === 'due-custom-count') { $$('.due-count-option', view).forEach(option => option.classList.remove('active')); updateDueCountHint(); }
+  if (event.target.id === 'custom-count') {
+    bindCountPicker('count', Number(event.target.max), { mode: 'soft', clearActive: true });
+  }
+  if (event.target.id === 'due-custom-count') {
+    const due = Number(event.target.max);
+    bindCountPicker('due-count', due, {
+      mode: 'strict',
+      startAction: 'start-due-practice',
+      defaultHint: `本句集有 ${due} 句待复习，可从到期最早的句子开始。`,
+      clearActive: true,
+    });
+  }
 });
 document.addEventListener('submit', async event => {
   event.preventDefault();

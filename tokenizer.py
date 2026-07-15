@@ -49,7 +49,8 @@ def _append_surface(result: list[Token], surface: str, start: int, pos: tuple[st
             result.append(Token(char, cursor, cursor + len(char), pos, char, char, mode, True))
             cursor += len(char)
         return
-    result.append(Token(surface, start, start + len(surface), pos, dictionary_form, normalized_form, mode, bool(surface) and all(char in PUNCT for char in surface)))
+    # 全标点 surface 已在上方逐字拆出并 return；能走到这里则必然不是整段标点
+    result.append(Token(surface, start, start + len(surface), pos, dictionary_form, normalized_form, mode, False))
 
 
 def analyze(text: str, mode: str) -> list[Token]:

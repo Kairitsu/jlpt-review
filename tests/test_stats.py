@@ -149,6 +149,63 @@ def test_learning_stats_buckets_and_today(tmp_path, monkeypatch):
     assert data["series"][-1]["known"] >= 1
 
 
+def test_dashboard_today_aligns_with_stats_across_utc_boundary(tmp_path, monkeypatch):
+    """Dashboard and stats_learning must share local-day + review_events for 'today'.
+
+    Construct events where UTC calendar date may differ from the server local date
+    (common for Asia/Shanghai near the UTC day boundary). Old dashboard used
+    substr(attempts.created_at,1,10) against UTC date and would miscount.
+    """
+    from memory import local_date, parse_iso
+
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    s_today = make_sentence(client, collection, "跨日A")
+    s_skipped = make_sentence(client, collection, "跨日B")
+    s_tomorrow = make_sentence(client, collection, "跨日C")
+
+    today = local_date()
+    local_tz = datetime.now().astimezone().tzinfo
+    # Local today 01:00 — often still previous UTC date for +HH:MM zones.
+    local_morning = (
+        datetime.combine(today, datetime.min.time()).replace(tzinfo=local_tz)
+        + timedelta(hours=1)
+    )
+    stamp_today = local_morning.astimezone(timezone.utc).isoformat(timespec="seconds")
+    # Local tomorrow 01:00 — must not count toward "today".
+    stamp_tomorrow = (
+        local_morning + timedelta(days=1)
+    ).astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    assert local_date(parse_iso(stamp_today)) == today
+    assert local_date(parse_iso(stamp_tomorrow)) == today + timedelta(days=1)
+
+    with db.get_db() as connection:
+        for sid, result, stamp in [
+            (s_today["id"], "known", stamp_today),
+            (s_skipped["id"], "skipped", stamp_today),
+            (s_tomorrow["id"], "known", stamp_tomorrow),
+        ]:
+            connection.execute(
+                """INSERT INTO review_events(
+                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
+                     is_new, stability_before, stability_after, interval_days, created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (sid, None, stamp, result, 5000, 1, 1, 1.0, 2.0, 1.0, stamp),
+            )
+
+    dash = client.get("/api/dashboard").get_json()
+    col = next(c for c in dash["collections"] if c["id"] == collection)
+    # Only the non-skipped local-today sentence (distinct) counts.
+    assert col["today"] == 1
+
+    stats = client.get("/api/stats/learning?granularity=day").get_json()
+    # Same local day: the known event is included; tomorrow's is not.
+    assert stats["today"]["known"] == 1
+    assert stats["today"]["fuzzy"] == 0
+    assert stats["today"]["forgotten"] == 0
+
+
 def test_learning_stats_trims_leading_keeps_mid_gap(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]

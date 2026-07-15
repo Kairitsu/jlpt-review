@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -45,6 +46,32 @@ from tokenizer import furigana_segments, local_tokenize, validate_chunks
 
 def truthy(name: str, default=False):
     return os.environ.get(name, str(default)).lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_limit(requested, available, subject):
+    """返回 (limit, notice) 或 (None, error_message)。"""
+    if requested in (None, "all"):
+        return available, ""
+    try:
+        limit = max(1, int(requested))
+    except (TypeError, ValueError):
+        return None, "题目数量必须是正整数"
+    notice = ""
+    if limit >= available:
+        if limit > available:
+            notice = f"{subject}只有 {available} 句，已调整为全部"
+        limit = available
+    return limit, notice
+
+
+def _hard_delete_sentences(db, sentence_ids: list[int]) -> None:
+    """级联硬删除给定句子及其 review_events / attempts 记录。空列表直接返回。"""
+    if not sentence_ids:
+        return
+    placeholders = ",".join("?" for _ in sentence_ids)
+    db.execute(f"DELETE FROM review_events WHERE sentence_id IN ({placeholders})", sentence_ids)
+    db.execute(f"DELETE FROM attempts WHERE sentence_id IN ({placeholders})", sentence_ids)
+    db.execute(f"DELETE FROM sentences WHERE id IN ({placeholders})", sentence_ids)
 
 
 def sentence_dict(row):
@@ -340,7 +367,7 @@ def create_app(test_config=None):
 
     @app.get("/api/dashboard")
     def dashboard():
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = local_date()
         now = now_iso()
         with get_db() as db:
             collections = [dict(row) for row in db.execute("""
@@ -349,10 +376,24 @@ def create_app(test_config=None):
               FROM collections c LEFT JOIN sentences s ON s.collection_id=c.id
               GROUP BY c.id ORDER BY c.created_at
             """)]
+            # Align "today" with stats_learning: local calendar day + review_events
+            # (result != skipped), distinct sentence_id per collection.
+            event_rows = db.execute(
+                """SELECT re.sentence_id, re.reviewed_at, s.collection_id
+                   FROM review_events re
+                   JOIN sentences s ON s.id = re.sentence_id
+                   WHERE re.result != 'skipped' AND re.sentence_id IS NOT NULL"""
+            ).fetchall()
+            today_ids: dict[int, set[int]] = {}
+            for row in event_rows:
+                dt = parse_iso(row["reviewed_at"])
+                if not dt or local_date(dt) != today:
+                    continue
+                today_ids.setdefault(row["collection_id"], set()).add(row["sentence_id"])
             for item in collections:
                 item["total"], item["learned"] = int(item["total"] or 0), int(item["learned"] or 0)
                 item["due"] = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=? AND next_review_at<=?", (item["id"], now)).fetchone()["n"]
-                item["today"] = db.execute("SELECT COUNT(DISTINCT sentence_id) n FROM attempts WHERE sentence_id IN (SELECT id FROM sentences WHERE collection_id=?) AND substr(created_at,1,10)=?", (item["id"], today)).fetchone()["n"]
+                item["today"] = len(today_ids.get(item["id"], set()))
         return jsonify(collections=collections)
 
     @app.post("/api/collections")
@@ -367,10 +408,8 @@ def create_app(test_config=None):
                 new_id = cursor.lastrowid
             schedule_font_rebuild()
             return jsonify(id=new_id, name=name), 201
-        except Exception as exc:
-            if "UNIQUE" in str(exc):
-                return jsonify(error="句集名称已存在"), 409
-            raise
+        except sqlite3.IntegrityError:
+            return jsonify(error="句集名称已存在"), 409
 
     @app.patch("/api/collections/<int:collection_id>")
     def rename_collection(collection_id):
@@ -395,11 +434,7 @@ def create_app(test_config=None):
             ids = [row["id"] for row in db.execute("SELECT id FROM sentences WHERE collection_id=?", (collection_id,)).fetchall()]
             if ids and not cascade:
                 return jsonify(error="请先移动或删除句集中的句子"), 409
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                db.execute(f"DELETE FROM review_events WHERE sentence_id IN ({placeholders})", ids)
-                db.execute(f"DELETE FROM attempts WHERE sentence_id IN ({placeholders})", ids)
-                db.execute(f"DELETE FROM sentences WHERE id IN ({placeholders})", ids)
+            _hard_delete_sentences(db, ids)
             db.execute("DELETE FROM collections WHERE id=?", (collection_id,))
         schedule_font_rebuild()
         return jsonify(ok=True)
@@ -448,15 +483,13 @@ def create_app(test_config=None):
         try:
             furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
             with get_db() as db:
-                cursor = db.execute("""INSERT INTO sentences(collection_id,chinese,japanese,chunks_json,correct_order_json,furigana_json,kana,romaji,explanation,next_review_at,created_at,updated_at)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, "", "", "", stamp, stamp, stamp))
+                cursor = db.execute("""INSERT INTO sentences(collection_id,chinese,japanese,chunks_json,correct_order_json,furigana_json,next_review_at,created_at,updated_at)
+                  VALUES(?,?,?,?,?,?,?,?,?)""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, stamp, stamp, stamp))
                 row = db.execute("SELECT * FROM sentences WHERE id=?", (cursor.lastrowid,)).fetchone()
             schedule_font_rebuild()
             return jsonify(sentence=sentence_dict(row)), 201
-        except Exception as exc:
-            if "FOREIGN KEY" in str(exc):
-                return jsonify(error="所属句集不存在"), 400
-            raise
+        except sqlite3.IntegrityError:
+            return jsonify(error="所属句集不存在"), 400
 
     @app.get("/api/sentences")
     def list_sentences():
@@ -484,7 +517,7 @@ def create_app(test_config=None):
             return jsonify(error=error), 400
         furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
         with get_db() as db:
-            changed = db.execute("""UPDATE sentences SET collection_id=?,chinese=?,japanese=?,chunks_json=?,correct_order_json=?,furigana_json=?,kana='',romaji='',explanation='',updated_at=? WHERE id=?""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, now_iso(), sentence_id)).rowcount
+            changed = db.execute("""UPDATE sentences SET collection_id=?,chinese=?,japanese=?,chunks_json=?,correct_order_json=?,furigana_json=?,updated_at=? WHERE id=?""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, now_iso(), sentence_id)).rowcount
         if changed:
             schedule_font_rebuild()
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
@@ -519,9 +552,7 @@ def create_app(test_config=None):
             exists = db.execute("SELECT id FROM sentences WHERE id=?", (sentence_id,)).fetchone()
             if not exists:
                 return jsonify(error="句子不存在"), 404
-            db.execute("DELETE FROM review_events WHERE sentence_id=?", (sentence_id,))
-            db.execute("DELETE FROM attempts WHERE sentence_id=?", (sentence_id,))
-            db.execute("DELETE FROM sentences WHERE id=?", (sentence_id,))
+            _hard_delete_sentences(db, [sentence_id])
         schedule_font_rebuild()
         return jsonify(ok=True)
 
@@ -532,7 +563,10 @@ def create_app(test_config=None):
         notice = ""
         with get_db() as db:
             if isinstance(ids, list) and ids:
-                clean = [int(value) for value in ids]
+                try:
+                    clean = [int(value) for value in ids]
+                except (ValueError, TypeError):
+                    return jsonify(error="参数无效"), 400
                 placeholders = ",".join("?" for _ in clean)
                 rows = db.execute(f"SELECT id FROM sentences WHERE id IN ({placeholders})", clean).fetchall()
                 selected = [row["id"] for row in rows]
@@ -543,18 +577,10 @@ def create_app(test_config=None):
                 available = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection_id,)).fetchone()["n"]
                 if not available:
                     return jsonify(error="当前句集还没有句子"), 400
-                requested = body.get("count")
-                if requested in (None, "all"):
-                    limit = available
-                else:
-                    try:
-                        limit = max(1, int(requested))
-                    except (TypeError, ValueError):
-                        return jsonify(error="题目数量必须是正整数"), 400
-                    if limit >= available:
-                        if limit > available:
-                            notice = f"当前句集只有 {available} 句，已调整为全部"
-                        limit = available
+                limit, msg = _resolve_limit(body.get("count"), available, "当前句集")
+                if limit is None:
+                    return jsonify(error=msg), 400
+                notice = msg
                 selected = [row["id"] for row in db.execute("SELECT id FROM sentences WHERE collection_id=? ORDER BY RANDOM() LIMIT ?", (collection_id, limit))]
                 source = "collection"
             else:
@@ -566,15 +592,11 @@ def create_app(test_config=None):
                     query, query_params = f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at", params
                 else:
                     available = db.execute(f"SELECT COUNT(*) n FROM sentences WHERE {where}", params).fetchone()["n"]
-                    try:
-                        limit = max(1, int(requested))
-                    except (TypeError, ValueError):
-                        return jsonify(error="题目数量必须是正整数"), 400
-                    if limit >= available:
-                        if limit > available:
-                            subject = "当前句集待复习" if body.get("collectionId") else "当前待复习"
-                            notice = f"{subject}只有 {available} 句，已调整为全部"
-                        limit = available
+                    subject = "当前句集待复习" if body.get("collectionId") else "当前待复习"
+                    limit, msg = _resolve_limit(requested, available, subject)
+                    if limit is None:
+                        return jsonify(error=msg), 400
+                    notice = msg
                     query, query_params = f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at LIMIT ?", [*params, limit]
                 selected = [row["id"] for row in db.execute(query, query_params)]
                 source = "due"
@@ -588,7 +610,11 @@ def create_app(test_config=None):
     @app.post("/api/practice/sessions/<int:session_id>/attempts")
     def record_attempt(session_id):
         body = request.get_json(silent=True) or {}
-        sentence_id, action = int(body.get("sentenceId", 0)), str(body.get("action", "check"))
+        try:
+            sentence_id = int(body.get("sentenceId", 0))
+        except (ValueError, TypeError):
+            return jsonify(error="参数无效"), 400
+        action = str(body.get("action", "check"))
         answer = body.get("answerOrder")
         if not isinstance(answer, list):
             answer = []
