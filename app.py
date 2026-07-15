@@ -288,6 +288,9 @@ def create_app(test_config=None):
         # Hashed active font files are content-addressed; cache forever.
         if request.path.startswith("/api/fonts/files/"):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        # App JS/CSS: allow store + revalidate so 304 works (ETag / Last-Modified).
+        elif request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
         if request.is_secure:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response

@@ -50,6 +50,18 @@ const statsState = {
   resizeObservers: {},
 };
 
+/** In-memory API response cache. Keys: curve | learning:{day|week|month} | retention:{day|week|month} */
+const statsDataCache = Object.create(null);
+
+function statsCacheKey(tab, granularity) {
+  if (tab === 'curve') return 'curve';
+  return `${tab}:${granularity}`;
+}
+
+function clearStatsCache() {
+  Object.keys(statsDataCache).forEach(k => { delete statsDataCache[k]; });
+}
+
 function isNarrowStatsViewport() {
   return typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(max-width: 480px)').matches;
 }
@@ -155,7 +167,6 @@ async function renderStats() {
   setChrome();
   const panel = document.getElementById('stats-panel');
   if (!panel) return;
-  panel.innerHTML = '<p class="status-note">加载中…</p>';
   try {
     if (statsState.tab === 'curve') await renderForgettingCurve(panel);
     else if (statsState.tab === 'learning') await renderLearningStats(panel);
@@ -166,7 +177,13 @@ async function renderStats() {
 }
 
 async function renderForgettingCurve(panel) {
-  const data = await api('/api/stats/forgetting-curve');
+  const key = statsCacheKey('curve');
+  let data = statsDataCache[key];
+  if (!data) {
+    panel.innerHTML = '<p class="status-note">加载中…</p>';
+    data = await api('/api/stats/forgetting-curve');
+    statsDataCache[key] = data;
+  }
   const labels = data.points.map(p => p.label);
   const theory = data.points.map(p => p.theory);
   const user = data.points.map(p => (p.user == null ? p.theory : p.user));
@@ -227,10 +244,16 @@ async function renderForgettingCurve(panel) {
 }
 
 async function renderLearningStats(panel) {
-  const data = await api(`/api/stats/learning?granularity=${encodeURIComponent(statsState.learningGranularity)}`);
+  const gran = statsState.learningGranularity;
+  const key = statsCacheKey('learning', gran);
+  let data = statsDataCache[key];
+  if (!data) {
+    panel.innerHTML = '<p class="status-note">加载中…</p>';
+    data = await api(`/api/stats/learning?granularity=${encodeURIComponent(gran)}`);
+    statsDataCache[key] = data;
+  }
   const t = data.today || {};
   const mode = statsState.learningMode;
-  const gran = statsState.learningGranularity;
   const series = data.series || [];
 
   panel.innerHTML = `
@@ -301,7 +324,13 @@ async function renderLearningStats(panel) {
 
 async function renderRetentionStats(panel) {
   const gran = statsState.retentionGranularity;
-  const data = await api(`/api/stats/retention?granularity=${encodeURIComponent(gran)}`);
+  const key = statsCacheKey('retention', gran);
+  let data = statsDataCache[key];
+  if (!data) {
+    panel.innerHTML = '<p class="status-note">加载中…</p>';
+    data = await api(`/api/stats/retention?granularity=${encodeURIComponent(gran)}`);
+    statsDataCache[key] = data;
+  }
   const series = data.series || [];
   const last = series[series.length - 1] || {};
 
@@ -389,6 +418,7 @@ function handleStatsAction(action, button) {
 window.renderStats = renderStats;
 window.handleStatsAction = handleStatsAction;
 window.destroyStatsCharts = destroyStatsCharts;
+window.clearStatsCache = clearStatsCache;
 // Test/debug helpers (also used by docs)
 window.__STATS_VISIBLE_BUCKETS = VISIBLE_BUCKETS;
 window.__STATS_PX_PER_BUCKET = PX_PER_BUCKET;
