@@ -12,4 +12,4 @@ RUN useradd -u 1000 -m appuser \
     && chown -R appuser:appuser /app/data
 USER appuser
 EXPOSE 8000
-CMD ["gunicorn", "--workers", "2", "--bind", "0.0.0.0:8000", "--timeout", "90", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+CMD ["gunicorn", "--workers", "3", "--threads", "2", "--worker-class", "gthread", "--bind", "0.0.0.0:8000", "--timeout", "90", "--access-logfile", "-", "--error-logfile", "-", "app:app"]

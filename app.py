@@ -369,6 +369,9 @@ def create_app(test_config=None):
     def dashboard():
         today = local_date()
         now = now_iso()
+        # 足够覆盖任意时区偏移(-12~+14)下的本地"今天"，把范围过滤下推到 SQL，
+        # 避免全表扫描 review_events。
+        lower_bound = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
         with get_db() as db:
             collections = [dict(row) for row in db.execute("""
               SELECT c.id,c.name,COUNT(s.id) total,
@@ -382,7 +385,9 @@ def create_app(test_config=None):
                 """SELECT re.sentence_id, re.reviewed_at, s.collection_id
                    FROM review_events re
                    JOIN sentences s ON s.id = re.sentence_id
-                   WHERE re.result != 'skipped' AND re.sentence_id IS NOT NULL"""
+                   WHERE re.result != 'skipped' AND re.sentence_id IS NOT NULL
+                     AND re.reviewed_at >= ?""",
+                (lower_bound,),
             ).fetchall()
             today_ids: dict[int, set[int]] = {}
             for row in event_rows:
@@ -855,11 +860,16 @@ def create_app(test_config=None):
         granularity = request.args.get("granularity", "day")
         g, buckets = _bucket_specs(granularity)
         series = []
+        earliest_local_date = buckets[0][1] - timedelta(days=2)
+        lower_bound = datetime.combine(
+            earliest_local_date, datetime.min.time(), tzinfo=timezone.utc
+        ).isoformat(timespec="seconds")
         with get_db() as db:
             events = [
                 dict(row)
                 for row in db.execute(
-                    "SELECT reviewed_at, result, is_new, duration_ms FROM review_events ORDER BY reviewed_at"
+                    "SELECT reviewed_at, result, is_new, duration_ms FROM review_events WHERE reviewed_at >= ? ORDER BY reviewed_at",
+                    (lower_bound,),
                 ).fetchall()
             ]
             now = now_iso()
@@ -934,48 +944,62 @@ def create_app(test_config=None):
     def stats_retention():
         granularity = request.args.get("granularity", "week")
         g, buckets = _bucket_specs(granularity)
+        earliest_local_date = buckets[0][1] - timedelta(days=2)
+        lower_bound = datetime.combine(
+            earliest_local_date, datetime.min.time(), tzinfo=timezone.utc
+        ).isoformat(timespec="seconds")
         with get_db() as db:
             sentences = [
                 dict(row)
-                for row in db.execute(
-                    "SELECT id, created_at, stability FROM sentences"
-                ).fetchall()
+                for row in db.execute("SELECT id, created_at, stability FROM sentences").fetchall()
             ]
             events = [
                 dict(row)
                 for row in db.execute(
                     """SELECT sentence_id, reviewed_at, stability_after FROM review_events
-                       WHERE sentence_id IS NOT NULL AND result != 'skipped'
-                       ORDER BY reviewed_at, id"""
+                       WHERE sentence_id IS NOT NULL AND result != 'skipped' AND reviewed_at >= ?
+                       ORDER BY sentence_id, reviewed_at, id""",
+                    (lower_bound,),
                 ).fetchall()
             ]
 
-        # Build per-sentence event timelines
-        timelines: dict[int, list] = {}
+        # 每条事件的本地日期只解析一次；按 sentence_id 分组，组内已按 reviewed_at 有序。
+        timelines: dict[int, list[tuple]] = {}
         for ev in events:
-            timelines.setdefault(ev["sentence_id"], []).append(ev)
+            dt = parse_iso(ev["reviewed_at"])
+            if not dt:
+                continue
+            timelines.setdefault(ev["sentence_id"], []).append((local_date(dt), ev.get("stability_after")))
+
+        sent_created = []
+        for sent in sentences:
+            created = parse_iso(sent["created_at"])
+            if not created:
+                continue
+            sent_created.append((sent["id"], local_date(created)))
+
+        # 每个句子一个游标 [事件下标, 最后一次看到的 stability_after]，
+        # 桶按时间升序遍历，cutoff 单调递增，游标只需单调前进，不需要每个桶重扫。
+        cursors: dict[int, list] = {sid: [0, None] for sid, _ in sent_created}
 
         series = []
         for label, start, end in buckets:
-            # Snapshot exclusive end date: include events with local_date < end
             cutoff = end
             total = 0
             counts = {n: 0 for n in HOLD_THRESHOLDS}
-            for sent in sentences:
-                created = parse_iso(sent["created_at"])
-                if not created or local_date(created) >= cutoff:
+            for sid, created_date in sent_created:
+                if created_date >= cutoff:
                     continue
                 total += 1
-                s = None
-                for ev in timelines.get(sent["id"], []):
-                    dt = parse_iso(ev["reviewed_at"])
-                    if not dt or local_date(dt) >= cutoff:
-                        continue
-                    if ev.get("stability_after") is not None:
-                        s = float(ev["stability_after"])
-                if s is None:
-                    s = INITIAL_S
-                hd = hold_days(s)
+                tl = timelines.get(sid, [])
+                cur = cursors[sid]
+                idx, s = cur
+                while idx < len(tl) and tl[idx][0] < cutoff:
+                    if tl[idx][1] is not None:
+                        s = float(tl[idx][1])
+                    idx += 1
+                cur[0], cur[1] = idx, s
+                hd = hold_days(s if s is not None else INITIAL_S)
                 for n in HOLD_THRESHOLDS:
                     if hd >= n:
                         counts[n] += 1
@@ -992,7 +1016,6 @@ def create_app(test_config=None):
             series.append(item)
 
         series = _trim_leading_empty(series, lambda item: (item.get("all") or 0) > 0)
-
         return jsonify(granularity=g, series=series, thresholds=list(HOLD_THRESHOLDS))
 
     # Build content-subset fonts at startup (no-op if sources missing / already current).
