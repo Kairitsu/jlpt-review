@@ -720,6 +720,15 @@ def create_app(test_config=None):
         payload["items"] = items
         return jsonify(report=payload)
 
+    @app.delete("/api/reports/<int:session_id>")
+    def delete_report(session_id):
+        with get_db() as db:
+            exists = db.execute("SELECT id FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
+            if not exists:
+                return jsonify(error="报告不存在"), 404
+            db.execute("DELETE FROM practice_sessions WHERE id=?", (session_id,))
+        return jsonify(ok=True)
+
     @app.get("/api/settings/auth")
     def get_auth_settings():
         with get_db() as db:

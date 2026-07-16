@@ -185,7 +185,7 @@ def init_db():
         _drop_column_if_exists(db, "sentences", "romaji")
         _drop_column_if_exists(db, "sentences", "explanation")
 
-        db.execute("DELETE FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')")
+        db.execute("DELETE FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted','scheduler_mode')")
         for row in db.execute("SELECT id,chunks_json FROM sentences").fetchall():
             chunks = json_load(row["chunks_json"], [])
             compact = [{"id": item.get("id"), "text": item.get("text")} for item in chunks if isinstance(item, dict)]

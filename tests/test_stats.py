@@ -397,6 +397,82 @@ def test_delete_sentence_hard_deletes_review_history(tmp_path, monkeypatch):
         ).fetchone()["n"] == 0
 
 
+def test_delete_report_keeps_review_events_and_sentence_memory(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "さ")
+    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
+    session_id = practice["sessionId"]
+    client.post(
+        f"/api/practice/sessions/{session_id}/attempts",
+        json={
+            "sentenceId": sentence["id"],
+            "action": "check",
+            "answerOrder": sentence["correctOrder"],
+            "durationMs": 5000,
+        },
+    )
+    client.post(f"/api/practice/sessions/{session_id}/complete", json={})
+
+    with db.get_db() as connection:
+        before = connection.execute(
+            "SELECT stability, next_review_at, review_count FROM sentences WHERE id=?",
+            (sentence["id"],),
+        ).fetchone()
+        event_before = connection.execute(
+            "SELECT id, sentence_id, result, attempt_n FROM review_events WHERE sentence_id=?",
+            (sentence["id"],),
+        ).fetchone()
+        assert before is not None
+        assert event_before is not None
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM practice_sessions WHERE id=?", (session_id,)
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM attempts WHERE session_id=?", (session_id,)
+        ).fetchone()["n"] >= 1
+        stability_before = before["stability"]
+        next_review_before = before["next_review_at"]
+        review_count_before = before["review_count"]
+        event_id = event_before["id"]
+        event_result = event_before["result"]
+        event_attempt_n = event_before["attempt_n"]
+
+    assert client.delete(f"/api/reports/{session_id}").status_code == 200
+
+    with db.get_db() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM practice_sessions WHERE id=?", (session_id,)
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM attempts WHERE session_id=?", (session_id,)
+        ).fetchone()["n"] == 0
+        event_after = connection.execute(
+            "SELECT id, sentence_id, result, attempt_n, session_id FROM review_events WHERE id=?",
+            (event_id,),
+        ).fetchone()
+        assert event_after is not None
+        assert event_after["sentence_id"] == sentence["id"]
+        assert event_after["result"] == event_result
+        assert event_after["attempt_n"] == event_attempt_n
+        # ON DELETE SET NULL may null session_id
+        assert event_after["session_id"] is None
+        after = connection.execute(
+            "SELECT stability, next_review_at, review_count FROM sentences WHERE id=?",
+            (sentence["id"],),
+        ).fetchone()
+        assert after["stability"] == stability_before
+        assert after["next_review_at"] == next_review_before
+        assert after["review_count"] == review_count_before
+
+
+def test_delete_report_not_found(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
+    res = client.delete("/api/reports/999999")
+    assert res.status_code == 404
+    assert res.get_json()["error"] == "报告不存在"
+
+
 def test_migration_adds_columns_and_backfills(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
