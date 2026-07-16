@@ -1,26 +1,63 @@
-# JLPT AI Tutor / Japanese Sentence Review
+# 句子重组 · jlpt-review
 
-面向中文母语者的**日语句子重组与间隔复习** Web 应用。
+面向中文母语者的**日语句子重组与间隔复习** Web 应用（GitHub：`jlpt-review`）。
 
-用中文提示回忆日语原句，通过拖拽词块还原语序；本机 **SudachiPy（full 词典）** 完成多粒度分词与词块合并，无需外接 LLM。数据默认保存在本机 SQLite。
+用中文提示回忆日语原句，通过点选 / 拖拽词块还原语序；本机 **SudachiPy（full 词典）** 完成多粒度分词、词块合并与假名注音，**无需外接 LLM**。数据默认保存在本机 SQLite。
 
 | 项目 | 说明 |
 |------|------|
 | 技术栈 | Flask · Gunicorn · SQLite · SudachiPy + SudachiDict-full |
-| 前端 | 单页静态资源（`static/`）；中日文为自托管 Noto **内容子集**（UI+已导入句子） |
+| 前端 | 单页静态资源（`static/`）；中日文为自托管 Noto **内容子集**（UI + 已导入句子） |
 | 部署 | Docker Compose，默认仅监听 `127.0.0.1:3220` |
 | 许可证 | [AGPL-3.0](LICENSE) |
 
 ## 功能概览
 
-- **句集管理**：创建 / 重命名 / 删除句集（删除前需清空句子）
-- **句子导入**：中文 + 日语；一键本机分块；可编辑词块后保存
-- **练习模式**：待复习 / 句集练习；拖拽排序作答；跳过与对错统计
-- **间隔复习（默认动态）**：指数遗忘模型 `R(t)=exp(-t/S)`，下次复习落在目标保持率（约 90%）附近；设置中可回退到固定间隔 1 → 3 → 7 → 14 → 30 天
-- **数据统计**：遗忘曲线 / 学习情况 / 记忆持久度（底栏「统计」入口）
-- **练习报告**：会话正确 / 错误 / 跳过记录与句子快照
-- **访问控制**：会话登录、密码 PBKDF2 哈希、失败锁定；可在设置页修改账号密码
-- **安全头**：CSP、HSTS（HTTPS 时）、禁缓存等默认开启
+### 首页
+
+- 当前句集进度（已学习 / 总数）、**待复习** 与 **今日学习**（按设置的时区自然日统计）
+- 选择句集与本轮数量后，从到期最早的句子开始复习
+
+### 题库（句集）
+
+- 按创建时间 / 错误率 / 最近练习排序；搜索中文或日语
+- **句集随机练习** 或 **勾选句子专项练习**
+- **批量转移**句子到其他句集
+- **管理句集**：重命名；删除时可选级联清空其中全部句子及记忆 / 练习历史（至少保留一个句集）
+
+### 添加 / 编辑句子
+
+- 输入中文翻译 + 完整日语原句 → 本机一键分块
+- 预览词块：拆分、合并相邻、修改文字；保存前校验拼接无损
+- 自动生成汉字 **假名注音**（`<ruby>`），练习与预览中展示
+- 编辑已有句子时默认使用**已保存词块**；再次「自动分块」才会按当前规则重新生成
+
+### 练习
+
+- 词块乱序展示：点选加入答案区，答案区内可**拖拽重排**
+- 核对 / 跳过；按**词块文字**判题（同形不同 id 可互换，例如两个「し」）
+- 记录作答时长（用于统计，**不参与**认知分级）
+- 练习报告中可查看会话明细，并可**重练本轮错题**（`retryWrong`：该会话中首次答对也记为「模糊」）
+
+### 统计
+
+底栏「统计」入口，图表库为本地 `static/vendor/chart.umd.min.js`（无 CDN）：
+
+- **遗忘曲线**：理论参考曲线 + 用户实测保持率（样本不足时向理论先验靠拢）
+- **学习情况**：按日 / 周 / 月分桶的认识 / 模糊 / 忘记与新学 / 复习
+- **记忆持久度**：稳定度对应持有 ≥10 / 30 / 60 / 90 天的句子占比
+
+### 报告
+
+- 已完成会话的正确 / 错误 / 跳过与句子快照
+- 可删除单条报告（**不影响**句子的记忆进度与 SRS 字段）
+
+### 设置
+
+- **访问认证**：用户名 + PBKDF2 密码哈希；可关闭认证
+- **时区**（IANA）：决定「今日学习」与统计页自然日分界；未设置则用服务器本地时区
+- **复习调度**：界面统一说明**动态间隔**原理（见下文）
+- 退出登录
 
 ## 快速开始
 
@@ -54,7 +91,7 @@ curl -s http://127.0.0.1:3220/api/health
 | `INIT_USERNAME` | 仅在尚未配置账号时生效的初始用户名 |
 | `INIT_PASSWORD` | 仅在尚未配置账号时生效的初始密码 |
 | `SESSION_COOKIE_SECURE` | 生产 HTTPS 下保持 `true`；纯 HTTP 本地调试可设 `false` |
-| `TRUST_PROXY_COUNT` | 前置反向代理层数（Caddy/Nginx 通常为 `1`） |
+| `TRUST_PROXY_COUNT` | 前置反向代理层数（Caddy / Nginx 通常为 `1`） |
 | `DATA_DIR` | 数据目录（Compose 内默认 `/app/data`） |
 
 **切勿**将真实的 `secrets/app.env`、数据库文件或 Basic Auth 哈希提交到 Git。仓库只包含 `secrets/app.env.example`。
@@ -69,7 +106,7 @@ your-domain.example {
 }
 ```
 
-## 本机分块逻辑（摘要）
+## 本机分块与假名（摘要）
 
 1. 同时跑 Sudachi **SplitMode A / B / C**，并校验每种结果可逐字还原原句  
 2. 以 **B** 为底边界；**C** 保护复合 / 专有等长词  
@@ -77,70 +114,50 @@ your-domain.example {
 4. `chunk_rules.py` 集中维护合并规则  
 5. 标点独立成块；每次分块生成唯一词块 ID  
 6. 保存前校验：ID 唯一、拼接无损、正确顺序与词块顺序一致  
-
-编辑已有句子时默认使用**已保存词块**；点击「重新分块」才按当前规则重新生成。
+7. 用 A 模式读音生成 `furigana_json`（仅汉字带 ruby）；失败时退化为纯文本段，不影响保存  
 
 SudachiDict-full 在**镜像构建**时经 `requirements.txt` 安装；容器运行期不需要访问外网下载词典。
 
-## 项目结构
+保存句子后会在后台按 UI + 句库字形重建 Noto 字体子集（`font_active.py`），浏览器通过 `/api/fonts/faces.css` 加载。
 
-```text
-app.py                 Flask 路由、练习 / 复习、统计 API
-auth.py                登录锁定与会话鉴权
-security.py            密码哈希 / 校验（PBKDF2）
-db.py                  SQLite schema、幂等迁移与设置读写
-memory.py              遗忘模型、四档认知映射、调度间隔
-tokenizer.py           Sudachi 分词封装
-chunk_rules.py         词块合并规则
-static/                前端 HTML / CSS / JS（含 stats.js、vendor/chart.js）
-font_active.py         按 UI+句库生成预置字体子集（保存句子后后台重建）
-font-sources/          Noto Sans SC/JP 源 OTF（仅供 subset，不直出浏览器）
-scripts/backup-db.sh   SQLite 一致性备份
-scripts/build_font_subsets.py  （可选）离线 unicode-range 全量分片工具
-secrets/app.env.example
-tests/                 pytest
-docker-compose.yml
-Dockerfile
-```
+## 记忆模型与认知分级
 
-## 统计与动态复习
+### 认知三档（+ 跳过）
 
-### 数据库（`init_db` 幂等）
+作答映射见 `memory.py` 的 `grade_attempt`。**作答时长不参与分级**，仅写入统计。
 
-| 变更 | 说明 |
-|------|------|
-| `sentences.stability` | 记忆稳定度 S（天），默认 `1.0` |
-| `sentences.review_count` / `lapse_count` | 有效复习次数 / 遗忘次数 |
-| `review_events` | 每次最终答题明细（result、duration_ms、S 前后、间隔等） |
-| `attempts.duration_ms` / `attempt_n` / `grade` | 作答时长、本会话核对次数、四档认知结果 |
+| 条件 | 结果（UI） |
+|------|------------|
+| 跳过 | `skipped`（跳过） |
+| 答错 | `forgotten`（忘记） |
+| 答对，且本会话第 2+ 次核对，或错题重练会话 | `fuzzy`（模糊） |
+| 答对，且本会话第一次核对 | `known`（认识） |
 
-旧库启动时自动 `ALTER` 加列；若 `review_events` 为空且已有 `attempts`，会按 `correct→known / wrong→forgotten / skipped→skipped` 回填一次。
+历史数据中的 `mastered`（旧「熟知」）在启动时会迁移为 `known`。
 
-### 认知四档映射
+### 稳定度与下次复习
 
-| 条件 | 结果 |
-|------|------|
-| 跳过 | skipped |
-| 答错 | forgotten（忘记） |
-| 答对且本会话第 2+ 次核对 | fuzzy（模糊） |
-| 答对、首次、时长 ≤15s | mastered（熟知） |
-| 答对、首次、更慢或无时长 | known（认识） |
+模型：`R(t) = exp(-t / S)`，目标保持率约 90%，下次间隔  
+`t = -S · ln(0.9)`。
 
-### 调度模式（设置页）
+| 结果 | 对 S 的影响 | 到期 |
+|------|-------------|------|
+| `known` | S × 2 | 按新 S 计算间隔 |
+| `fuzzy` | S × 1.2 | 按新 S 计算间隔 |
+| `forgotten` | 重置为初始值 `1.0` | **立即到期** |
+| `skipped` | 不变 | 不变 |
 
-- `GET/PUT /api/settings/scheduler` → `{ "mode": "dynamic" | "fixed" }`
-- **dynamic**（默认）：`t = -S · ln(0.9)`；答对增大 S，答错重置 S 并立即到期
-- **fixed**：沿用 `correct_streak` 与 1/3/7/14/30 天阶梯
+S 限制在 `0.3`～`365` 天。
 
-### 统计 API（只读 JSON）
+应用界面统一使用上述**动态调度**。后端仍保留 `GET/PUT /api/settings/scheduler` 的 `fixed` 模式（固定阶梯 1 → 3 → 7 → 14 → 30 天），供测试或高级调用；设置页不提供切换。
+
+### 主要统计 API（只读 JSON）
 
 | 接口 | 内容 |
 |------|------|
-| `GET /api/stats/forgetting-curve` | 艾宾浩斯理论曲线 + 用户实测保持率（按距上次复习天数分桶） |
-| `GET /api/stats/learning?granularity=day\|week\|month` | 时间桶内熟知/认识/模糊/忘记与新学/复习计数 + 今日汇总 |
-| `GET /api/stats/retention?granularity=day\|week\|month` | 记忆持久度 ≥10/30/60/90 天的累计句子数与占比 |
-
-图表库为本地 `static/vendor/chart.umd.min.js`（无 CDN）。
+| `GET /api/stats/forgetting-curve` | 理论曲线 + 用户按间隔天数分桶的实测保持率 |
+| `GET /api/stats/learning?granularity=day\|week\|month` | 时间桶内认识 / 模糊 / 忘记与新学 / 复习 + 今日汇总 |
+| `GET /api/stats/retention?granularity=day\|week\|month` | 记忆持久度 ≥10 / 30 / 60 / 90 天的累计与占比 |
 
 ## 数据与备份
 
@@ -152,7 +169,30 @@ Dockerfile
 # 输出到 backups/japanese_sentence_review-YYYYMMDD-HHMMSS.sqlite3
 ```
 
-`data/` 与 `backups/` 已在 `.gitignore` 中忽略。
+- **删除句子**或**级联删除句集**时，会硬删相关 `attempts` / `review_events` 等历史，避免孤儿统计  
+- 启动时 `init_db` 幂等迁移：补列、旧 attempts 回填 `review_events`、`mastered` → `known`、清理孤儿历史等  
+- `data/` 与 `backups/` 已在 `.gitignore` 中忽略
+
+## 项目结构
+
+```text
+app.py                 Flask 路由：句集 / 句子 / 练习 / 报告 / 设置 / 统计 / 字体
+auth.py                登录锁定与会话鉴权
+security.py            密码哈希 / 校验（PBKDF2）
+db.py                  SQLite schema、幂等迁移与设置读写
+memory.py              遗忘模型、认知分级、调度间隔、时区自然日
+tokenizer.py           Sudachi 分词、分块校验、假名段
+chunk_rules.py         词块合并规则
+font_active.py         按 UI+句库生成预置字体子集
+static/                前端 HTML / CSS / JS（app.js、stats.js、vendor/chart.js）
+font-sources/          Noto Sans SC/JP 源 OTF（仅供 subset，不直出浏览器）
+scripts/backup-db.sh   SQLite 一致性备份
+scripts/build_font_subsets.py  （可选）离线 unicode-range 全量分片工具
+secrets/app.env.example
+tests/                 pytest
+docker-compose.yml
+Dockerfile
+```
 
 ## 开发与测试
 
@@ -172,8 +212,9 @@ Docker 镜像内默认**不**拷贝 `tests/`（见 `.dockerignore`）；测试�
 
 - 真实密钥、登录口令、SQLite 用户数据**不得**入库  
 - 默认仅监听环回地址；公网访问应走 HTTPS 反代  
-- 登录失败超过阈值会锁定（见 `auth.py`）  
+- 登录失败超过阈值会锁定（默认 5 次失败，锁定 15 分钟，见 `auth.py`）  
 - 密码以 PBKDF2-SHA256 加盐哈希存储，不明文落盘  
+- 响应默认带安全头（CSP、HTTPS 时的 HSTS、禁缓存等）  
 
 若你发现安全问题，请勿在公开 issue 中粘贴真实凭据或用户句子数据。
 
