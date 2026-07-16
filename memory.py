@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # --- Model constants ---
 TARGET_R = 0.90
@@ -200,8 +201,36 @@ def parse_iso(value: str | None) -> datetime | None:
         return None
 
 
-def local_date(dt: datetime | None = None):
-    """Calendar date in the server's local timezone."""
+def _resolve_zone(tz_name: str | None) -> ZoneInfo | None:
+    """Resolve an IANA timezone name to a ZoneInfo, or None if empty/invalid.
+
+    Invalid or unrecognized names are treated the same as "not set" rather
+    than raising, so a corrupted or stale settings value never breaks a
+    request; callers fall back to server-local time in that case.
+    """
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def is_valid_timezone(tz_name: str) -> bool:
+    """True if tz_name is a resolvable IANA timezone key."""
+    return _resolve_zone(tz_name) is not None
+
+
+def local_date(dt: datetime | None = None, tz_name: str | None = None):
+    """Calendar date in tz_name (an IANA key) if valid, else the server's local timezone.
+
+    tz_name is normally the user-configured "user_timezone" setting, which
+    lets each deployment's users see "today" boundaries in their own
+    timezone rather than wherever the server happens to run. Empty or
+    unrecognized tz_name falls back to the previous server-local behavior,
+    so existing deployments are unaffected until a timezone is explicitly set.
+    """
+    zone = _resolve_zone(tz_name)
     if dt is None:
-        return datetime.now().astimezone().date()
-    return dt.astimezone().date()
+        dt = datetime.now(timezone.utc)
+    return dt.astimezone(zone).date() if zone else dt.astimezone().date()

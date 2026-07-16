@@ -34,6 +34,7 @@ from memory import (
     blend_user_rate,
     grade_attempt,
     hold_days,
+    is_valid_timezone,
     local_date,
     parse_iso,
     schedule_next,
@@ -136,6 +137,27 @@ def stats_snapshot(row):
 def scheduler_mode(db) -> str:
     mode = (setting(db, "scheduler_mode", DEFAULT_SCHEDULER_MODE) or DEFAULT_SCHEDULER_MODE).lower()
     return mode if mode in {"dynamic", "fixed"} else DEFAULT_SCHEDULER_MODE
+
+
+def user_timezone(db) -> str:
+    """Configured IANA timezone, or "" to fall back to the server's local timezone."""
+    return setting(db, "user_timezone", "")
+
+
+def _server_utc_offset_label() -> str:
+    """Current UTC offset of the server process, formatted as "+08:00" style.
+
+    Python's stdlib has no portable way to read the OS's IANA zone name, only
+    its current fixed offset, so this is only used for a display hint on the
+    settings page (e.g. "服务器当前是 UTC+08:00"), never for calculation.
+    """
+    offset = datetime.now().astimezone().utcoffset()
+    if offset is None:
+        return ""
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    return f"{sign}{total_minutes // 60:02d}:{total_minutes % 60:02d}"
 
 
 def apply_attempt_stats(
@@ -370,12 +392,13 @@ def create_app(test_config=None):
 
     @app.get("/api/dashboard")
     def dashboard():
-        today = local_date()
         now = now_iso()
         # 足够覆盖任意时区偏移(-12~+14)下的本地"今天"，把范围过滤下推到 SQL，
         # 避免全表扫描 review_events。
         lower_bound = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
         with get_db() as db:
+            tz = user_timezone(db)
+            today = local_date(tz_name=tz)
             collections = [dict(row) for row in db.execute("""
               SELECT c.id,c.name,COUNT(s.id) total,
                 SUM(CASE WHEN s.study_count>0 THEN 1 ELSE 0 END) learned
@@ -395,7 +418,7 @@ def create_app(test_config=None):
             today_ids: dict[int, set[int]] = {}
             for row in event_rows:
                 dt = parse_iso(row["reviewed_at"])
-                if not dt or local_date(dt) != today:
+                if not dt or local_date(dt, tz_name=tz) != today:
                     continue
                 today_ids.setdefault(row["collection_id"], set()).add(row["sentence_id"])
             for item in collections:
@@ -776,11 +799,27 @@ def create_app(test_config=None):
             set_setting(db, "scheduler_mode", mode)
         return jsonify(ok=True, mode=mode)
 
+    @app.get("/api/settings/timezone")
+    def get_timezone_settings():
+        with get_db() as db:
+            tz = user_timezone(db)
+        return jsonify(timezone=tz, serverUtcOffset=_server_utc_offset_label())
+
+    @app.put("/api/settings/timezone")
+    def save_timezone_settings():
+        body = request.get_json(silent=True) or {}
+        tz = str(body.get("timezone", "")).strip()
+        if tz and not is_valid_timezone(tz):
+            return jsonify(error="无效的时区名称"), 400
+        with get_db() as db:
+            set_setting(db, "user_timezone", tz)
+        return jsonify(ok=True, timezone=tz)
+
     # ---- Stats APIs ----
 
-    def _bucket_specs(granularity: str):
+    def _bucket_specs(granularity: str, tz_name: str | None = None):
         """Return (granularity, list of (label, start_date, end_date exclusive))."""
-        today = local_date()
+        today = local_date(tz_name=tz_name)
         g = (granularity or "day").lower()
         if g not in {"day", "week", "month"}:
             g = "day"
@@ -870,13 +909,14 @@ def create_app(test_config=None):
     @app.get("/api/stats/learning")
     def stats_learning():
         granularity = request.args.get("granularity", "day")
-        g, buckets = _bucket_specs(granularity)
         series = []
-        earliest_local_date = buckets[0][1] - timedelta(days=2)
-        lower_bound = datetime.combine(
-            earliest_local_date, datetime.min.time(), tzinfo=timezone.utc
-        ).isoformat(timespec="seconds")
         with get_db() as db:
+            tz = user_timezone(db)
+            g, buckets = _bucket_specs(granularity, tz)
+            earliest_local_date = buckets[0][1] - timedelta(days=2)
+            lower_bound = datetime.combine(
+                earliest_local_date, datetime.min.time(), tzinfo=timezone.utc
+            ).isoformat(timespec="seconds")
             events = [
                 dict(row)
                 for row in db.execute(
@@ -895,10 +935,10 @@ def create_app(test_config=None):
             dt = parse_iso(ev["reviewed_at"])
             if not dt:
                 continue
-            d = local_date(dt)
+            d = local_date(dt, tz_name=tz)
             by_date.setdefault(d, []).append(ev)
 
-        today = local_date()
+        today = local_date(tz_name=tz)
         today_counts = {"known": 0, "fuzzy": 0, "forgotten": 0, "skipped": 0}
         today_duration_ms = 0
         for ev in by_date.get(today, []):
@@ -955,12 +995,13 @@ def create_app(test_config=None):
     @app.get("/api/stats/retention")
     def stats_retention():
         granularity = request.args.get("granularity", "week")
-        g, buckets = _bucket_specs(granularity)
-        earliest_local_date = buckets[0][1] - timedelta(days=2)
-        lower_bound = datetime.combine(
-            earliest_local_date, datetime.min.time(), tzinfo=timezone.utc
-        ).isoformat(timespec="seconds")
         with get_db() as db:
+            tz = user_timezone(db)
+            g, buckets = _bucket_specs(granularity, tz)
+            earliest_local_date = buckets[0][1] - timedelta(days=2)
+            lower_bound = datetime.combine(
+                earliest_local_date, datetime.min.time(), tzinfo=timezone.utc
+            ).isoformat(timespec="seconds")
             sentences = [
                 dict(row)
                 for row in db.execute("SELECT id, created_at, stability FROM sentences").fetchall()
@@ -981,14 +1022,14 @@ def create_app(test_config=None):
             dt = parse_iso(ev["reviewed_at"])
             if not dt:
                 continue
-            timelines.setdefault(ev["sentence_id"], []).append((local_date(dt), ev.get("stability_after")))
+            timelines.setdefault(ev["sentence_id"], []).append((local_date(dt, tz_name=tz), ev.get("stability_after")))
 
         sent_created = []
         for sent in sentences:
             created = parse_iso(sent["created_at"])
             if not created:
                 continue
-            sent_created.append((sent["id"], local_date(created)))
+            sent_created.append((sent["id"], local_date(created, tz_name=tz)))
 
         # 每个句子一个游标 [事件下标, 最后一次看到的 stability_after]，
         # 桶按时间升序遍历，cutoff 单调递增，游标只需单调前进，不需要每个桶重扫。

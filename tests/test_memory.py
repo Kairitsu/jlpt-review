@@ -12,6 +12,8 @@ from memory import (
     grade_attempt,
     hold_days,
     interval_for_stability,
+    is_valid_timezone,
+    local_date,
     retention,
     schedule_next,
     theory_curve_points,
@@ -115,3 +117,17 @@ def test_blend_user_rate_prior_and_weight():
     # More samples → closer to empirical
     more = blend_user_rate(theory, 100.0, 30)
     assert more > blended
+
+
+def test_local_date_respects_explicit_timezone():
+    from memory import parse_iso
+
+    # 2026-01-01 23:30 UTC：东京（UTC+9）已经是次日，洛杉矶（UTC-8）还是前一天
+    dt = parse_iso("2026-01-01T23:30:00+00:00")
+    assert local_date(dt, tz_name="Asia/Tokyo").isoformat() == "2026-01-02"
+    assert local_date(dt, tz_name="America/Los_Angeles").isoformat() == "2026-01-01"
+    # 无效时区名静默回退到服务器本地时区，不抛异常
+    assert local_date(dt, tz_name="Not/AZone") == local_date(dt)
+    assert is_valid_timezone("Asia/Tokyo") is True
+    assert is_valid_timezone("Not/AZone") is False
+    assert is_valid_timezone("") is False

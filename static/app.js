@@ -6,6 +6,7 @@ const state = {
   activeCollection: Number(localStorage.getItem('activeCollection') || 0),
   draft: null, selectedChunks: [], editing: null, practice: null, report: null,
   routeMeta: {}, homeDuePicker: false,
+  timezone: '',
 };
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
@@ -15,7 +16,71 @@ function rubyHtml(segments) {
     ? `<ruby>${esc(seg.text)}<rt>${esc(seg.ruby)}</rt></ruby>`
     : esc(seg.text)).join('');
 }
-function formatDate(value) { if (!value) return '从未'; return new Intl.DateTimeFormat('zh-CN', {dateStyle:'medium', timeStyle:'short'}).format(new Date(value)); }
+function formatDate(value) {
+  if (!value) return '从未';
+  const opts = { dateStyle: 'medium', timeStyle: 'short' };
+  if (state.timezone) opts.timeZone = state.timezone;
+  return new Intl.DateTimeFormat('zh-CN', opts).format(new Date(value));
+}
+
+const COMMON_TIMEZONES = ['Asia/Shanghai', 'Asia/Singapore', 'Asia/Tokyo', 'UTC'];
+const TZ_REGION_LABELS = {
+  Africa: '非洲', America: '美洲', Antarctica: '南极洲', Arctic: '北极',
+  Asia: '亚洲', Atlantic: '大西洋', Australia: '大洋洲', Europe: '欧洲',
+  Indian: '印度洋', Pacific: '太平洋', Etc: 'UTC 偏移 / 其他',
+};
+
+function detectBrowserTimezone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { return ''; }
+}
+function tzOffsetLabel(tz) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' }).formatToParts(new Date());
+    return (parts.find(p => p.type === 'timeZoneName') || {}).value || '';
+  } catch { return ''; }
+}
+function tzDisplayLabel(tz) {
+  const city = tz.split('/').pop().replace(/_/g, ' ');
+  const offset = tzOffsetLabel(tz);
+  return offset ? `${city}（${offset}）` : city;
+}
+function allTimezones() {
+  if (typeof Intl.supportedValuesOf === 'function') {
+    try { return Intl.supportedValuesOf('timeZone'); } catch { /* 继续走兜底 */ }
+  }
+  return COMMON_TIMEZONES; // 极老旧浏览器兜底，至少保留常用项可选
+}
+function timezoneOptionsHtml(selected) {
+  const detected = detectBrowserTimezone();
+  const common = [...new Set(detected ? [...COMMON_TIMEZONES, detected] : COMMON_TIMEZONES)];
+  let html = '<optgroup label="常用">';
+  html += `<option value="" ${!selected ? 'selected' : ''}>跟随服务器时区（默认）</option>`;
+  for (const tz of common) {
+    const suffix = tz === detected ? '　·　本设备当前时区' : '';
+    html += `<option value="${tz}" ${selected === tz ? 'selected' : ''}>${esc(tzDisplayLabel(tz))}${suffix}</option>`;
+  }
+  html += '</optgroup>';
+
+  const groups = {};
+  for (const tz of allTimezones()) {
+    const region = tz.includes('/') ? tz.split('/')[0] : 'Etc';
+    (groups[region] ||= []).push(tz);
+  }
+  for (const region of Object.keys(groups).sort()) {
+    const label = TZ_REGION_LABELS[region] || region;
+    html += `<optgroup label="${esc(label)}">`;
+    for (const tz of groups[region].sort()) {
+      html += `<option value="${tz}" ${selected === tz ? 'selected' : ''}>${esc(tzDisplayLabel(tz))}</option>`;
+    }
+    html += '</optgroup>';
+  }
+  return html;
+}
+async function loadTimezoneState() {
+  try { state.timezone = (await api('/api/settings/timezone')).timezone || ''; }
+  catch { /* 未登录或请求失败时静默忽略，访问设置页时会重新加载一次 */ }
+}
+
 function toast(message, error = false) { const el = $('#toast'); el.textContent = message; el.className = `toast${error ? ' error' : ''}`; clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.add('hidden'), 3600); }
 async function api(url, options = {}) {
   const response = await fetch(url, {headers:{'Content-Type':'application/json', ...(options.headers || {})}, ...options});
@@ -562,8 +627,9 @@ function renderReport() { const r = state.report; if (!r) return route('reports'
 function reportItems(items) { return items.map(item => `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${{correct:'正确',wrong:'错误',skipped:'跳过'}[item.status]}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div></article>`).join(''); }
 
 async function renderSettings() {
-  const authCfg = await api('/api/settings/auth');
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form><div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>系统统一使用基于遗忘曲线的动态调度，原理如下。</p></div><span class="config-status ok">动态</span></div><p class="status-note">每个句子都有一个"记忆稳定度" S，遵循指数遗忘模型 R(t) = e^(−t/S)，t 是距上次复习的天数。下次复习时间取 R(t) 降到 90% 时的 t，也就是 S 越大间隔越长。</p><p class="status-note">每次作答会更新 S：第一次就答对（认识）S 翻倍；曾经答错、后来答对或错题重练答对（模糊）S 乘以 1.2；答错（忘记）S 重置为初始值 1.0 并立即到期；跳过不影响 S 和到期时间。S 的范围被限制在 0.3 到 365 天之间。</p><p class="status-note">「统计」页展示的理论遗忘曲线以经典艾宾浩斯曲线为参照（约一天后保留率 40%），并随着你的真实作答样本增多，逐渐向你的实际表现靠拢。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看遗忘曲线、学习情况与记忆持久度。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
+  const [authCfg, tzCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone')]);
+  const timezoneCard = `<form id="timezone-form" class="card"><div class="settings-title"><div><h2>时区</h2><p>"今日学习"和「统计」页的分桶都按自然日归类，这里设置的时区决定自然日的分界点；不设置时默认按服务器所在时区计算。</p></div><span class="config-status ${tzCfg.timezone ? 'ok' : 'warn'}">${tzCfg.timezone ? '已设置' : '未设置'}</span></div><label class="field">时区<select name="timezone" id="timezone-select">${timezoneOptionsHtml(tzCfg.timezone)}</select></label>${tzCfg.timezone ? '' : `<p class="status-note">当前按服务器时区（UTC${tzCfg.serverUtcOffset}）计算，如果你实际所在地区和服务器不同，建议在上方选择你自己的时区。</p>`}<div class="form-actions"><button class="btn primary" type="submit">保存时区设置</button></div></form>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>系统统一使用基于遗忘曲线的动态调度，原理如下。</p></div><span class="config-status ok">动态</span></div><p class="status-note">每个句子都有一个"记忆稳定度" S，遵循指数遗忘模型 R(t) = e^(−t/S)，t 是距上次复习的天数。下次复习时间取 R(t) 降到 90% 时的 t，也就是 S 越大间隔越长。</p><p class="status-note">每次作答会更新 S：第一次就答对（认识）S 翻倍；曾经答错、后来答对或错题重练答对（模糊）S 乘以 1.2；答错（忘记）S 重置为初始值 1.0 并立即到期；跳过不影响 S 和到期时间。S 的范围被限制在 0.3 到 365 天之间。</p><p class="status-note">「统计」页展示的理论遗忘曲线以经典艾宾浩斯曲线为参照（约一天后保留率 40%），并随着你的真实作答样本增多，逐渐向你的实际表现靠拢。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看遗忘曲线、学习情况与记忆持久度。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
 
@@ -672,10 +738,18 @@ document.addEventListener('input', event => {
 document.addEventListener('submit', async event => {
   event.preventDefault();
   try {
-    if (event.target.id === 'login-form') { const body = Object.fromEntries(new FormData(event.target)); await api('/api/auth/login', {method:'POST', body:JSON.stringify(body)}); hideLogin(); route('home', {replace:true}); }
+    if (event.target.id === 'login-form') { const body = Object.fromEntries(new FormData(event.target)); await api('/api/auth/login', {method:'POST', body:JSON.stringify(body)}); hideLogin(); await loadTimezoneState(); route('home', {replace:true}); }
     else if (event.target.id === 'auth-form') { const form = new FormData(event.target), clearAuth = form.get('clearAuth') === 'on'; const body = {username:form.get('username'), password:form.get('password'), clearAuth}; await api('/api/settings/auth', {method:'PUT', body:JSON.stringify(body)}); toast(clearAuth ? '应用认证已关闭' : '访问认证已保存并立即生效'); await renderSettings(); }
+    else if (event.target.id === 'timezone-form') { const tz = new FormData(event.target).get('timezone') || ''; const result = await api('/api/settings/timezone', {method:'PUT', body:JSON.stringify({timezone: tz})}); state.timezone = result.timezone || ''; state.dashboard = null; if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); toast('时区设置已保存'); await renderSettings(); }
   } catch (error) { if (event.target.id === 'login-form') $('#login-error').textContent = error.message; else toast(error.data?.details?.join('；') || error.message, true); }
 });
 window.addEventListener('popstate', event => { const entry = event.state || {route:'home'}; route(entry.route || 'home', {...entry, fromPop:true}); });
 
-(async () => { try { const auth = await api('/api/auth/status'); history.replaceState({route:'home'}, '', '#home'); if (auth.configured && !auth.authenticated) showLogin(); else route('home', {replace:true}); } catch (error) { toast(error.message, true); } })();
+(async () => {
+  try {
+    const auth = await api('/api/auth/status');
+    history.replaceState({route:'home'}, '', '#home');
+    if (auth.configured && !auth.authenticated) { showLogin(); }
+    else { await loadTimezoneState(); route('home', {replace:true}); }
+  } catch (error) { toast(error.message, true); }
+})();

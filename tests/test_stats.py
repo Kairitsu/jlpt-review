@@ -37,6 +37,19 @@ def test_scheduler_settings_roundtrip(tmp_path, monkeypatch):
     assert client.put("/api/settings/scheduler", json={"mode": "nope"}).status_code == 400
 
 
+def test_timezone_settings_roundtrip(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
+    got = client.get("/api/settings/timezone").get_json()
+    assert got["timezone"] == ""
+    assert "serverUtcOffset" in got
+    assert client.put("/api/settings/timezone", json={"timezone": "Asia/Tokyo"}).status_code == 200
+    assert client.get("/api/settings/timezone").get_json()["timezone"] == "Asia/Tokyo"
+    assert client.put("/api/settings/timezone", json={"timezone": "Not/AZone"}).status_code == 400
+    # 空字符串代表"跟随服务器时区"，是合法值，用于清除设置
+    assert client.put("/api/settings/timezone", json={"timezone": ""}).status_code == 200
+    assert client.get("/api/settings/timezone").get_json()["timezone"] == ""
+
+
 def test_dynamic_srs_updates_stability_and_due(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
@@ -204,6 +217,78 @@ def test_dashboard_today_aligns_with_stats_across_utc_boundary(tmp_path, monkeyp
     assert stats["today"]["known"] == 1
     assert stats["today"]["fuzzy"] == 0
     assert stats["today"]["forgotten"] == 0
+
+
+def test_dashboard_today_uses_configured_timezone(tmp_path, monkeypatch):
+    """With user_timezone set, dashboard 'today' follows that zone, not server local.
+
+    Pacific/Kiritimati is UTC+14 — almost never the CI host zone — so an event
+    that is "today" there can be a different calendar day under server-local time.
+    """
+    from memory import local_date, parse_iso
+    from zoneinfo import ZoneInfo
+
+    tz_name = "Pacific/Kiritimati"
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    s_today = make_sentence(client, collection, "基里A")
+    s_skipped = make_sentence(client, collection, "基里B")
+    s_tomorrow = make_sentence(client, collection, "基里C")
+
+    today = local_date(tz_name=tz_name)
+    zone = ZoneInfo(tz_name)
+    local_morning = (
+        datetime.combine(today, datetime.min.time()).replace(tzinfo=zone)
+        + timedelta(hours=1)
+    )
+    stamp_today = local_morning.astimezone(timezone.utc).isoformat(timespec="seconds")
+    stamp_tomorrow = (
+        local_morning + timedelta(days=1)
+    ).astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    assert local_date(parse_iso(stamp_today), tz_name=tz_name) == today
+    assert local_date(parse_iso(stamp_tomorrow), tz_name=tz_name) == today + timedelta(days=1)
+
+    with db.get_db() as connection:
+        for sid, result, stamp in [
+            (s_today["id"], "known", stamp_today),
+            (s_skipped["id"], "skipped", stamp_today),
+            (s_tomorrow["id"], "known", stamp_tomorrow),
+        ]:
+            connection.execute(
+                """INSERT INTO review_events(
+                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
+                     is_new, stability_before, stability_after, interval_days, created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (sid, None, stamp, result, 5000, 1, 1, 1.0, 2.0, 1.0, stamp),
+            )
+
+    assert client.put("/api/settings/timezone", json={"timezone": tz_name}).status_code == 200
+
+    dash = client.get("/api/dashboard").get_json()
+    col = next(c for c in dash["collections"] if c["id"] == collection)
+    # Only the non-skipped Kiritimati-local-today sentence counts.
+    assert col["today"] == 1
+
+    stats = client.get("/api/stats/learning?granularity=day").get_json()
+    assert stats["today"]["known"] == 1
+    assert stats["today"]["fuzzy"] == 0
+    assert stats["today"]["forgotten"] == 0
+
+    # When server-local bucketing of the same stamps differs from Kiritimati,
+    # clearing the setting must change the dashboard count — proves the setting
+    # is applied (not just that both zones happen to agree).
+    server_today = local_date()
+    server_count = sum(
+        1
+        for stamp in (stamp_today, stamp_tomorrow)
+        if local_date(parse_iso(stamp)) == server_today
+    )
+    if server_count != 1:
+        assert client.put("/api/settings/timezone", json={"timezone": ""}).status_code == 200
+        dash_server = client.get("/api/dashboard").get_json()
+        col_server = next(c for c in dash_server["collections"] if c["id"] == collection)
+        assert col_server["today"] == server_count
 
 
 def test_learning_stats_trims_leading_keeps_mid_gap(tmp_path, monkeypatch):
