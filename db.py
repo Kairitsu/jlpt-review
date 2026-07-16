@@ -6,8 +6,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from fsrs_service import FSRS_VERSION
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "japanese_sentence_review.sqlite3"
+FSRS_MIGRATION = "fsrs_v1_reset"
 
 
 def now_iso() -> str:
@@ -23,210 +26,190 @@ def get_db():
     return db
 
 
-def _add_column_if_missing(db, table: str, column: str, ddl: str):
-    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+def _table_exists(db, name: str) -> bool:
+    return db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
-def _drop_column_if_exists(db, table: str, column: str):
-    """Drop a column if present. Safe under concurrent gunicorn workers."""
-    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        return
-    try:
-        db.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-    except sqlite3.OperationalError as exc:
-        # Another worker may have dropped it between PRAGMA and ALTER.
-        if "no such column" not in str(exc).lower():
-            raise
+def _columns(db, table: str) -> set[str]:
+    return {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
 
 
-def _backfill_review_events(db):
-    """One-shot: map legacy attempts into review_events when the table is empty.
-
-    Orphaned FKs (deleted sentence/session) are nulled so backfill never crashes
-    older production databases.
-    """
-    event_count = db.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"]
-    if event_count:
-        return
-    attempt_count = db.execute("SELECT COUNT(*) n FROM attempts").fetchone()["n"]
-    if not attempt_count:
-        return
-    # Legacy mapping: correct→known, wrong→forgotten, skipped→skipped
-    # Null out sentence_id / session_id when the referenced row is gone.
-    db.execute("""
-        INSERT INTO review_events(
-          sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-          is_new, stability_before, stability_after, interval_days, created_at
-        )
-        SELECT
-          CASE WHEN s.id IS NULL THEN NULL ELSE a.sentence_id END,
-          CASE WHEN p.id IS NULL THEN NULL ELSE a.session_id END,
-          a.created_at,
-          CASE a.status
-            WHEN 'correct' THEN 'known'
-            WHEN 'wrong' THEN 'forgotten'
-            ELSE 'skipped'
-          END,
-          0,
-          1,
-          0,
-          NULL,
-          NULL,
-          NULL,
-          a.created_at
-        FROM attempts a
-        LEFT JOIN sentences s ON s.id = a.sentence_id
-        LEFT JOIN practice_sessions p ON p.id = a.session_id
-    """)
+def _create_base_tables(db) -> None:
+    db.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS collections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS login_attempts (
+        identifier TEXT PRIMARY KEY,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        last_failed_at REAL NOT NULL DEFAULT 0,
+        locked_until REAL NOT NULL DEFAULT 0
+    )""")
 
 
-def init_db():
+def _create_sentences_table(db) -> None:
+    db.execute("""CREATE TABLE IF NOT EXISTS sentences (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE RESTRICT,
+        chinese TEXT NOT NULL,
+        japanese TEXT NOT NULL,
+        chunks_json TEXT NOT NULL,
+        correct_order_json TEXT NOT NULL,
+        furigana_json TEXT NOT NULL DEFAULT '[]',
+        fsrs_state INTEGER NOT NULL DEFAULT 1 CHECK(fsrs_state IN (1,2,3)),
+        fsrs_step INTEGER,
+        stability REAL,
+        difficulty REAL,
+        last_review_at TEXT,
+        next_review_at TEXT NOT NULL,
+        fsrs_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+
+
+def _create_review_tables(db) -> None:
+    db.execute("""CREATE TABLE IF NOT EXISTS practice_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL DEFAULT 'due',
+        sentence_ids_json TEXT NOT NULL,
+        total INTEGER NOT NULL,
+        correct INTEGER NOT NULL DEFAULT 0,
+        wrong INTEGER NOT NULL DEFAULT 0,
+        skipped INTEGER NOT NULL DEFAULT 0,
+        completed_at TEXT,
+        report_deleted_at TEXT,
+        created_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS practice_items (
+        session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+        sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL,
+        finalized_at TEXT,
+        final_status TEXT CHECK(final_status IN ('correct','wrong','skipped')),
+        fsrs_rating INTEGER CHECK(fsrs_rating BETWEEN 1 AND 4),
+        easy_selected INTEGER NOT NULL DEFAULT 0 CHECK(easy_selected IN (0,1)),
+        PRIMARY KEY(session_id, sentence_id),
+        UNIQUE(session_id, position)
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+        sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK(status IN ('correct','wrong','skipped')),
+        answer_order_json TEXT NOT NULL DEFAULT '[]',
+        sentence_snapshot_json TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS review_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
+        session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE RESTRICT,
+        rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 4),
+        reviewed_at TEXT NOT NULL,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        is_new INTEGER NOT NULL DEFAULT 0 CHECK(is_new IN (0,1)),
+        fsrs_state_before INTEGER NOT NULL,
+        fsrs_state_after INTEGER NOT NULL,
+        fsrs_step_before INTEGER,
+        fsrs_step_after INTEGER,
+        stability_before REAL,
+        stability_after REAL,
+        difficulty_before REAL,
+        difficulty_after REAL,
+        next_review_before TEXT NOT NULL,
+        next_review_after TEXT NOT NULL,
+        fsrs_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(session_id, sentence_id)
+    )""")
+
+
+def _create_indexes(db) -> None:
+    statements = (
+        "CREATE INDEX IF NOT EXISTS idx_sentences_collection ON sentences(collection_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sentences_due ON sentences(next_review_at)",
+        "CREATE INDEX IF NOT EXISTS idx_attempts_session_sentence ON attempts(session_id, sentence_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_attempts_sentence ON attempts(sentence_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_created ON practice_sessions(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_review_events_reviewed ON review_events(reviewed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_review_events_sentence ON review_events(sentence_id, reviewed_at)",
+    )
+    for statement in statements:
+        db.execute(statement)
+
+
+def _reset_legacy_to_fsrs(db, stamp: str) -> None:
+    """Destructively replace legacy progress while preserving sentence content."""
+    for table in ("review_events", "attempts", "practice_items", "practice_sessions"):
+        db.execute(f"DROP TABLE IF EXISTS {table}")
+
+    if _table_exists(db, "sentences"):
+        legacy_columns = _columns(db, "sentences")
+        db.execute("ALTER TABLE sentences RENAME TO sentences_before_fsrs")
+        _create_sentences_table(db)
+        furigana = "furigana_json" if "furigana_json" in legacy_columns else "'[]'"
+        db.execute(f"""INSERT INTO sentences(
+            id, collection_id, chinese, japanese, chunks_json, correct_order_json,
+            furigana_json, fsrs_state, fsrs_step, stability, difficulty,
+            last_review_at, next_review_at, fsrs_version, created_at, updated_at
+        ) SELECT
+            id, collection_id, chinese, japanese, chunks_json, correct_order_json,
+            {furigana}, 1, 0, NULL, NULL, NULL, ?, ?, created_at, updated_at
+          FROM sentences_before_fsrs""", (stamp, FSRS_VERSION))
+        db.execute("DROP TABLE sentences_before_fsrs")
+    else:
+        _create_sentences_table(db)
+
+    _create_review_tables(db)
+
+
+def init_db() -> None:
     with get_db() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS settings (
-          key TEXT PRIMARY KEY, value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS collections (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sentences (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE RESTRICT,
-          chinese TEXT NOT NULL,
-          japanese TEXT NOT NULL,
-          chunks_json TEXT NOT NULL,
-          correct_order_json TEXT NOT NULL,
-          furigana_json TEXT NOT NULL DEFAULT '[]',
-          study_count INTEGER NOT NULL DEFAULT 0,
-          correct_count INTEGER NOT NULL DEFAULT 0,
-          wrong_count INTEGER NOT NULL DEFAULT 0,
-          skip_count INTEGER NOT NULL DEFAULT 0,
-          correct_streak INTEGER NOT NULL DEFAULT 0,
-          stability REAL NOT NULL DEFAULT 1.0,
-          review_count INTEGER NOT NULL DEFAULT 0,
-          lapse_count INTEGER NOT NULL DEFAULT 0,
-          next_review_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          last_practiced_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS practice_sessions (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          source TEXT NOT NULL DEFAULT 'due',
-          sentence_ids_json TEXT NOT NULL,
-          total INTEGER NOT NULL,
-          correct INTEGER NOT NULL DEFAULT 0,
-          wrong INTEGER NOT NULL DEFAULT 0,
-          skipped INTEGER NOT NULL DEFAULT 0,
-          completed_at TEXT,
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS attempts (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
-          sentence_id INTEGER REFERENCES sentences(id) ON DELETE SET NULL,
-          status TEXT NOT NULL CHECK(status IN ('correct','wrong','skipped')),
-          answer_order_json TEXT NOT NULL DEFAULT '[]',
-          sentence_snapshot_json TEXT NOT NULL,
-          stats_before_json TEXT NOT NULL DEFAULT '{}',
-          duration_ms INTEGER NOT NULL DEFAULT 0,
-          attempt_n INTEGER NOT NULL DEFAULT 1,
-          grade TEXT NOT NULL DEFAULT '',
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS review_events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          sentence_id INTEGER REFERENCES sentences(id) ON DELETE SET NULL,
-          session_id INTEGER REFERENCES practice_sessions(id) ON DELETE SET NULL,
-          reviewed_at TEXT NOT NULL,
-          result TEXT NOT NULL CHECK(result IN (
-            'mastered','known','fuzzy','forgotten','skipped'
-          )),
-          duration_ms INTEGER NOT NULL DEFAULT 0,
-          attempt_n INTEGER NOT NULL DEFAULT 1,
-          is_new INTEGER NOT NULL DEFAULT 0,
-          stability_before REAL,
-          stability_after REAL,
-          interval_days REAL,
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS login_attempts (
-          identifier TEXT PRIMARY KEY,
-          fail_count INTEGER NOT NULL DEFAULT 0,
-          last_failed_at REAL NOT NULL DEFAULT 0,
-          locked_until REAL NOT NULL DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_sentences_collection ON sentences(collection_id);
-        CREATE INDEX IF NOT EXISTS idx_sentences_due ON sentences(next_review_at);
-        CREATE INDEX IF NOT EXISTS idx_attempts_session ON attempts(session_id);
-        CREATE INDEX IF NOT EXISTS idx_attempts_sentence ON attempts(sentence_id);
-        CREATE INDEX IF NOT EXISTS idx_sessions_created ON practice_sessions(created_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_review_events_reviewed ON review_events(reviewed_at);
-        CREATE INDEX IF NOT EXISTS idx_review_events_sentence ON review_events(sentence_id, reviewed_at);
-        CREATE INDEX IF NOT EXISTS idx_review_events_session_sentence
-          ON review_events(session_id, sentence_id);
-        """)
-        # Idempotent ALTERs for existing databases
-        _add_column_if_missing(db, "attempts", "stats_before_json", "stats_before_json TEXT NOT NULL DEFAULT '{}'")
-        _add_column_if_missing(db, "attempts", "duration_ms", "duration_ms INTEGER NOT NULL DEFAULT 0")
-        _add_column_if_missing(db, "attempts", "attempt_n", "attempt_n INTEGER NOT NULL DEFAULT 1")
-        _add_column_if_missing(db, "attempts", "grade", "grade TEXT NOT NULL DEFAULT ''")
-        _add_column_if_missing(db, "sentences", "furigana_json", "furigana_json TEXT NOT NULL DEFAULT '[]'")
-        _add_column_if_missing(db, "sentences", "stability", "stability REAL NOT NULL DEFAULT 1.0")
-        _add_column_if_missing(db, "sentences", "review_count", "review_count INTEGER NOT NULL DEFAULT 0")
-        _add_column_if_missing(db, "sentences", "lapse_count", "lapse_count INTEGER NOT NULL DEFAULT 0")
-        # Drop legacy unused sentence metadata columns (always empty in practice).
-        _drop_column_if_exists(db, "sentences", "kana")
-        _drop_column_if_exists(db, "sentences", "romaji")
-        _drop_column_if_exists(db, "sentences", "explanation")
+        db.execute("BEGIN IMMEDIATE")
+        _create_base_tables(db)
+        migrated = db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?", (FSRS_MIGRATION,)
+        ).fetchone()
+        stamp = now_iso()
+        if not migrated:
+            _reset_legacy_to_fsrs(db, stamp)
+            db.execute(
+                "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)",
+                (FSRS_MIGRATION, stamp),
+            )
+        else:
+            _create_sentences_table(db)
+            _create_review_tables(db)
+        _create_indexes(db)
 
-        db.execute("DELETE FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted','scheduler_mode')")
+        db.execute("DELETE FROM settings WHERE key IN ('scheduler_mode','base_url','model','custom_params','api_key_encrypted')")
         for row in db.execute("SELECT id,chunks_json FROM sentences").fetchall():
             chunks = json_load(row["chunks_json"], [])
-            compact = [{"id": item.get("id"), "text": item.get("text")} for item in chunks if isinstance(item, dict)]
+            compact = [
+                {"id": item.get("id"), "text": item.get("text")}
+                for item in chunks if isinstance(item, dict)
+            ]
             if compact != chunks:
-                db.execute("UPDATE sentences SET chunks_json=? WHERE id=?", (json.dumps(compact, ensure_ascii=False), row["id"]))
-        stamp = now_iso()
-        db.execute("INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)", (stamp, stamp))
-        _backfill_review_events(db)
-        # Purge history left by older ON DELETE SET NULL behavior (hard-delete is now app policy).
-        _purge_orphaned_sentence_history(db)
-        _migrate_mastered_to_known(db)
-
-
-def _migrate_mastered_to_known(db):
-    """One-shot: fold legacy mastered grades into known (new taxonomy).
-
-    Old "熟知" + "认识" both map to "认识". CHECK still allows 'mastered' so we
-    avoid rebuilding the table; new code never writes mastered.
-    """
-    db.execute("UPDATE review_events SET result='known' WHERE result='mastered'")
-    db.execute("UPDATE attempts SET grade='known' WHERE grade='mastered'")
-
-
-def _purge_orphaned_sentence_history(db):
-    """Remove review_events/attempts that no longer belong to any sentence.
-
-    The API hard-deletes these rows when a sentence is removed; this cleans
-    leftovers from older SET NULL FK behavior and any dangling FKs.
-    """
-    db.execute("DELETE FROM review_events WHERE sentence_id IS NULL")
-    db.execute(
-        """DELETE FROM review_events
-           WHERE sentence_id IS NOT NULL
-             AND NOT EXISTS (SELECT 1 FROM sentences s WHERE s.id = review_events.sentence_id)"""
-    )
-    db.execute("DELETE FROM attempts WHERE sentence_id IS NULL")
-    db.execute(
-        """DELETE FROM attempts
-           WHERE sentence_id IS NOT NULL
-             AND NOT EXISTS (SELECT 1 FROM sentences s WHERE s.id = attempts.sentence_id)"""
-    )
+                db.execute(
+                    "UPDATE sentences SET chunks_json=? WHERE id=?",
+                    (json.dumps(compact, ensure_ascii=False), row["id"]),
+                )
+        db.execute(
+            "INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)",
+            (stamp, stamp),
+        )
 
 
 def setting(db, key, default=""):
@@ -235,7 +218,11 @@ def setting(db, key, default=""):
 
 
 def set_setting(db, key, value):
-    db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    db.execute(
+        "INSERT INTO settings(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
 
 
 def json_load(value, fallback=None):

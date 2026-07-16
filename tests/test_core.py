@@ -86,7 +86,7 @@ def test_crud_practice_srs_report(tmp_path, monkeypatch):
     report = client.get(f'/api/reports/{practice["sessionId"]}').get_json()["report"]
     assert report["wrong"] == 1 and report["items"][0]["answerText"]
     refreshed = client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]
-    assert refreshed["correct_streak"] == 0 and refreshed["wrong_count"] == 1
+    assert refreshed["stability"] is not None and refreshed["difficulty"] is not None
 
 
 def test_split_merge_validation_and_duplicate_ids():
@@ -276,12 +276,11 @@ def test_migration_removes_only_legacy_remote_settings_and_keeps_saved_chunks(tm
             "INSERT INTO settings(key,value) VALUES(?,?)",
             [("base_url", "https://old.invalid"), ("model", "old"), ("custom_params", "{}"), ("api_key_encrypted", "secret")],
         )
-        cursor = connection.execute(
-            """INSERT INTO sentences(collection_id,chinese,japanese,chunks_json,correct_order_json,next_review_at,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?)""",
-            (collection, "旧分块", "昔の分け方。", json.dumps(saved_chunks, ensure_ascii=False), json.dumps(["old-a", "old-b"]), stamp, stamp, stamp),
-        )
-        sentence_id = cursor.lastrowid
+    created = client.post("/api/sentences", json={
+        "collectionId": collection, "chinese": "旧分块", "japanese": "昔の分け方。",
+        "chunks": saved_chunks, "correctOrder": ["old-a", "old-b"],
+    })
+    sentence_id = created.get_json()["sentence"]["id"]
     db.init_db()
     with sqlite3.connect(tmp_path / "japanese_sentence_review.sqlite3") as connection:
         assert connection.execute("SELECT key FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')").fetchall() == []
@@ -307,6 +306,10 @@ def _practice_once(client, sentence):
     client.post(
         f'/api/practice/sessions/{practice["sessionId"]}/attempts',
         json={"sentenceId": sentence["id"], "action": "check", "answerOrder": sentence["correctOrder"], "durationMs": 3000},
+    )
+    client.post(
+        f'/api/practice/sessions/{practice["sessionId"]}/sentences/{sentence["id"]}/complete',
+        json={},
     )
     return practice["sessionId"]
 
@@ -384,10 +387,8 @@ def test_move_sentences_between_collections(tmp_path, monkeypatch):
 
     after = client.get(f"/api/sentences/{sentence['id']}").get_json()["sentence"]
     assert after["collection_id"] == target_id
-    assert after["study_count"] == before["study_count"]
-    assert after["correct_count"] == before["correct_count"]
-    assert after["wrong_count"] == before["wrong_count"]
-    assert after["correct_streak"] == before["correct_streak"]
+    for field in ("fsrs_state", "fsrs_step", "stability", "difficulty", "last_review_at", "next_review_at"):
+        assert after[field] == before[field]
     with db.get_db() as connection:
         assert connection.execute("SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] == event_n
         assert connection.execute("SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)).fetchone()["n"] == attempt_n

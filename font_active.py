@@ -49,7 +49,7 @@ EXTRA_UI_TEXT = (
     # Stats page (also scanned from stats.js; kept as fallback for deploy races).
     "认识模糊忘记本场第一次就拼对曾拼错过最终仍未拼对"
     "认知情况复习新学记忆持久度今日汇总今日认识今日模糊今日忘记今日待学今日时长"
-    "遗忘曲线学习情况周月日待学时长句子数已加入记忆规划"
+    "评分复习预测稳定度难度保持率今日学习未来天句子数"
 )
 
 _state_lock = threading.Lock()

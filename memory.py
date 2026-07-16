@@ -1,213 +1,27 @@
-"""Exponential forgetting model and grade mapping for sentence review.
+"""Timezone helpers used for display and natural-day statistics.
 
-Grade mapping from practice outcomes (documented for stats UI 认识/模糊/忘记):
-
-  - skipped  → skipped     (不计入认知堆叠 / 遗忘拟合)
-  - wrong    → forgotten   (忘记：本 session 最终仍未拼对)
-  - correct & (force_fuzzy or attempt_n > 1) → fuzzy  (模糊：曾拼错过再对，或错题重练拼对)
-  - correct & attempt_n == 1 → known   (认识：本场第一次就拼对；不看用时)
-
-duration_ms is still recorded for stats (e.g. 今日时长) but does not affect grade.
-
-Memory model: R(t) = exp(-t / S)
-Next interval: t = -S * ln(TARGET_R)  so review lands near the target retention.
+Review scheduling intentionally does not live here.  All scheduling is handled
+by :mod:`fsrs_service`, and all scheduler timestamps remain in UTC.
 """
 from __future__ import annotations
 
-import math
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-# --- Model constants ---
-TARGET_R = 0.90
-INITIAL_S = 1.0
-MIN_S = 0.3
-MAX_S = 365.0
-FIXED_INTERVALS = [1, 3, 7, 14, 30]
-DEFAULT_SCHEDULER_MODE = "dynamic"
-MIN_CURVE_SAMPLES = 3
-# Reference Ebbinghaus curve: R(t)=exp(-t/S_REF) in days.
-# S_REF≈1.09 → day-1 retention ≈40% (classic 33–44% band); strictly decreasing after.
-S_REF = 1.09
-# Bayesian-style blend: w = n/(n+K); small n stays close to theory.
-CURVE_BLEND_K = MIN_CURVE_SAMPLES
-HOLD_THRESHOLDS = (10, 30, 60, 90)
-DUE_PRESSURE_THRESHOLD = 30
-
-SUCCESS_RESULTS = frozenset({"known", "fuzzy"})
-COGNITIVE_RESULTS = frozenset({"known", "fuzzy", "forgotten"})
-
-
-def clamp_stability(s: float) -> float:
-    return max(MIN_S, min(MAX_S, float(s)))
-
-
-def retention(days: float, stability: float) -> float:
-    """R(t) = exp(-t / S)."""
-    s = max(stability, 1e-9)
-    t = max(0.0, float(days))
-    return math.exp(-t / s)
-
-
-def interval_for_stability(stability: float, target_r: float = TARGET_R) -> float:
-    """Days until R(t) drops to target_r."""
-    s = clamp_stability(stability)
-    r = min(max(float(target_r), 1e-6), 0.999999)
-    return -s * math.log(r)
-
-
-def hold_days(stability: float, target_r: float = TARGET_R) -> float:
-    """Predicted days the item stays above target retention (same as interval_for_stability)."""
-    return interval_for_stability(stability, target_r)
-
-
-def update_stability(stability: float, result: str) -> float:
-    """Update S after a graded review. skipped leaves S unchanged (caller should skip)."""
-    s = clamp_stability(stability if stability is not None else INITIAL_S)
-    if result == "known":
-        return clamp_stability(s * 2.0)
-    if result == "fuzzy":
-        return clamp_stability(s * 1.2)
-    if result == "forgotten":
-        return INITIAL_S
-    if result == "skipped":
-        return s
-    raise ValueError(f"unknown result: {result}")
-
-
-def grade_attempt(
-    status: str,
-    attempt_n: int = 1,
-    duration_ms: int = 0,
-    force_fuzzy: bool = False,
-) -> str:
-    """Map status + attempt metadata to a cognitive grade.
-
-    duration_ms is accepted for call-site compatibility / stats recording but
-    does not affect the grade. force_fuzzy is set for retry_wrong sessions so
-    a first correct in that new session still counts as fuzzy.
-
-    See module docstring for the full mapping table.
-    """
-    # duration_ms intentionally unused for classification (still recorded for stats)
-    _ = duration_ms
-    status = (status or "").lower()
-    if status == "skipped":
-        return "skipped"
-    if status == "wrong":
-        return "forgotten"
-    if status != "correct":
-        raise ValueError(f"unknown status: {status}")
-    if force_fuzzy or max(1, int(attempt_n or 1)) > 1:
-        return "fuzzy"
-    return "known"
-
-
-def fixed_interval_days(streak_after_correct: int) -> int:
-    idx = max(0, min(streak_after_correct - 1, len(FIXED_INTERVALS) - 1))
-    return FIXED_INTERVALS[idx]
-
-
-def schedule_next(
-    *,
-    mode: str,
-    result: str,
-    stability_after: float,
-    streak_after: int,
-    now: datetime | None = None,
-) -> tuple[str, float]:
-    """Return (next_review_at_iso, interval_days).
-
-    skipped: caller should not change due; this still returns current stamp + 0
-    for bookkeeping if invoked.
-    """
-    now = now or datetime.now(timezone.utc)
-    stamp = now.isoformat(timespec="seconds")
-    mode = (mode or DEFAULT_SCHEDULER_MODE).lower()
-    if result == "skipped":
-        return stamp, 0.0
-    if result == "forgotten":
-        return stamp, 0.0
-
-    if mode == "fixed":
-        days = float(fixed_interval_days(streak_after))
-        due = (now + timedelta(days=days)).isoformat(timespec="seconds")
-        return due, days
-
-    # dynamic
-    days = interval_for_stability(stability_after)
-    due = (now + timedelta(days=days)).isoformat(timespec="seconds")
-    return due, days
-
-
-def ebbinghaus_theory_rate(days: float) -> float:
-    """Reference forgetting curve R(t)=exp(-t/S_REF) with t in days.
-
-    Day 0 is 100% retention. S_REF is calibrated so day 1 lands near the
-    classic ~33–44% band; the curve is smooth and strictly decreasing.
-    """
-    if days <= 0:
-        return 1.0
-    return retention(float(days), S_REF)
-
-
-def blend_user_rate(theory_pct: float, empirical_pct: float | None, sample_size: int) -> float:
-    """Blend empirical retention with theory prior.
-
-    w = n/(n+K); when n=0 the result equals theory (user curve overlays reference).
-    """
-    n = max(0, int(sample_size or 0))
-    theory = float(theory_pct)
-    if n <= 0 or empirical_pct is None:
-        return theory  # exact prior — do not re-round away from theory_curve_points
-    w = n / (n + CURVE_BLEND_K)
-    blended = w * float(empirical_pct) + (1.0 - w) * theory
-    return round(max(0.0, min(100.0, blended)), 2)
-
-
-def theory_curve_points(max_offset: int = 11) -> list[dict]:
-    """Points for offsets 0..max_offset days with Chinese labels."""
-    points = []
-    for d in range(max_offset + 1):
-        if d == 0:
-            label = "今天"
-        elif d == 1:
-            label = "明天"
-        elif d == 2:
-            label = "后天"
-        else:
-            label = f"{d}天后"
-        rate = ebbinghaus_theory_rate(d)
-        # Keep two decimals so late-window values stay strictly ordered before flooring to 0.
-        pct = round(rate * 100, 2)
-        points.append({
-            "offsetDays": d,
-            "label": label,
-            "theory": pct,
-        })
-    return points
 
 
 def parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        text = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _resolve_zone(tz_name: str | None) -> ZoneInfo | None:
-    """Resolve an IANA timezone name to a ZoneInfo, or None if empty/invalid.
-
-    Invalid or unrecognized names are treated the same as "not set" rather
-    than raising, so a corrupted or stale settings value never breaks a
-    request; callers fall back to server-local time in that case.
-    """
     if not tz_name:
         return None
     try:
@@ -217,20 +31,10 @@ def _resolve_zone(tz_name: str | None) -> ZoneInfo | None:
 
 
 def is_valid_timezone(tz_name: str) -> bool:
-    """True if tz_name is a resolvable IANA timezone key."""
     return _resolve_zone(tz_name) is not None
 
 
 def local_date(dt: datetime | None = None, tz_name: str | None = None):
-    """Calendar date in tz_name (an IANA key) if valid, else the server's local timezone.
-
-    tz_name is normally the user-configured "user_timezone" setting, which
-    lets each deployment's users see "today" boundaries in their own
-    timezone rather than wherever the server happens to run. Empty or
-    unrecognized tz_name falls back to the previous server-local behavior,
-    so existing deployments are unaffected until a timezone is explicitly set.
-    """
     zone = _resolve_zone(tz_name)
-    if dt is None:
-        dt = datetime.now(timezone.utc)
+    dt = dt or datetime.now(timezone.utc)
     return dt.astimezone(zone).date() if zone else dt.astimezone().date()

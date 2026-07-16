@@ -1,133 +1,73 @@
-"""Unit tests for the exponential forgetting model and grade mapping."""
-import math
+from datetime import datetime, timezone
 
-from memory import (
-    FIXED_INTERVALS,
-    INITIAL_S,
-    S_REF,
-    TARGET_R,
-    blend_user_rate,
-    ebbinghaus_theory_rate,
-    fixed_interval_days,
-    grade_attempt,
-    hold_days,
-    interval_for_stability,
-    is_valid_timezone,
-    local_date,
-    retention,
-    schedule_next,
-    theory_curve_points,
-    update_stability,
+import pytest
+from fsrs import Rating, State
+
+from fsrs_service import (
+    FSRS_VERSION,
+    card_fields,
+    new_card,
+    rating_from_attempts,
+    review,
 )
+from memory import is_valid_timezone, local_date, parse_iso
 
 
-def test_grade_mapping_rules():
-    assert grade_attempt("skipped") == "skipped"
-    assert grade_attempt("wrong") == "forgotten"
-    assert grade_attempt("correct", attempt_n=2) == "fuzzy"
-    # First correct is known regardless of duration
-    assert grade_attempt("correct", attempt_n=1, duration_ms=5_000) == "known"
-    assert grade_attempt("correct", attempt_n=1, duration_ms=15_000) == "known"
-    assert grade_attempt("correct", attempt_n=1, duration_ms=20_000) == "known"
-    assert grade_attempt("correct", attempt_n=1, duration_ms=0) == "known"
-    # retry_wrong sessions force fuzzy on first correct
-    assert grade_attempt("correct", attempt_n=1, duration_ms=1_000, force_fuzzy=True) == "fuzzy"
-    assert grade_attempt("wrong", force_fuzzy=True) == "forgotten"
+NOW = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
 
 
-def test_stability_updates_and_clamp():
-    s0 = INITIAL_S
-    s_known = update_stability(s0, "known")
-    s_fuzzy = update_stability(s0, "fuzzy")
-    s_forgot = update_stability(10.0, "forgotten")
-    assert s_known > s_fuzzy > s0
-    assert s_forgot == INITIAL_S
-    assert update_stability(s0, "skipped") == s0
-    # clamp upper
-    assert update_stability(300.0, "known") <= 365.0
+def row_for(card):
+    return {"id": card.card_id, **card_fields(card)}
 
 
-def test_interval_and_retention_math():
-    s = 10.0
-    t = interval_for_stability(s, TARGET_R)
-    assert abs(t - (-s * math.log(TARGET_R))) < 1e-9
-    assert abs(retention(t, s) - TARGET_R) < 1e-9
-    assert hold_days(s) == t
+def test_new_card_is_due_fsrs_learning_card():
+    card = new_card(42, NOW)
+    fields = card_fields(card)
+    assert card.state is State.Learning
+    assert fields == {
+        "fsrs_state": int(State.Learning),
+        "fsrs_step": 0,
+        "stability": None,
+        "difficulty": None,
+        "last_review_at": None,
+        "next_review_at": NOW.isoformat(timespec="seconds"),
+        "fsrs_version": FSRS_VERSION,
+    }
 
 
-def test_schedule_dynamic_and_fixed():
-    from datetime import datetime, timezone
+@pytest.mark.parametrize(
+    "attempts,easy,expected",
+    [
+        ([{"status": "skipped"}], False, None),
+        ([{"status": "wrong"}], False, Rating.Again),
+        ([{"status": "wrong"}, {"status": "correct"}], False, Rating.Hard),
+        ([{"status": "correct"}], False, Rating.Good),
+        ([{"status": "correct"}], True, Rating.Easy),
+    ],
+)
+def test_rating_mapping(attempts, easy, expected):
+    assert rating_from_attempts(attempts, easy=easy) == expected
 
-    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-    due, days = schedule_next(
-        mode="dynamic", result="known", stability_after=10.0, streak_after=1, now=now,
+
+@pytest.mark.parametrize("rating", list(Rating))
+def test_official_fsrs_new_card_ratings_are_persistable(rating):
+    outcome = review(
+        row_for(new_card(7, NOW)), rating,
+        reviewed_at=NOW, duration_ms=1200, enable_fuzzing=False,
     )
-    assert days == interval_for_stability(10.0)
-    assert due.startswith("2026-")
-
-    due_f, days_f = schedule_next(
-        mode="fixed", result="known", stability_after=10.0, streak_after=1, now=now,
-    )
-    assert days_f == float(FIXED_INTERVALS[0])
-    assert "2026-01-02" in due_f
-
-    due_w, days_w = schedule_next(
-        mode="dynamic", result="forgotten", stability_after=1.0, streak_after=0, now=now,
-    )
-    assert days_w == 0.0
-    assert due_w == now.isoformat(timespec="seconds")
+    assert outcome.rating is rating
+    assert outcome.after["stability"] is not None
+    assert outcome.after["difficulty"] is not None
+    assert parse_iso(outcome.after["last_review_at"]) == NOW
+    assert parse_iso(outcome.after["next_review_at"]) >= NOW
+    assert outcome.after["fsrs_version"] == FSRS_VERSION
 
 
-def test_fixed_interval_ladder():
-    assert fixed_interval_days(1) == 1
-    assert fixed_interval_days(2) == 3
-    assert fixed_interval_days(5) == 30
-    assert fixed_interval_days(99) == 30
-
-
-def test_theory_curve_shape():
-    points = theory_curve_points(11)
-    assert len(points) == 12
-    assert points[0]["label"] == "今天"
-    assert points[0]["theory"] == 100.0
-    # Monotone decreasing exponential (day units); allow tiny late-window floor
-    for i in range(len(points) - 1):
-        assert points[i]["theory"] >= points[i + 1]["theory"]
-    # Early window must drop visibly (not flatten after day 1)
-    assert points[0]["theory"] > points[1]["theory"] > points[2]["theory"]
-    assert points[2]["theory"] > points[6]["theory"] > points[11]["theory"]
-    d1 = points[1]["theory"]
-    assert 33.0 <= d1 <= 44.0
-    # Day-unit model: R(t)=exp(-t/S_REF), not minute-log flattening
-    assert abs(ebbinghaus_theory_rate(1) - math.exp(-1 / S_REF)) < 1e-9
-    assert abs(ebbinghaus_theory_rate(0) - 1.0) < 1e-12
-    # Unrounded rates are strictly decreasing across the whole window
-    raw = [ebbinghaus_theory_rate(d) for d in range(12)]
-    assert all(raw[i] > raw[i + 1] for i in range(11))
-
-
-def test_blend_user_rate_prior_and_weight():
-    theory = 40.0
-    # No samples → equals theory prior
-    assert blend_user_rate(theory, None, 0) == theory
-    assert blend_user_rate(theory, 100.0, 0) == theory
-    # With samples, pull toward empirical
-    blended = blend_user_rate(theory, 100.0, 3)
-    assert theory < blended < 100.0
-    # More samples → closer to empirical
-    more = blend_user_rate(theory, 100.0, 30)
-    assert more > blended
-
-
-def test_local_date_respects_explicit_timezone():
-    from memory import parse_iso
-
-    # 2026-01-01 23:30 UTC：东京（UTC+9）已经是次日，洛杉矶（UTC-8）还是前一天
-    dt = parse_iso("2026-01-01T23:30:00+00:00")
-    assert local_date(dt, tz_name="Asia/Tokyo").isoformat() == "2026-01-02"
-    assert local_date(dt, tz_name="America/Los_Angeles").isoformat() == "2026-01-01"
-    # 无效时区名静默回退到服务器本地时区，不抛异常
-    assert local_date(dt, tz_name="Not/AZone") == local_date(dt)
-    assert is_valid_timezone("Asia/Tokyo") is True
-    assert is_valid_timezone("Not/AZone") is False
-    assert is_valid_timezone("") is False
+def test_timezone_helpers_do_not_change_utc_instant():
+    stamp = "2026-01-01T16:30:00+00:00"
+    parsed = parse_iso(stamp)
+    assert parsed.tzinfo is timezone.utc
+    assert local_date(parsed, "Asia/Shanghai").isoformat() == "2026-01-02"
+    assert local_date(parsed, "UTC").isoformat() == "2026-01-01"
+    assert is_valid_timezone("Asia/Shanghai")
+    assert not is_valid_timezone("Mars/Olympus")

@@ -1,7 +1,10 @@
-"""API tests for stats endpoints, scheduler settings, and dynamic SRS."""
 import importlib
 import json
-from datetime import datetime, timedelta, timezone
+import sqlite3
+from datetime import datetime, timezone
+
+import pytest
+from fsrs import Rating, State
 
 
 def load_app(tmp_path, monkeypatch):
@@ -15,698 +18,236 @@ def load_app(tmp_path, monkeypatch):
     return app.create_app({"TESTING": True}).test_client(), db
 
 
-def make_sentence(client, collection, text="文"):
-    chunks = [{"id": f"c-{text}", "text": text}]
-    created = client.post("/api/sentences", json={
-        "collectionId": collection,
-        "chinese": f"中{text}",
-        "japanese": text,
+def make_sentence(client, collection_id, suffix=""):
+    chunks = [{"id": f"a{suffix}", "text": f"文{suffix}"}]
+    response = client.post("/api/sentences", json={
+        "collectionId": collection_id,
+        "chinese": f"句子{suffix}",
+        "japanese": f"文{suffix}",
         "chunks": chunks,
-        "correctOrder": [chunks[0]["id"]],
+        "correctOrder": [f"a{suffix}"],
     })
-    assert created.status_code == 201
-    return created.get_json()["sentence"]
+    assert response.status_code == 201
+    return response.get_json()["sentence"]
 
 
-def test_scheduler_settings_roundtrip(tmp_path, monkeypatch):
-    client, _ = load_app(tmp_path, monkeypatch)
-    got = client.get("/api/settings/scheduler").get_json()
-    assert got["mode"] == "dynamic"
-    assert client.put("/api/settings/scheduler", json={"mode": "fixed"}).status_code == 200
-    assert client.get("/api/settings/scheduler").get_json()["mode"] == "fixed"
-    assert client.put("/api/settings/scheduler", json={"mode": "nope"}).status_code == 400
+def start(client, sentence, retry_wrong=False):
+    response = client.post("/api/practice/sessions", json={
+        "sentenceIds": [sentence["id"]], "retryWrong": retry_wrong,
+    })
+    assert response.status_code == 201
+    return response.get_json()["sessionId"]
 
 
-def test_timezone_settings_roundtrip(tmp_path, monkeypatch):
-    client, _ = load_app(tmp_path, monkeypatch)
-    got = client.get("/api/settings/timezone").get_json()
-    assert got["timezone"] == ""
-    assert "serverUtcOffset" in got
-    assert client.put("/api/settings/timezone", json={"timezone": "Asia/Tokyo"}).status_code == 200
-    assert client.get("/api/settings/timezone").get_json()["timezone"] == "Asia/Tokyo"
-    assert client.put("/api/settings/timezone", json={"timezone": "Not/AZone"}).status_code == 400
-    # 空字符串代表"跟随服务器时区"，是合法值，用于清除设置
-    assert client.put("/api/settings/timezone", json={"timezone": ""}).status_code == 200
-    assert client.get("/api/settings/timezone").get_json()["timezone"] == ""
-
-
-def test_dynamic_srs_updates_stability_and_due(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "あ")
-    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
-    endpoint = f'/api/practice/sessions/{practice["sessionId"]}/attempts'
-    # First correct → known (duration no longer affects grade)
-    res = client.post(endpoint, json={
+def check(client, session_id, sentence, correct, duration_ms=1000):
+    return client.post(f"/api/practice/sessions/{session_id}/attempts", json={
         "sentenceId": sentence["id"],
         "action": "check",
-        "answerOrder": sentence["correctOrder"],
-        "durationMs": 3000,
+        "answerOrder": sentence["correctOrder"] if correct else [],
+        "durationMs": duration_ms,
     })
-    assert res.status_code == 200
-    assert res.get_json()["grade"] == "known"
-    refreshed = client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]
-    assert refreshed["stability"] > 1.0
-    assert refreshed["review_count"] == 1
-    assert refreshed["next_review_at"] > refreshed["last_practiced_at"]
 
+
+def finish(client, session_id, sentence, easy=False):
+    return client.post(
+        f"/api/practice/sessions/{session_id}/sentences/{sentence['id']}/complete",
+        json={"easy": easy},
+    )
+
+
+def stored_card(db, sentence_id):
     with db.get_db() as connection:
-        events = connection.execute(
-            "SELECT result, attempt_n FROM review_events WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchall()
-    assert len(events) == 1
-    assert events[0]["result"] == "known"
+        return dict(connection.execute("SELECT * FROM sentences WHERE id=?", (sentence_id,)).fetchone())
 
 
-def test_retry_grades_as_fuzzy_and_upserts_event(tmp_path, monkeypatch):
+def test_new_sentence_is_immediately_due_fsrs_new_card(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "い")
-    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
-    endpoint = f'/api/practice/sessions/{practice["sessionId"]}/attempts'
-    wrong = client.post(endpoint, json={
-        "sentenceId": sentence["id"], "action": "check",
-        "answerOrder": [], "durationMs": 1000,
+    sentence = make_sentence(client, collection, "new")
+    row = stored_card(db, sentence["id"])
+    assert row["fsrs_state"] == int(State.Learning)
+    assert row["fsrs_step"] == 0
+    assert row["stability"] is None and row["difficulty"] is None
+    assert row["last_review_at"] is None
+    assert row["fsrs_version"] == "6.3.1"
+    assert datetime.fromisoformat(row["next_review_at"]) <= datetime.now(timezone.utc)
+    due = client.post("/api/practice/sessions", json={"collectionId": collection})
+    assert sentence["id"] in [item["id"] for item in due.get_json()["sentences"]]
+
+
+def test_check_only_appends_raw_attempt_without_changing_fsrs(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "raw")
+    session_id = start(client, sentence)
+    before = stored_card(db, sentence["id"])
+    assert check(client, session_id, sentence, False).get_json()["status"] == "wrong"
+    assert check(client, session_id, sentence, True).get_json()["status"] == "correct"
+    after = stored_card(db, sentence["id"])
+    for field in ("fsrs_state", "fsrs_step", "stability", "difficulty", "last_review_at", "next_review_at"):
+        assert after[field] == before[field]
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM attempts").fetchone()["n"] == 2
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 0
+
+
+@pytest.mark.parametrize(
+    "checks,easy,expected",
+    [
+        ([False], False, "again"),
+        ([False, True], False, "hard"),
+        ([True], False, "good"),
+        ([True], True, "easy"),
+    ],
+)
+def test_final_rating_updates_once(checks, easy, expected, tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, expected)
+    session_id = start(client, sentence, retry_wrong=True)
+    for correct in checks:
+        assert check(client, session_id, sentence, correct).status_code == 200
+    completed = finish(client, session_id, sentence, easy=easy)
+    assert completed.status_code == 200
+    assert completed.get_json()["rating"] == expected
+    row = stored_card(db, sentence["id"])
+    assert row["stability"] is not None and row["difficulty"] is not None
+    with db.get_db() as connection:
+        event = connection.execute("SELECT * FROM review_events").fetchone()
+        assert event["rating"] == int(getattr(Rating, expected.capitalize()))
+        assert event["next_review_after"] == row["next_review_at"]
+        assert event["fsrs_version"] == "6.3.1"
+        assert event["duration_ms"] == len(checks) * 1000
+
+    duplicate = finish(client, session_id, sentence, easy=not easy)
+    assert duplicate.status_code == 200 and duplicate.get_json()["duplicate"] is True
+    assert stored_card(db, sentence["id"])["next_review_at"] == row["next_review_at"]
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 1
+
+
+def test_skip_finalizes_without_fsrs_change(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection, "skip")
+    session_id = start(client, sentence)
+    before = stored_card(db, sentence["id"])
+    response = client.post(f"/api/practice/sessions/{session_id}/attempts", json={
+        "sentenceId": sentence["id"], "action": "skip", "answerOrder": [],
     })
-    assert wrong.get_json()["status"] == "wrong"
-    final = client.post(endpoint, json={
-        "sentenceId": sentence["id"], "action": "check",
-        "answerOrder": sentence["correctOrder"], "durationMs": 2000,
-    })
-    assert final.get_json()["grade"] == "fuzzy"
+    assert response.status_code == 200
+    completed = finish(client, session_id, sentence)
+    assert completed.get_json()["rating"] is None
+    assert stored_card(db, sentence["id"])["next_review_at"] == before["next_review_at"]
     with db.get_db() as connection:
-        n = connection.execute(
-            "SELECT COUNT(*) n FROM review_events WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchone()["n"]
-        row = connection.execute(
-            "SELECT result, attempt_n FROM review_events WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchone()
-    assert n == 1
-    assert row["result"] == "fuzzy"
-    assert row["attempt_n"] == 2
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 0
 
 
-def test_fixed_mode_uses_interval_ladder(tmp_path, monkeypatch):
-    client, _ = load_app(tmp_path, monkeypatch)
-    client.put("/api/settings/scheduler", json={"mode": "fixed"})
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "う")
-    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
-    client.post(
-        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
-        json={"sentenceId": sentence["id"], "action": "check", "answerOrder": sentence["correctOrder"], "durationMs": 20000},
-    )
-    refreshed = client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]
-    # streak 1 → 1 day fixed
-    from datetime import datetime
-    due = datetime.fromisoformat(refreshed["next_review_at"])
-    practiced = datetime.fromisoformat(refreshed["last_practiced_at"])
-    delta = (due - practiced).total_seconds()
-    assert 23 * 3600 < delta < 25 * 3600
-
-
-def test_learning_stats_buckets_and_today(tmp_path, monkeypatch):
+def test_database_unique_constraint_and_delete_cascade(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s1 = make_sentence(client, collection, "え")
-    s2 = make_sentence(client, collection, "お")
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    sentence = make_sentence(client, collection, "delete")
+    session_id = start(client, sentence)
+    check(client, session_id, sentence, True)
+    finish(client, session_id, sentence)
     with db.get_db() as connection:
-        for sid, result, is_new, ms in [
-            (s1["id"], "known", 1, 5000),
-            (s1["id"], "fuzzy", 0, 8000),  # will be separate rows for historical
-            (s2["id"], "forgotten", 1, 12000),
-        ]:
+        event = dict(connection.execute("SELECT * FROM review_events").fetchone())
+        columns = [key for key in event if key != "id"]
+        with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                """INSERT INTO review_events(
-                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                     is_new, stability_before, stability_after, interval_days, created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (sid, None, stamp, result, ms, 1, is_new, 1.0, 2.0 if result != "forgotten" else 1.0, 1.0, stamp),
+                f"INSERT INTO review_events({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                [event[key] for key in columns],
             )
-    data = client.get("/api/stats/learning?granularity=day").get_json()
-    assert data["granularity"] == "day"
-    # Only today has activity → leading empty buckets trimmed; grow from first data day
-    assert len(data["series"]) == 1
-    assert data["series"][0]["label"] == "今天"
-    today = data["today"]
-    assert "mastered" not in today
-    assert today["known"] >= 1
-    assert today["fuzzy"] >= 1
-    assert today["forgotten"] >= 1
-    assert today["durationSec"] >= 5
-    assert "dueTotal" in today
-    assert data["series"][-1]["known"] >= 1
+    assert client.delete(f"/api/sentences/{sentence['id']}").status_code == 200
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM attempts").fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM practice_items").fetchone()["n"] == 0
 
 
-def test_dashboard_today_aligns_with_stats_across_utc_boundary(tmp_path, monkeypatch):
-    """Dashboard and stats_learning must share local-day + review_events for 'today'.
+def create_legacy_database(path):
+    stamp = "2025-01-01T00:00:00+00:00"
+    with sqlite3.connect(path) as db:
+        db.executescript("""
+          CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+          CREATE TABLE collections(id INTEGER PRIMARY KEY,name TEXT,created_at TEXT,updated_at TEXT);
+          CREATE TABLE sentences(
+            id INTEGER PRIMARY KEY, collection_id INTEGER, chinese TEXT, japanese TEXT,
+            chunks_json TEXT, correct_order_json TEXT, furigana_json TEXT,
+            study_count INTEGER, correct_count INTEGER, wrong_count INTEGER, skip_count INTEGER,
+            correct_streak INTEGER, stability REAL, review_count INTEGER, lapse_count INTEGER,
+            next_review_at TEXT, created_at TEXT, updated_at TEXT, last_practiced_at TEXT
+          );
+          CREATE TABLE practice_sessions(id INTEGER PRIMARY KEY,source TEXT,sentence_ids_json TEXT,total INTEGER,correct INTEGER,wrong INTEGER,skipped INTEGER,completed_at TEXT,created_at TEXT);
+          CREATE TABLE attempts(id INTEGER PRIMARY KEY,session_id INTEGER,sentence_id INTEGER,status TEXT,answer_order_json TEXT,sentence_snapshot_json TEXT,created_at TEXT);
+          CREATE TABLE review_events(id INTEGER PRIMARY KEY,sentence_id INTEGER,session_id INTEGER,reviewed_at TEXT,result TEXT,created_at TEXT);
+        """)
+        db.execute("INSERT INTO settings VALUES('scheduler_mode','fixed')")
+        db.execute("INSERT INTO collections VALUES(1,'旧句集',?,?)", (stamp, stamp))
+        db.execute("""INSERT INTO sentences VALUES(
+          1,1,'保留中文','保留日本語','[{"id":"a","text":"保留日本語"}]','["a"]','[]',
+          9,8,7,6,5,99,4,3,'2099-01-01T00:00:00+00:00',?,?,?)""", (stamp, stamp, stamp))
+        db.execute("INSERT INTO practice_sessions VALUES(1,'due','[1]',1,1,0,0,?,?)", (stamp, stamp))
+        db.execute("INSERT INTO attempts VALUES(1,1,1,'correct','[]','{}',?)", (stamp,))
+        db.execute("INSERT INTO review_events VALUES(1,1,1,?,'known',?)", (stamp, stamp))
 
-    Construct events where UTC calendar date may differ from the server local date
-    (common for Asia/Shanghai near the UTC day boundary). Old dashboard used
-    substr(attempts.created_at,1,10) against UTC date and would miscount.
-    """
-    from memory import local_date, parse_iso
 
+def test_one_time_migration_preserves_content_resets_progress_and_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "japanese_sentence_review.sqlite3"
+    create_legacy_database(db_path)
     client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s_today = make_sentence(client, collection, "跨日A")
-    s_skipped = make_sentence(client, collection, "跨日B")
-    s_tomorrow = make_sentence(client, collection, "跨日C")
-
-    today = local_date()
-    local_tz = datetime.now().astimezone().tzinfo
-    # Local today 01:00 — often still previous UTC date for +HH:MM zones.
-    local_morning = (
-        datetime.combine(today, datetime.min.time()).replace(tzinfo=local_tz)
-        + timedelta(hours=1)
-    )
-    stamp_today = local_morning.astimezone(timezone.utc).isoformat(timespec="seconds")
-    # Local tomorrow 01:00 — must not count toward "today".
-    stamp_tomorrow = (
-        local_morning + timedelta(days=1)
-    ).astimezone(timezone.utc).isoformat(timespec="seconds")
-
-    assert local_date(parse_iso(stamp_today)) == today
-    assert local_date(parse_iso(stamp_tomorrow)) == today + timedelta(days=1)
-
+    sentence = client.get("/api/sentences/1").get_json()["sentence"]
+    assert sentence["chinese"] == "保留中文" and sentence["japanese"] == "保留日本語"
+    assert sentence["chunks"][0]["text"] == "保留日本語"
+    assert sentence["fsrs_state"] == int(State.Learning)
+    assert sentence["stability"] is None and sentence["last_review_at"] is None
     with db.get_db() as connection:
-        for sid, result, stamp in [
-            (s_today["id"], "known", stamp_today),
-            (s_skipped["id"], "skipped", stamp_today),
-            (s_tomorrow["id"], "known", stamp_tomorrow),
-        ]:
-            connection.execute(
-                """INSERT INTO review_events(
-                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                     is_new, stability_before, stability_after, interval_days, created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (sid, None, stamp, result, 5000, 1, 1, 1.0, 2.0, 1.0, stamp),
-            )
+        assert connection.execute("SELECT COUNT(*) n FROM attempts").fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 0
+        assert connection.execute("SELECT COUNT(*) n FROM practice_sessions").fetchone()["n"] == 0
+        assert connection.execute("SELECT value FROM settings WHERE key='scheduler_mode'").fetchone() is None
+        assert connection.execute("SELECT COUNT(*) n FROM schema_migrations WHERE version='fsrs_v1_reset'").fetchone()["n"] == 1
 
-    dash = client.get("/api/dashboard").get_json()
-    col = next(c for c in dash["collections"] if c["id"] == collection)
-    # Only the non-skipped local-today sentence (distinct) counts.
-    assert col["today"] == 1
-
-    stats = client.get("/api/stats/learning?granularity=day").get_json()
-    # Same local day: the known event is included; tomorrow's is not.
-    assert stats["today"]["known"] == 1
-    assert stats["today"]["fuzzy"] == 0
-    assert stats["today"]["forgotten"] == 0
-
-
-def test_dashboard_today_uses_configured_timezone(tmp_path, monkeypatch):
-    """With user_timezone set, dashboard 'today' follows that zone, not server local.
-
-    Pacific/Kiritimati is UTC+14 — almost never the CI host zone — so an event
-    that is "today" there can be a different calendar day under server-local time.
-    """
-    from memory import local_date, parse_iso
-    from zoneinfo import ZoneInfo
-
-    tz_name = "Pacific/Kiritimati"
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s_today = make_sentence(client, collection, "基里A")
-    s_skipped = make_sentence(client, collection, "基里B")
-    s_tomorrow = make_sentence(client, collection, "基里C")
-
-    today = local_date(tz_name=tz_name)
-    zone = ZoneInfo(tz_name)
-    local_morning = (
-        datetime.combine(today, datetime.min.time()).replace(tzinfo=zone)
-        + timedelta(hours=1)
-    )
-    stamp_today = local_morning.astimezone(timezone.utc).isoformat(timespec="seconds")
-    stamp_tomorrow = (
-        local_morning + timedelta(days=1)
-    ).astimezone(timezone.utc).isoformat(timespec="seconds")
-
-    assert local_date(parse_iso(stamp_today), tz_name=tz_name) == today
-    assert local_date(parse_iso(stamp_tomorrow), tz_name=tz_name) == today + timedelta(days=1)
-
-    with db.get_db() as connection:
-        for sid, result, stamp in [
-            (s_today["id"], "known", stamp_today),
-            (s_skipped["id"], "skipped", stamp_today),
-            (s_tomorrow["id"], "known", stamp_tomorrow),
-        ]:
-            connection.execute(
-                """INSERT INTO review_events(
-                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                     is_new, stability_before, stability_after, interval_days, created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (sid, None, stamp, result, 5000, 1, 1, 1.0, 2.0, 1.0, stamp),
-            )
-
-    assert client.put("/api/settings/timezone", json={"timezone": tz_name}).status_code == 200
-
-    dash = client.get("/api/dashboard").get_json()
-    col = next(c for c in dash["collections"] if c["id"] == collection)
-    # Only the non-skipped Kiritimati-local-today sentence counts.
-    assert col["today"] == 1
-
-    stats = client.get("/api/stats/learning?granularity=day").get_json()
-    assert stats["today"]["known"] == 1
-    assert stats["today"]["fuzzy"] == 0
-    assert stats["today"]["forgotten"] == 0
-
-    # When server-local bucketing of the same stamps differs from Kiritimati,
-    # clearing the setting must change the dashboard count — proves the setting
-    # is applied (not just that both zones happen to agree).
-    server_today = local_date()
-    server_count = sum(
-        1
-        for stamp in (stamp_today, stamp_tomorrow)
-        if local_date(parse_iso(stamp)) == server_today
-    )
-    if server_count != 1:
-        assert client.put("/api/settings/timezone", json={"timezone": ""}).status_code == 200
-        dash_server = client.get("/api/dashboard").get_json()
-        col_server = next(c for c in dash_server["collections"] if c["id"] == collection)
-        assert col_server["today"] == server_count
-
-
-def test_learning_stats_trims_leading_keeps_mid_gap(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s = make_sentence(client, collection, "え2")
-    now = datetime.now(timezone.utc)
-    # Activity 5 days ago and today; days in between empty → continuous axis with zeros
-    stamps = [
-        (now - timedelta(days=5)).isoformat(timespec="seconds"),
-        now.isoformat(timespec="seconds"),
-    ]
-    with db.get_db() as connection:
-        for t in stamps:
-            connection.execute(
-                """INSERT INTO review_events(
-                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                     is_new, stability_before, stability_after, interval_days, created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (s["id"], None, t, "known", 1000, 1, 0, 1.0, 2.0, 1.0, t),
-            )
-    data = client.get("/api/stats/learning?granularity=day").get_json()
-    series = data["series"]
-    assert len(series) == 6  # 5 days ago … today inclusive
-    assert series[0]["label"] == "5天前"
-    assert series[-1]["label"] == "今天"
-    # Mid gap: day 4..1 ago should be zero-activity placeholders
-    mid = series[1:-1]
-    assert len(mid) == 4
-    for bucket in mid:
-        activity = (
-            bucket["known"] + bucket["fuzzy"]
-            + bucket["forgotten"] + bucket["new"] + bucket["review"]
-        )
-        assert activity == 0
-
-
-def test_forgetting_curve_empirical_buckets(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "か")
-    base = datetime.now(timezone.utc) - timedelta(days=20)
-    with db.get_db() as connection:
-        # Create enough pairs with gap=1 day, all successful, to pass min samples
-        for i in range(6):
-            t1 = (base + timedelta(days=i * 3)).isoformat(timespec="seconds")
-            t2 = (base + timedelta(days=i * 3 + 1)).isoformat(timespec="seconds")
-            for t, result in [(t1, "known"), (t2, "known")]:
-                connection.execute(
-                    """INSERT INTO review_events(
-                         sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                         is_new, stability_before, stability_after, interval_days, created_at
-                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                    (sentence["id"], None, t, result, 1000, 1, 0, 1.0, 2.0, 1.0, t),
-                )
-    data = client.get("/api/stats/forgetting-curve").get_json()
-    assert len(data["points"]) == 12
-    assert data["points"][0]["theory"] == 100.0
-    # Theory strictly decreasing
-    theories = [p["theory"] for p in data["points"]]
-    assert all(theories[i] > theories[i + 1] for i in range(len(theories) - 1))
-    assert 33.0 <= theories[1] <= 44.0
-    # User curve always present (never null); sparse buckets equal theory
-    for p in data["points"]:
-        assert p["user"] is not None
-        if p["userSampleSize"] == 0:
-            assert p["user"] == p["theory"]
-    gap1 = data["points"][1]
-    assert gap1["userSampleSize"] >= 3
-    # 100% empirical blended with theory → between theory and 100
-    assert gap1["theory"] < gap1["user"] <= 100.0
-
-
-def test_forgetting_curve_empty_user_matches_theory(tmp_path, monkeypatch):
-    client, _ = load_app(tmp_path, monkeypatch)
-    data = client.get("/api/stats/forgetting-curve").get_json()
-    assert len(data["points"]) == 12
-    assert data["dataReady"] is False
-    for p in data["points"]:
-        assert p["userSampleSize"] == 0
-        assert p["user"] == p["theory"]
-
-
-def test_retention_stats_thresholds(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s = make_sentence(client, collection, "き")
-    # S such that hold_days >= 10: need -S*ln(0.9) >= 10 → S >= 10/0.10536 ≈ 95
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with db.get_db() as connection:
-        connection.execute(
-            "UPDATE sentences SET stability=?, created_at=? WHERE id=?",
-            (100.0, stamp, s["id"]),
-        )
-        connection.execute(
-            """INSERT INTO review_events(
-                 sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                 is_new, stability_before, stability_after, interval_days, created_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (s["id"], None, stamp, "known", 1000, 1, 1, 1.0, 100.0, 10.0, stamp),
-        )
-    data = client.get("/api/stats/retention?granularity=week").get_json()
-    assert data["granularity"] == "week"
-    # Sentence created today → series starts this week (leading empty weeks trimmed)
-    assert len(data["series"]) >= 1
-    assert data["series"][-1]["label"] == "本周"
-    last = data["series"][-1]
-    assert last["all"] >= 1
-    assert last["d10"] >= 1
-    assert last["d90"] == 0  # 100 * ln isn't enough for 90 days at 90%
-
-
-def test_retention_mid_gap_still_has_points(tmp_path, monkeypatch):
-    """Memory snapshot exists every day after first sentence; mid days are not dropped."""
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s = make_sentence(client, collection, "き2")
-    created = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat(timespec="seconds")
-    with db.get_db() as connection:
-        connection.execute(
-            "UPDATE sentences SET stability=?, created_at=? WHERE id=?",
-            (100.0, created, s["id"]),
-        )
-    data = client.get("/api/stats/retention?granularity=day").get_json()
-    series = data["series"]
-    # From created day (4 days ago) through today → 5 continuous buckets
-    assert len(series) == 5
-    for bucket in series:
-        assert bucket["all"] >= 1
-
-
-def test_learning_series_can_exceed_visible_bucket_threshold(tmp_path, monkeypatch):
-    """Long continuous history returns enough buckets for frontend horizontal scroll."""
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    s = make_sentence(client, collection, "く2")
-    now = datetime.now(timezone.utc)
-    # 20 days of activity (day threshold is 14)
-    with db.get_db() as connection:
-        for i in range(20, -1, -1):
-            t = (now - timedelta(days=i)).isoformat(timespec="seconds")
-            connection.execute(
-                """INSERT INTO review_events(
-                     sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                     is_new, stability_before, stability_after, interval_days, created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                (s["id"], None, t, "known", 500, 1, 0, 1.0, 2.0, 1.0, t),
-            )
-    data = client.get("/api/stats/learning?granularity=day").get_json()
-    assert len(data["series"]) == 21
-    assert len(data["series"]) > 14  # exceeds VISIBLE_BUCKETS.day
-
-
-def test_delete_sentence_hard_deletes_review_history(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "け")
-    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
-    client.post(
-        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
-        json={
-            "sentenceId": sentence["id"],
-            "action": "check",
-            "answerOrder": sentence["correctOrder"],
-            "durationMs": 5000,
-        },
-    )
-    with db.get_db() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)
-        ).fetchone()["n"] == 1
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)
-        ).fetchone()["n"] >= 1
-
-    assert client.delete(f'/api/sentences/{sentence["id"]}').status_code == 200
-
-    with db.get_db() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM sentences WHERE id=?", (sentence["id"],)
-        ).fetchone()["n"] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (sentence["id"],)
-        ).fetchone()["n"] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM attempts WHERE sentence_id=?", (sentence["id"],)
-        ).fetchone()["n"] == 0
-        # No orphaned NULL sentence_id rows from this delete path
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM review_events WHERE sentence_id IS NULL"
-        ).fetchone()["n"] == 0
-
-
-def test_delete_report_keeps_review_events_and_sentence_memory(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "さ")
-    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
-    session_id = practice["sessionId"]
-    client.post(
-        f"/api/practice/sessions/{session_id}/attempts",
-        json={
-            "sentenceId": sentence["id"],
-            "action": "check",
-            "answerOrder": sentence["correctOrder"],
-            "durationMs": 5000,
-        },
-    )
-    client.post(f"/api/practice/sessions/{session_id}/complete", json={})
-
-    with db.get_db() as connection:
-        before = connection.execute(
-            "SELECT stability, next_review_at, review_count FROM sentences WHERE id=?",
-            (sentence["id"],),
-        ).fetchone()
-        event_before = connection.execute(
-            "SELECT id, sentence_id, result, attempt_n FROM review_events WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchone()
-        assert before is not None
-        assert event_before is not None
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM practice_sessions WHERE id=?", (session_id,)
-        ).fetchone()["n"] == 1
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM attempts WHERE session_id=?", (session_id,)
-        ).fetchone()["n"] >= 1
-        stability_before = before["stability"]
-        next_review_before = before["next_review_at"]
-        review_count_before = before["review_count"]
-        event_id = event_before["id"]
-        event_result = event_before["result"]
-        event_attempt_n = event_before["attempt_n"]
-
-    assert client.delete(f"/api/reports/{session_id}").status_code == 200
-
-    with db.get_db() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM practice_sessions WHERE id=?", (session_id,)
-        ).fetchone()["n"] == 0
-        assert connection.execute(
-            "SELECT COUNT(*) n FROM attempts WHERE session_id=?", (session_id,)
-        ).fetchone()["n"] == 0
-        event_after = connection.execute(
-            "SELECT id, sentence_id, result, attempt_n, session_id FROM review_events WHERE id=?",
-            (event_id,),
-        ).fetchone()
-        assert event_after is not None
-        assert event_after["sentence_id"] == sentence["id"]
-        assert event_after["result"] == event_result
-        assert event_after["attempt_n"] == event_attempt_n
-        # ON DELETE SET NULL may null session_id
-        assert event_after["session_id"] is None
-        after = connection.execute(
-            "SELECT stability, next_review_at, review_count FROM sentences WHERE id=?",
-            (sentence["id"],),
-        ).fetchone()
-        assert after["stability"] == stability_before
-        assert after["next_review_at"] == next_review_before
-        assert after["review_count"] == review_count_before
-
-
-def test_delete_report_not_found(tmp_path, monkeypatch):
-    client, _ = load_app(tmp_path, monkeypatch)
-    res = client.delete("/api/reports/999999")
-    assert res.status_code == 404
-    assert res.get_json()["error"] == "报告不存在"
-
-
-def test_migration_adds_columns_and_backfills(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "く")
-    practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
-    client.post(
-        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
-        json={"sentenceId": sentence["id"], "action": "check", "answerOrder": sentence["correctOrder"]},
-    )
-    with db.get_db() as connection:
-        cols = {row["name"] for row in connection.execute("PRAGMA table_info(sentences)")}
-        assert {"stability", "review_count", "lapse_count"} <= cols
-        a_cols = {row["name"] for row in connection.execute("PRAGMA table_info(attempts)")}
-        assert {"duration_ms", "attempt_n", "grade"} <= a_cols
-        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] >= 1
-    # Re-init is idempotent
+    session_id = start(client, sentence)
+    check(client, session_id, sentence, True)
+    finish(client, session_id, sentence)
+    db.init_db()
     db.init_db()
     with db.get_db() as connection:
-        n1 = connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"]
-    db.init_db()
-    with db.get_db() as connection:
-        n2 = connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"]
-    assert n1 == n2
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 1
+        assert connection.execute("SELECT COUNT(*) n FROM attempts").fetchone()["n"] == 1
 
 
-def test_retry_wrong_session_first_correct_is_fuzzy(tmp_path, monkeypatch):
-    """retryWrong sessions grade first correct as fuzzy (not known)."""
+def test_timezone_only_changes_natural_day_not_fsrs_utc(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "さ")
-    practice = client.post(
-        "/api/practice/sessions",
-        json={"sentenceIds": [sentence["id"]], "retryWrong": True},
-    ).get_json()
-    with db.get_db() as connection:
-        source = connection.execute(
-            "SELECT source FROM practice_sessions WHERE id=?",
-            (practice["sessionId"],),
-        ).fetchone()["source"]
-    assert source == "retry_wrong"
-    res = client.post(
-        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
-        json={
-            "sentenceId": sentence["id"],
-            "action": "check",
-            "answerOrder": sentence["correctOrder"],
-            "durationMs": 4000,
-        },
-    )
-    assert res.status_code == 200
-    assert res.get_json()["grade"] == "fuzzy"
-    with db.get_db() as connection:
-        row = connection.execute(
-            "SELECT result, attempt_n FROM review_events WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchone()
-    assert row["result"] == "fuzzy"
-    assert row["attempt_n"] == 1
+    sentence = make_sentence(client, collection, "tz")
+    assert client.put("/api/settings/timezone", json={"timezone": "Pacific/Kiritimati"}).status_code == 200
+    session_id = start(client, sentence)
+    check(client, session_id, sentence, True)
+    finish(client, session_id, sentence)
+    row = stored_card(db, sentence["id"])
+    assert row["last_review_at"].endswith("+00:00")
+    assert row["next_review_at"].endswith("+00:00")
+    summary = client.get("/api/stats/summary").get_json()
+    assert summary["today"]["learned"] == 1
 
 
-def test_retry_wrong_e2e_after_failed_round(tmp_path, monkeypatch):
-    """Complete a round with wrongs → open retry_wrong session → correct → fuzzy."""
-    client, db = load_app(tmp_path, monkeypatch)
+def test_fsrs_stats_and_read_only_settings(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "し")
-    practice1 = client.post(
-        "/api/practice/sessions", json={"sentenceIds": [sentence["id"]]},
-    ).get_json()
-    sid1 = practice1["sessionId"]
-    wrong = client.post(
-        f"/api/practice/sessions/{sid1}/attempts",
-        json={
-            "sentenceId": sentence["id"],
-            "action": "check",
-            "answerOrder": [],
-            "durationMs": 1000,
-        },
-    )
-    assert wrong.get_json()["status"] == "wrong"
-    assert wrong.get_json()["grade"] == "forgotten"
-    assert client.post(f"/api/practice/sessions/{sid1}/complete").status_code == 200
-
-    practice2 = client.post(
-        "/api/practice/sessions",
-        json={"sentenceIds": [sentence["id"]], "retryWrong": True},
-    ).get_json()
-    sid2 = practice2["sessionId"]
-    assert sid2 != sid1
-    final = client.post(
-        f"/api/practice/sessions/{sid2}/attempts",
-        json={
-            "sentenceId": sentence["id"],
-            "action": "check",
-            "answerOrder": sentence["correctOrder"],
-            "durationMs": 2000,
-        },
-    )
-    assert final.get_json()["grade"] == "fuzzy"
-    with db.get_db() as connection:
-        # Latest event for this sentence in the retry session is fuzzy
-        row = connection.execute(
-            """SELECT result FROM review_events
-               WHERE sentence_id=? AND session_id=? ORDER BY id DESC LIMIT 1""",
-            (sentence["id"], sid2),
-        ).fetchone()
-    assert row["result"] == "fuzzy"
-
-
-def test_migrate_mastered_to_known(tmp_path, monkeypatch):
-    client, db = load_app(tmp_path, monkeypatch)
-    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentence = make_sentence(client, collection, "す")
-    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with db.get_db() as connection:
-        connection.execute(
-            """INSERT INTO review_events(
-                 sentence_id, session_id, reviewed_at, result, duration_ms, attempt_n,
-                 is_new, stability_before, stability_after, interval_days, created_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-            (sentence["id"], None, stamp, "mastered", 1000, 1, 1, 1.0, 2.0, 1.0, stamp),
-        )
-        practice = connection.execute(
-            "INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at) VALUES(?,?,?,?)",
-            ("selected", json.dumps([sentence["id"]]), 1, stamp),
-        )
-        session_id = practice.lastrowid
-        connection.execute(
-            """INSERT INTO attempts(
-                 session_id,sentence_id,status,answer_order_json,sentence_snapshot_json,
-                 stats_before_json,duration_ms,attempt_n,grade,created_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (
-                session_id, sentence["id"], "correct", "[]", "{}",
-                "{}", 1000, 1, "mastered", stamp,
-            ),
-        )
-    db.init_db()
-    with db.get_db() as connection:
-        ev = connection.execute(
-            "SELECT result FROM review_events WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchone()
-        att = connection.execute(
-            "SELECT grade FROM attempts WHERE sentence_id=?",
-            (sentence["id"],),
-        ).fetchone()
-        leftover = connection.execute(
-            "SELECT COUNT(*) n FROM review_events WHERE result='mastered'"
-        ).fetchone()["n"]
-    assert ev["result"] == "known"
-    assert att["grade"] == "known"
-    assert leftover == 0
+    sentence = make_sentence(client, collection, "stats")
+    session_id = start(client, sentence)
+    check(client, session_id, sentence, False)
+    check(client, session_id, sentence, True)
+    finish(client, session_id, sentence)
+    data = client.get("/api/stats/summary").get_json()
+    assert data["today"]["learned"] == 1
+    assert data["today"]["ratings"]["hard"] == 1
+    assert set(data["forecast"]) == {"days7", "days30", "days90"}
+    assert data["stabilityDistribution"] and data["difficultyDistribution"]
+    assert data["retentionPct"] is not None
+    settings = client.get("/api/settings/fsrs").get_json()
+    assert settings == {"system": "FSRS", "desiredRetention": 0.9, "maximumIntervalDays": 36500, "version": "6.3.1"}
+    assert client.get("/api/settings/scheduler").status_code == 404
+    assert client.put("/api/settings/scheduler", json={"mode": "fixed"}).status_code == 404
