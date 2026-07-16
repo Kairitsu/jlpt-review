@@ -275,15 +275,36 @@ function prepareQuestion() { const p = state.practice, s = p.sentences[p.index];
 function selectionHtml(s, p, map) {
   // Grade by chunk text so duplicate surfaces (e.g. two 「し」) match regardless of which id instance was used.
   const correctTexts = (s.correctOrder || []).map(id => map[id]?.text || '');
-  return p.selected.length
-    ? `<div class="chosen-list">${p.selected.map((id, i) => {
-        const text = map[id]?.text || '';
-        const cls = p.checked ? (text === correctTexts[i] ? 'good' : 'bad') : '';
-        return `<button class="chosen ${cls}" lang="ja" data-action="unchoose" data-index="${i}" ${p.checked ? 'disabled' : ''}>${esc(text)}</button>`;
-      }).join('')}</div>`
-    : `<div class="placeholder">看中文翻译，点击下方词块，组成句子</div>`;
+  if (!p.selected.length) {
+    return `<div class="chosen-list"><div class="placeholder">看中文翻译，点击或拖拽下方词块，组成句子</div></div>`;
+  }
+  return `<div class="chosen-list">${p.selected.map((id, i) => {
+    const text = map[id]?.text || '';
+    const cls = p.checked ? (text === correctTexts[i] ? 'good' : 'bad') : '';
+    return `<button class="chosen ${cls}" lang="ja" data-action="unchoose" data-index="${i}" data-id="${id}" ${p.checked ? 'disabled' : ''}>${esc(text)}</button>`;
+  }).join('')}</div>`;
 }
 function practiceReadyToCheck(p = state.practice) { return Boolean(p) && !p.checked && !p.submitting && p.selected.length === p.candidates.length; }
+function moveSelectedTo(id, targetIndex) {
+  const p = state.practice;
+  if (!p || p.checked || p.submitting) return;
+  const from = p.selected.indexOf(id);
+  if (from === targetIndex || (from !== -1 && from + 1 === targetIndex)) return;
+  if (from !== -1) p.selected.splice(from, 1);
+  let insertAt = targetIndex;
+  if (from !== -1 && from < targetIndex) insertAt -= 1;
+  insertAt = Math.max(0, Math.min(insertAt, p.selected.length));
+  p.selected.splice(insertAt, 0, id);
+  updatePracticeSelection();
+}
+function removeSelectedId(id) {
+  const p = state.practice;
+  if (!p || p.checked || p.submitting) return;
+  const from = p.selected.indexOf(id);
+  if (from === -1) return;
+  p.selected.splice(from, 1);
+  updatePracticeSelection();
+}
 function updatePracticeSelection() {
   const p = state.practice, s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const composer = $('#practice-composer'); if (!composer) return;
@@ -292,6 +313,219 @@ function updatePracticeSelection() {
   const checkButton = $('[data-action="check"]', view);
   if (checkButton) checkButton.disabled = !practiceReadyToCheck(p);
 }
+
+/** Practice-page pointer drag session (document-level; survives innerHTML re-renders of chips only via abort). */
+let practiceDrag = null;
+let suppressPracticeClick = false;
+const PRACTICE_DRAG_THRESHOLD = 8;
+
+function pointInRect(x, y, el) {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+}
+
+function clearPracticeDropSlots() {
+  $$('.drop-slot').forEach(el => el.remove());
+}
+
+function setCandidateDropRemove(on) {
+  const area = $('.candidate-area', view);
+  if (area) area.classList.toggle('drop-remove', Boolean(on));
+}
+
+function cleanupPracticeDrag({ keepSuppress = false } = {}) {
+  if (!practiceDrag) return;
+  const session = practiceDrag;
+  practiceDrag = null;
+  if (session.ghost) session.ghost.remove();
+  if (session.originEl) {
+    session.originEl.classList.remove('dragging');
+    try { if (session.pointerId != null) session.originEl.releasePointerCapture(session.pointerId); } catch {}
+  }
+  clearPracticeDropSlots();
+  setCandidateDropRemove(false);
+  if (session.didDrag && keepSuppress) {
+    suppressPracticeClick = true;
+    setTimeout(() => { suppressPracticeClick = false; }, 0);
+  }
+}
+
+function abortPracticeDrag() {
+  cleanupPracticeDrag({ keepSuppress: true });
+}
+
+function positionPracticeGhost(session, clientX, clientY) {
+  if (!session.ghost) return;
+  session.ghost.style.left = `${clientX - session.offsetX}px`;
+  session.ghost.style.top = `${clientY - session.offsetY}px`;
+}
+
+function computePracticeDropIndex(clientX, clientY) {
+  const list = $('#practice-composer .chosen-list');
+  if (!list) return null;
+  const chips = $$('.chosen', list);
+  if (!chips.length) return 0;
+  const items = chips.map((el, i) => {
+    const r = el.getBoundingClientRect();
+    return { i, r, midX: r.left + r.width / 2 };
+  });
+  const rows = [];
+  for (const item of items) {
+    let row = rows.find(row => Math.abs(row[0].r.top - item.r.top) < 16);
+    if (!row) { row = []; rows.push(row); }
+    row.push(item);
+  }
+  let bestRow = rows[0];
+  let bestDist = Infinity;
+  for (const row of rows) {
+    const top = Math.min(...row.map(x => x.r.top));
+    const bottom = Math.max(...row.map(x => x.r.bottom));
+    if (clientY >= top && clientY <= bottom) { bestRow = row; bestDist = -1; break; }
+    const dist = clientY < top ? top - clientY : clientY - bottom;
+    if (dist < bestDist) { bestDist = dist; bestRow = row; }
+  }
+  for (const item of bestRow) {
+    if (clientX < item.midX) return item.i;
+  }
+  return bestRow[bestRow.length - 1].i + 1;
+}
+
+function updatePracticeDropIndicator(session, clientX, clientY) {
+  const composer = $('#practice-composer');
+  const candidateArea = $('.candidate-area', view);
+  const overCandidate = pointInRect(clientX, clientY, candidateArea);
+  const overComposer = pointInRect(clientX, clientY, composer);
+  session.overCandidate = overCandidate;
+  session.overComposer = overComposer;
+  setCandidateDropRemove(overCandidate && session.source === 'chosen');
+
+  if (overCandidate || !overComposer) {
+    session.dropIndex = null;
+    clearPracticeDropSlots();
+    return;
+  }
+
+  const dropIndex = computePracticeDropIndex(clientX, clientY);
+  session.dropIndex = dropIndex;
+  const list = $('#practice-composer .chosen-list');
+  if (!list || dropIndex == null) { clearPracticeDropSlots(); return; }
+
+  let slot = list.querySelector('.drop-slot');
+  if (!slot) {
+    slot = document.createElement('span');
+    slot.className = 'drop-slot';
+    slot.setAttribute('aria-hidden', 'true');
+  } else {
+    slot.remove();
+  }
+  const chips = $$('.chosen', list);
+  if (dropIndex >= chips.length) list.appendChild(slot);
+  else list.insertBefore(slot, chips[dropIndex]);
+}
+
+function beginPracticeDrag(session, event) {
+  session.dragging = true;
+  session.didDrag = true;
+  session.originEl.classList.add('dragging');
+  const rect = session.originEl.getBoundingClientRect();
+  session.offsetX = event.clientX - rect.left;
+  session.offsetY = event.clientY - rect.top;
+  const ghost = session.originEl.cloneNode(true);
+  ghost.classList.add('drag-ghost');
+  ghost.classList.remove('dragging');
+  ghost.removeAttribute('data-action');
+  ghost.disabled = false;
+  ghost.style.width = `${rect.width}px`;
+  ghost.style.height = `${rect.height}px`;
+  document.body.appendChild(ghost);
+  session.ghost = ghost;
+  positionPracticeGhost(session, event.clientX, event.clientY);
+  try { session.originEl.setPointerCapture(session.pointerId); } catch {}
+  updatePracticeDropIndicator(session, event.clientX, event.clientY);
+}
+
+function onPracticePointerDown(event) {
+  if (event.button != null && event.button !== 0) return;
+  if (state.route !== 'practice' || !state.practice || state.practice.checked || state.practice.submitting) return;
+  if (practiceDrag) return;
+  const chip = event.target.closest?.('.chosen, .candidate');
+  if (!chip || !view.contains(chip)) return;
+  if (chip.disabled || chip.classList.contains('used')) return;
+  const id = chip.dataset.id;
+  if (!id) return;
+  const source = chip.classList.contains('chosen') ? 'chosen' : 'candidate';
+  if (source === 'candidate' && (!state.practice.candidates.includes(id) || state.practice.selected.includes(id))) return;
+  if (source === 'chosen' && !state.practice.selected.includes(id)) return;
+  practiceDrag = {
+    pointerId: event.pointerId,
+    id,
+    source,
+    startX: event.clientX,
+    startY: event.clientY,
+    originEl: chip,
+    dragging: false,
+    didDrag: false,
+    ghost: null,
+    dropIndex: null,
+    overCandidate: false,
+    overComposer: false,
+    offsetX: 0,
+    offsetY: 0,
+  };
+}
+
+function onPracticePointerMove(event) {
+  const session = practiceDrag;
+  if (!session || event.pointerId !== session.pointerId) return;
+  if (!session.dragging) {
+    const dx = event.clientX - session.startX;
+    const dy = event.clientY - session.startY;
+    if (dx * dx + dy * dy < PRACTICE_DRAG_THRESHOLD * PRACTICE_DRAG_THRESHOLD) return;
+    if (!session.originEl.isConnected) { abortPracticeDrag(); return; }
+    beginPracticeDrag(session, event);
+  }
+  event.preventDefault();
+  positionPracticeGhost(session, event.clientX, event.clientY);
+  updatePracticeDropIndicator(session, event.clientX, event.clientY);
+}
+
+function onPracticePointerUp(event) {
+  const session = practiceDrag;
+  if (!session || event.pointerId !== session.pointerId) return;
+  if (!session.didDrag) {
+    cleanupPracticeDrag();
+    return;
+  }
+  event.preventDefault();
+  const { id, source, dropIndex, overCandidate, overComposer } = session;
+  cleanupPracticeDrag({ keepSuppress: true });
+  if (overCandidate && source === 'chosen') {
+    removeSelectedId(id);
+    return;
+  }
+  if (overComposer && dropIndex != null) {
+    moveSelectedTo(id, dropIndex);
+  }
+}
+
+function onPracticePointerCancel(event) {
+  if (!practiceDrag || event.pointerId !== practiceDrag.pointerId) return;
+  abortPracticeDrag();
+}
+
+function onPracticeKeyDown(event) {
+  if (event.key === 'Escape' && practiceDrag) {
+    event.preventDefault();
+    abortPracticeDrag();
+  }
+}
+
+document.addEventListener('pointerdown', onPracticePointerDown);
+document.addEventListener('pointermove', onPracticePointerMove, { passive: false });
+document.addEventListener('pointerup', onPracticePointerUp);
+document.addEventListener('pointercancel', onPracticePointerCancel);
+document.addEventListener('keydown', onPracticeKeyDown);
 function renderPractice() {
   const p = state.practice; if (!p) return route('home', {replace:true}); const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c])); const pct = Math.round(p.index * 100 / p.sentences.length), ready = practiceReadyToCheck(p), busy = p.submitting;
   view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, p, map)}</div><div class="candidate-area"><div class="chunk-list">${p.candidates.map(id => `<button class="candidate ${p.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${p.selected.includes(id) || p.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${p.checked ? answerDetails(s, map, p) : ''}<div class="practice-actions"><button class="btn outline" data-action="skip" ${p.checked || busy ? 'disabled' : ''}>跳过练习</button><button class="btn ghost" data-action="reset" ${p.checked || busy ? 'disabled' : ''}>重置</button>${p.checked ? '<button class="btn outline retry-current" data-action="retry-current">重新练习本题</button>' : ''}<button class="btn primary" data-action="${p.checked ? 'next' : 'check'}" ${!p.checked && !ready ? 'disabled' : ''}>${p.checked ? '下一题' : '核对答案'}</button></div></section>`;
@@ -338,6 +572,7 @@ document.addEventListener('click', async event => {
   const button = event.target.closest('button'); if (!button) return;
   if (button.dataset.route) { if (button.dataset.route === state.route) return; state.editing = null; route(button.dataset.route); return; }
   const action = button.dataset.action;
+  if (suppressPracticeClick && (action === 'choose' || action === 'unchoose')) return;
   try {
     if (action === 'home') route('home');
     else if (action === 'back') navigateBack();
