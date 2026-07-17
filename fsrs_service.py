@@ -7,13 +7,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
-from fsrs import Card, Rating, Scheduler, State
+from fsrs import Card, Rating, ReviewLog, Scheduler, State
 
 FSRS_VERSION = "6.3.1"
 DESIRED_RETENTION = 0.90
 MAXIMUM_INTERVAL_DAYS = 36500
+LEARNING_STEPS = ()
+RELEARNING_STEPS = ()
 
 RATING_NAMES = {
     Rating.Again: "again",
@@ -51,6 +53,8 @@ def parse_utc(value: str | None) -> datetime | None:
 def scheduler(*, enable_fuzzing: bool = True) -> Scheduler:
     return Scheduler(
         desired_retention=DESIRED_RETENTION,
+        learning_steps=LEARNING_STEPS,
+        relearning_steps=RELEARNING_STEPS,
         maximum_interval=MAXIMUM_INTERVAL_DAYS,
         enable_fuzzing=enable_fuzzing,
     )
@@ -134,6 +138,43 @@ def review(
         after=card_fields(after_card),
         duration_ms=max(0, int(duration_ms)),
     )
+
+
+def reschedule_from_review_events(
+    row: Mapping,
+    events: Sequence[Mapping],
+    *,
+    enable_fuzzing: bool = True,
+) -> dict:
+    """Replay persisted audit events with the current official scheduler.
+
+    ``review_events`` remains immutable during migration.  This adapter only
+    converts those rows to the package's ``ReviewLog`` type and delegates the
+    full state calculation to ``Scheduler.reschedule_card()``.
+    """
+    logs = sorted(
+        (
+            ReviewLog(
+                card_id=int(row["id"]),
+                rating=Rating(int(event["rating"])),
+                review_datetime=parse_utc(event["reviewed_at"]),
+                review_duration=max(0, int(event["duration_ms"] or 0)),
+            )
+            for event in events
+        ),
+        key=lambda log: log.review_datetime,
+    )
+    if not logs:
+        raise ValueError("at least one review event is required for rescheduling")
+
+    initial_due = parse_utc(row.get("created_at")) or logs[0].review_datetime
+    if initial_due > logs[0].review_datetime:
+        initial_due = logs[0].review_datetime
+    rescheduled = scheduler(enable_fuzzing=enable_fuzzing).reschedule_card(
+        Card(card_id=int(row["id"]), due=initial_due),
+        logs,
+    )
+    return card_fields(rescheduled)
 
 
 def retrievability(row: Mapping, now: datetime | None = None) -> float:

@@ -6,11 +6,12 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fsrs_service import FSRS_VERSION
+from fsrs_service import FSRS_VERSION, reschedule_from_review_events
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "japanese_sentence_review.sqlite3"
 FSRS_MIGRATION = "fsrs_v1_reset"
+NO_SHORT_STEPS_MIGRATION = "fsrs_no_short_steps_v1"
 
 
 def now_iso() -> str:
@@ -175,7 +176,79 @@ def _reset_legacy_to_fsrs(db, stamp: str) -> None:
     _create_review_tables(db)
 
 
-def init_db() -> None:
+def _backup_database_for_migration(db, version: str) -> Path:
+    """Create a committed SQLite snapshot before a data-changing migration."""
+    backup_dir = DATA_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    target = backup_dir / f"{DB_PATH.stem}-{version}-{stamp}.sqlite3"
+    with sqlite3.connect(target) as backup:
+        db.backup(backup)
+        integrity = backup.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise sqlite3.DatabaseError(f"backup integrity check failed: {integrity}")
+    return target
+
+
+def _migrate_no_short_steps(*, enable_fuzzing: bool) -> Path | None:
+    """Replay FSRS history without learning/relearning steps, exactly once."""
+    with get_db() as db:
+        migrated = db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (NO_SHORT_STEPS_MIGRATION,),
+        ).fetchone()
+        if migrated:
+            return None
+
+        backup_path = _backup_database_for_migration(db, NO_SHORT_STEPS_MIGRATION)
+        db.execute("BEGIN IMMEDIATE")
+        migrated = db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (NO_SHORT_STEPS_MIGRATION,),
+        ).fetchone()
+        if migrated:
+            return backup_path
+
+        stamp = now_iso()
+        sentences = db.execute(
+            """SELECT s.* FROM sentences s
+               WHERE EXISTS(
+                 SELECT 1 FROM review_events re WHERE re.sentence_id=s.id
+               )
+               ORDER BY s.id"""
+        ).fetchall()
+        for sentence in sentences:
+            events = db.execute(
+                """SELECT rating,reviewed_at,duration_ms
+                   FROM review_events
+                   WHERE sentence_id=?
+                   ORDER BY reviewed_at,id""",
+                (sentence["id"],),
+            ).fetchall()
+            after = reschedule_from_review_events(
+                dict(sentence),
+                events,
+                enable_fuzzing=enable_fuzzing,
+            )
+            db.execute(
+                """UPDATE sentences
+                   SET fsrs_state=?,fsrs_step=?,stability=?,difficulty=?,
+                       last_review_at=?,next_review_at=?,fsrs_version=?
+                   WHERE id=?""",
+                (
+                    after["fsrs_state"], after["fsrs_step"], after["stability"],
+                    after["difficulty"], after["last_review_at"],
+                    after["next_review_at"], after["fsrs_version"], sentence["id"],
+                ),
+            )
+        db.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)",
+            (NO_SHORT_STEPS_MIGRATION, stamp),
+        )
+        return backup_path
+
+
+def init_db(*, enable_fuzzing: bool = True) -> None:
     with get_db() as db:
         db.execute("BEGIN IMMEDIATE")
         _create_base_tables(db)
@@ -210,6 +283,7 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)",
             (stamp, stamp),
         )
+    _migrate_no_short_steps(enable_fuzzing=enable_fuzzing)
 
 
 def setting(db, key, default=""):

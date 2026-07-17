@@ -78,7 +78,78 @@ def sentence_dict(row):
 
 def sentence_snapshot(row):
     item = sentence_dict(row)
-    return {key: item[key] for key in ("id", "chinese", "japanese", "chunks", "correctOrder", "furigana")}
+    snapshot = {key: item[key] for key in ("id", "chinese", "japanese", "chunks", "correctOrder", "furigana")}
+    # Keep the report tied to the collection that produced it even if the
+    # sentence is moved later. Older snapshots are resolved from live rows.
+    snapshot["collectionId"] = item["collection_id"]
+    return snapshot
+
+
+def _empty_rating_counts():
+    return {"again": 0, "hard": 0, "good": 0, "easy": 0, "skipped": 0}
+
+
+def _rating_counts(rows):
+    """Summarize finalized practice items from persisted FSRS ratings."""
+    counts = _empty_rating_counts()
+    for row in rows:
+        rating_value = row["fsrs_rating"]
+        if rating_value:
+            rating = Rating(rating_value)
+            counts[RATING_NAMES[rating]] += 1
+        elif row["final_status"] == "skipped":
+            counts["skipped"] += 1
+    return counts
+
+
+def _report_collection(db, item_rows):
+    """Resolve a report's collection without consulting the UI selection.
+
+    New attempts carry the original collection in their snapshot. For legacy
+    attempts, fall back to the current collection of the report's surviving
+    sentences. The most frequent collection wins, with report order breaking
+    ties so mixed-selection reports stay deterministic.
+    """
+    snapshot_ids = []
+    for row in item_rows:
+        snapshot = json_load(row["sentence_snapshot_json"], {})
+        try:
+            collection_id = int(snapshot.get("collectionId"))
+        except (TypeError, ValueError):
+            continue
+        if collection_id > 0:
+            snapshot_ids.append(collection_id)
+
+    def most_common(values):
+        frequencies = {}
+        for value in values:
+            frequencies[value] = frequencies.get(value, 0) + 1
+        return max(frequencies, key=frequencies.get) if frequencies else None
+
+    collection_id = most_common(snapshot_ids)
+    collection = db.execute(
+        "SELECT id,name FROM collections WHERE id=?", (collection_id,)
+    ).fetchone() if collection_id else None
+
+    if not collection:
+        live_ids = []
+        for row in item_rows:
+            live = db.execute(
+                "SELECT collection_id FROM sentences WHERE id=?", (row["sentence_id"],)
+            ).fetchone()
+            if live:
+                live_ids.append(live["collection_id"])
+        collection_id = most_common(live_ids)
+        collection = db.execute(
+            "SELECT id,name FROM collections WHERE id=?", (collection_id,)
+        ).fetchone() if collection_id else None
+
+    if not collection:
+        return None
+    available = db.execute(
+        "SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection["id"],)
+    ).fetchone()["n"]
+    return {"id": collection["id"], "name": collection["name"], "available": available}
 
 
 def answers_match(answer, correct, chunks):
@@ -247,7 +318,7 @@ def create_app(test_config=None):
     if count:
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=count, x_proto=count, x_host=count)
 
-    init_db()
+    init_db(enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]))
     with get_db() as db:
         username, password = os.environ.get("INIT_USERNAME", ""), os.environ.get("INIT_PASSWORD", "")
         if username and password and not auth_configured(db):
@@ -592,8 +663,7 @@ def create_app(test_config=None):
                 placeholders = ",".join("?" for _ in clean)
                 rows = db.execute(f"SELECT id FROM sentences WHERE id IN ({placeholders})", clean).fetchall()
                 selected = [row["id"] for row in rows]
-                # Keep the report-origin label only; it does not alter FSRS grading.
-                source = "retry_wrong" if body.get("retryWrong") else "selected"
+                source = "selected"
             elif body.get("scope") == "collection" and body.get("collectionId"):
                 collection_id = int(body["collectionId"])
                 available = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection_id,)).fetchone()["n"]
@@ -733,8 +803,19 @@ def create_app(test_config=None):
             rows = [dict(row) for row in db.execute("""SELECT * FROM practice_sessions
                 WHERE completed_at IS NOT NULL AND report_deleted_at IS NULL
                 ORDER BY created_at DESC LIMIT 100""")]
+            rating_rows = db.execute(
+                """SELECT pi.session_id,pi.fsrs_rating,pi.final_status
+                   FROM practice_items pi
+                   JOIN practice_sessions ps ON ps.id=pi.session_id
+                   WHERE ps.completed_at IS NOT NULL
+                     AND ps.report_deleted_at IS NULL
+                     AND pi.finalized_at IS NOT NULL"""
+            ).fetchall()
+        counts_by_session = {}
+        for rating_row in rating_rows:
+            counts_by_session.setdefault(rating_row["session_id"], []).append(rating_row)
         for row in rows:
-            row["accuracy"] = round(row["correct"] * 100 / row["total"], 1) if row["total"] else 0
+            row["ratingCounts"] = _rating_counts(counts_by_session.get(row["id"], []))
         return jsonify(reports=rows)
 
     @app.get("/api/reports/<int:session_id>")
@@ -752,8 +833,9 @@ def create_app(test_config=None):
                    WHERE pi.session_id=? AND pi.finalized_at IS NOT NULL ORDER BY pi.position""",
                 (session_id,),
             ).fetchall()
-        if not practice or practice["report_deleted_at"]:
-            return jsonify(error="报告不存在"), 404
+            if not practice or practice["report_deleted_at"]:
+                return jsonify(error="报告不存在"), 404
+            collection = _report_collection(db, items_rows)
         items = []
         for attempt in items_rows:
             snap = json_load(attempt["sentence_snapshot_json"], {})
@@ -766,7 +848,8 @@ def create_app(test_config=None):
                 "rating": RATING_NAMES.get(rating), "ratingLabel": RATING_LABELS_ZH.get(rating), **snap,
             })
         payload = dict(practice)
-        payload["accuracy"] = round(payload["correct"] * 100 / payload["total"], 1) if payload["total"] else 0
+        payload["ratingCounts"] = _rating_counts(items_rows)
+        payload["collection"] = collection
         payload["items"] = items
         return jsonify(report=payload)
 

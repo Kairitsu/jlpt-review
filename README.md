@@ -10,22 +10,24 @@
 | 部署 | Docker Compose，默认监听 `127.0.0.1:3220` |
 | 许可证 | [AGPL-3.0](LICENSE) |
 
-## 升级前必须备份
+## 数据库升级与备份
 
-首次使用 FSRS 版本启动现有数据库时，会执行一次不可逆的数据库升级：
+从旧版非 FSRS 数据库首次升级到 FSRS 时，原有的 `fsrs_v1_reset` 仍按既有逻辑执行一次不可逆升级：
 
 - 保留句集、中文、日文、词块顺序、假名和句集归属；
 - 永久删除旧作答、旧复习事件、旧练习报告和全部旧记忆进度；
 - 删除旧的 dynamic/fixed 调度设置与旧记忆字段；
 - 把所有现有句子初始化为立即到期的 FSRS 新卡。
 
-升级前务必备份数据库：
+该旧版升级前务必手动备份数据库：
 
 ```bash
 ./scripts/backup-db.sh
 ```
 
-升级由 `schema_migrations` 表中的 `fsrs_v1_reset` 标记保护。重置只执行一次；后续启动不会再次清空已经生成的 FSRS 进度和记录。
+旧版升级由 `schema_migrations` 表中的 `fsrs_v1_reset` 标记保护。重置只执行一次；关闭短学习步骤的升级不会改动、删除或重新触发这个标记。
+
+从已有 FSRS 数据升级到“无短学习步骤”配置时，应用使用独立的 `fsrs_no_short_steps_v1` 标记。标记不存在时，启动过程会先通过 SQLite Backup API 自动创建 `${DATA_DIR}/backups/japanese_sentence_review-fsrs_no_short_steps_v1-*.sqlite3`，然后在单个写事务中按时间顺序读取每个句子的 `review_events`，转换为官方 `ReviewLog`，并调用 `Scheduler.reschedule_card()` 重放历史。迁移只更新句子当前的 FSRS 状态和下次复习时间，不改写、删除或补造任何复习事件、作答、会话、练习项或报告；失败会完整回滚。标记写入后，后续启动不会重复备份或重放。
 
 ## 功能
 
@@ -48,10 +50,12 @@
 | FSRS 包版本 | 6.3.1 |
 | 目标保持率 | 90% |
 | 最长间隔 | 36500 天 |
-| 学习步骤 | 官方库默认值 |
-| 重学步骤 | 官方库默认值 |
+| 学习步骤 | 关闭（`learning_steps=()`） |
+| 重学步骤 | 关闭（`relearning_steps=()`） |
 | 生产随机间隔扰动 | 开启 |
 | 测试随机间隔扰动 | 关闭 |
+
+项目不传入自定义模型参数，继续使用 Py-FSRS 6.3.1 内置的 21 个默认参数。由于学习和重学步骤都为空，新卡完成一次评分后会直接进入 `Review`，Review 卡答 Again 后也不会进入 `Relearning`；之后的日、周、月级间隔完全由官方 FSRS 根据 stability、difficulty、rating 和目标保持率计算，不叠加固定减半、固定加天等应用规则。
 
 FSRS 和数据库中的复习时间始终使用 UTC。用户时区只影响页面显示、“今日”边界和自然日统计，不参与调度计算。
 
@@ -125,7 +129,7 @@ curl -s http://127.0.0.1:3220/api/health
 
 ```text
 app.py              Flask 路由、题目完成事务、报告与统计
-db.py               SQLite schema 与一次性 FSRS 重置迁移
+db.py               SQLite schema、自动备份与幂等 FSRS 数据迁移
 fsrs_service.py     官方 Python FSRS 的唯一集成边界
 memory.py           UTC 解析与自然日时区工具（不含调度逻辑）
 tokenizer.py        Sudachi 分词与假名段

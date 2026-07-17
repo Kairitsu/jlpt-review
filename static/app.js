@@ -91,7 +91,7 @@ async function api(url, options = {}) {
 }
 function showLogin() { $('#login-modal').classList.remove('hidden'); }
 function hideLogin() { $('#login-modal').classList.add('hidden'); }
-function openDialog(html) { const el = $('#dialog'); el.innerHTML = `<div class="modal">${html}</div>`; el.classList.remove('hidden'); }
+function openDialog(html, { className = '', label = '对话框' } = {}) { const el = $('#dialog'); el.innerHTML = `<div class="modal ${className}" role="dialog" aria-modal="true" aria-label="${esc(label)}">${html}</div>`; el.classList.remove('hidden'); requestAnimationFrame(() => $('input, select, button', el)?.focus()); }
 function closeDialog() { const el = $('#dialog'); el.classList.add('hidden'); el.innerHTML = ''; }
 function updateMoveSelectedBtn() { const btn = $('#move-selected-btn'); if (btn) btn.disabled = !$$('.sentence-check:checked').length; }
 function openManageCollectionDialog() {
@@ -119,6 +119,27 @@ function openMoveSentencesDialog(ids) {
   $('#dialog').dataset.moveIds = ids.join(',');
 }
 
+function openRetryRoundDialog() {
+  const collection = state.report?.collection;
+  const max = Number(collection?.available || 0);
+  const collectionLabel = collection
+    ? `“${esc(collection.name)}”当前共有 <strong>${max}</strong> 句可练习。`
+    : '无法确定这份报告对应的句集，相关句子可能已被删除。';
+  const picker = renderCountPicker({
+    idPrefix: 'report-count',
+    max,
+    filterQuick: true,
+    startAction: 'start-report-round',
+    startLabel: '开始练习',
+    groupAriaLabel: '下一轮题目数量',
+    initialHint: max ? `将从该句集中重新随机抽取题目。` : '',
+    includeStartButton: false,
+    emptyHtml: '<span class="status-note retry-empty">当前没有可用于新一轮练习的题目。</span>',
+  });
+  openDialog(`<div class="retry-round-dialog"><h1>再练一轮</h1><p class="retry-collection-total">${collectionLabel}</p>${picker}<div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="start-report-round" ${!max ? 'disabled' : ''}>开始练习</button></div></div>`, { className: 'retry-round-modal', label: '再练一轮' });
+  $('#dialog').dataset.retryCollectionId = collection?.id || '';
+}
+
 const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats']);
 function setChrome(practice = false) {
   const header = $('#main-header');
@@ -128,7 +149,7 @@ function setChrome(practice = false) {
     header.innerHTML = `<button class="brand plain-button" data-action="${secondary ? 'back' : 'home'}" aria-label="${secondary ? '返回上一页' : '返回首页'}">${secondary ? '<span class="back-arrow" aria-hidden="true">←</span>' : '<span class="brand-mark">文</span>'}<strong>句子重组</strong></button><button class="icon-button" data-route="settings" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>`;
   }
   $('#bottom-nav').classList.toggle('hidden', practice);
-  $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'settings' || state.route === 'stats');
+  $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'report' || state.route === 'settings' || state.route === 'stats');
   $$('#bottom-nav button').forEach(button => button.classList.toggle('active', button.dataset.route === state.route));
 }
 function historyEntry(name) {
@@ -195,6 +216,16 @@ function countPickerIds(idPrefix) {
       scope: view,
     };
   }
+  if (idPrefix === 'report-count') {
+    return {
+      inputId: 'report-custom-count',
+      hintId: 'report-count-hint',
+      optionClass: 'count-option report-count-option',
+      optionSelector: '.report-count-option',
+      setAction: 'set-report-count',
+      scope: $('#dialog') || document,
+    };
+  }
   return {
     inputId: 'custom-count',
     hintId: 'count-hint',
@@ -215,6 +246,7 @@ function renderCountPicker({
   groupAriaLabel,
   initialHint,
   emptyHtml = null,
+  includeStartButton = true,
 }) {
   const cfg = countPickerIds(idPrefix);
   let optionsInner;
@@ -224,7 +256,8 @@ function renderCountPicker({
     const nums = filterQuick ? quickOptions.filter(n => n <= max) : quickOptions;
     const buttons = nums.map(n => `<button class="${cfg.optionClass}" data-action="${cfg.setAction}" data-count="${n}">${n} 句</button>`).join('');
     const inputMax = idPrefix === 'count' ? Math.max(max, 1) : max;
-    optionsInner = `${buttons}<button class="${cfg.optionClass} active" data-action="${cfg.setAction}" data-count="all">全部</button><label class="custom-count">自定义<input id="${cfg.inputId}" type="number" min="1" max="${inputMax}" placeholder="1-${max}"></label><button class="btn primary" data-action="${startAction}" ${!max ? 'disabled' : ''}>${startLabel}</button>`;
+    const startButton = includeStartButton ? `<button class="btn primary" data-action="${startAction}" ${!max ? 'disabled' : ''}>${startLabel}</button>` : '';
+    optionsInner = `${buttons}<button class="${cfg.optionClass} active" data-action="${cfg.setAction}" data-count="all">全部</button><label class="custom-count">自定义<input id="${cfg.inputId}" type="number" min="1" max="${inputMax}" inputmode="numeric" placeholder="1-${max}"></label>${startButton}`;
   }
   return `<div class="count-options" role="group" aria-label="${groupAriaLabel}">${optionsInner}</div><p id="${cfg.hintId}" class="status-note">${initialHint}</p>`;
 }
@@ -249,7 +282,7 @@ function bindCountPicker(idPrefix, max, { mode = 'soft', defaultHint = '', start
 
   if (mode === 'strict') {
     if (clearActive) $$(cfg.optionSelector, cfg.scope).forEach(option => option.classList.remove('active'));
-    const start = startAction ? $(`[data-action="${startAction}"]`, view) : null;
+    const start = startAction ? $(`[data-action="${startAction}"]`, cfg.scope) : null;
     const value = input.value.trim();
     if (!value) {
       if (start) start.disabled = false;
@@ -625,9 +658,10 @@ async function record(action) {
 async function finalizeCurrentQuestion() { const p = state.practice, s = p?.sentences[p.index]; if (!p || !s || !p.checked) return null; const easy = Boolean($('#easy-rating')?.checked); return api(`/api/practice/sessions/${p.sessionId}/sentences/${s.id}/complete`, {method:'POST', body:JSON.stringify({easy})}); }
 async function nextQuestion() { const p = state.practice; await finalizeCurrentQuestion(); if (p.index < p.sentences.length - 1) { p.index++; prepareQuestion(); renderPractice(); return; } await api(`/api/practice/sessions/${p.sessionId}/complete`, {method:'POST', body:'{}'}); if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); state.report = (await api(`/api/reports/${p.sessionId}`)).report; route('report', {reportId:p.sessionId}); }
 
-async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<div class="history-row"><button class="row-open" data-action="open-report" data-id="${r.id}"><span class="row-icon">${r.accuracy}%</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>共 ${r.total} · 对 ${r.correct} · 错 ${r.wrong} · 跳过 ${r.skipped}</small></span></button><div class="row-actions"><button class="small-btn" data-action="delete-report" data-id="${r.id}" aria-label="删除这条记录">删除</button><span class="arrow">›</span></div></div>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
-function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>本轮练习报告</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div><button class="btn outline" data-action="toggle-wrong">只看错误</button> <button class="btn outline" data-action="home">返回首页</button> <button class="btn primary" data-action="retry-report">重新练习本轮</button> <button class="btn outline" data-action="retry-wrong" ${r.wrong === 0 ? 'disabled' : ''}>练习本轮错题</button></div></div><div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>总句数</div><div class="card stat-card"><strong>${r.correct}</strong>正确</div><div class="card stat-card"><strong>${r.wrong}</strong>错误</div><div class="card stat-card"><strong>${r.skipped}</strong>跳过</div><div class="card stat-card"><strong>${r.accuracy}%</strong>正确率</div></div><div id="report-items">${reportItems(r.items)}</div></section>`; setChrome(); }
-function reportItems(items) { return items.map(item => `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过'}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div></article>`).join(''); }
+function ratingSummaryText(report) { const c = report.ratingCounts || {}; return `忘记 ${c.again || 0} · 模糊 ${c.hard || 0} · 认识 ${c.good || 0} · 轻松掌握 ${c.easy || 0}${c.skipped ? ` · 跳过 ${c.skipped}` : ''}`; }
+async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<div class="history-row"><button class="row-open" data-action="open-report" data-id="${r.id}"><span class="row-icon fsrs-report-icon">FSRS</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>本轮 ${r.total} 句 · ${ratingSummaryText(r)}</small></span></button><div class="row-actions"><button class="small-btn" data-action="delete-report" data-id="${r.id}" aria-label="删除这条记录">删除</button><span class="arrow">›</span></div></div>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
+function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); const c = r.ratingCounts || {}; const skipped = c.skipped || 0; view.innerHTML = `<section class="page"><div class="page-head report-head"><div><h1>本轮练习报告</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div class="report-actions"><button class="btn outline" data-action="home">返回首页</button><button class="btn primary" data-action="open-retry-round">再练一轮</button></div></div><div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>本轮句数</div><div class="card stat-card"><strong>${c.again || 0}</strong>忘记</div><div class="card stat-card"><strong>${c.hard || 0}</strong>模糊</div><div class="card stat-card"><strong>${c.good || 0}</strong>认识</div><div class="card stat-card"><strong>${c.easy || 0}</strong>轻松掌握</div></div>${skipped ? `<p class="report-skip-note">另有 ${skipped} 句跳过，未计入 FSRS 评分。</p>` : ''}<div id="report-items">${reportItems(r.items)}</div></section>`; setChrome(); }
+function reportItems(items) { return items.length ? items.map(item => `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过'}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div></article>`).join('') : '<div class="card empty">这份旧报告的题目明细已不可用。</div>'; }
 
 async function renderSettings() {
   const [authCfg, tzCfg, fsrsCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone'), api('/api/settings/fsrs')]);
@@ -669,6 +703,35 @@ document.addEventListener('click', async event => {
       const { custom, selected } = readCountPickerSelection('count', { trimCustom: false });
       await startPractice({ scope: 'collection', collectionId: state.activeCollection, count: custom || selected });
     }
+    else if (action === 'open-retry-round') openRetryRoundDialog();
+    else if (action === 'set-report-count') {
+      selectCountOption('report-count', button);
+      const max = Number($('#report-custom-count')?.max || 0);
+      bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '将从该句集中重新随机抽取题目。' });
+    }
+    else if (action === 'start-report-round') {
+      const collectionId = Number($('#dialog').dataset.retryCollectionId || 0);
+      const max = Number($('#report-custom-count')?.max || 0);
+      const { custom, selected } = readCountPickerSelection('report-count', { trimCustom: true });
+      const count = custom ? Number(custom) : selected;
+      if (!collectionId || !max) return;
+      if (custom && (!Number.isInteger(count) || count < 1 || count > max)) {
+        bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '将从该句集中重新随机抽取题目。' });
+        return;
+      }
+      button.disabled = true;
+      const oldLabel = button.textContent;
+      button.textContent = '正在开始…';
+      try {
+        await startPractice({ scope: 'collection', collectionId, count });
+        closeDialog();
+      } catch (error) {
+        button.disabled = false;
+        button.textContent = oldLabel;
+        const hint = $('#report-count-hint');
+        if (hint) { hint.textContent = error.message; hint.classList.add('error-text'); }
+      }
+    }
     else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分块…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
     else if (action === 'select-chunk') { const i = Number(button.dataset.index), at = state.selectedChunks.indexOf(i); if (at >= 0) state.selectedChunks.splice(at, 1); else { if (state.selectedChunks.length >= 2) state.selectedChunks.shift(); state.selectedChunks.push(i); } state.selectedChunks.sort((a,b) => a-b); renderPreview(); }
     else if (action === 'split-chunk') { if (state.selectedChunks.length !== 1) throw new Error('请先选中一个要拆分的词块'); const i = state.selectedChunks[0], item = state.draft.chunks[i], pos = Number(prompt(`“${item.text}” 在第几个字符后拆分？`, Math.max(1, Math.floor(item.text.length / 2)))); if (!Number.isInteger(pos) || pos <= 0 || pos >= item.text.length) throw new Error('拆分位置必须位于词块内部'); state.draft.chunks.splice(i, 1, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(0,pos)}, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(pos)}); state.selectedChunks = []; renderPreview(); }
@@ -702,13 +765,6 @@ document.addEventListener('click', async event => {
       toast('记录已删除');
       await renderReports();
     }
-    else if (action === 'retry-report') await startPractice({sentenceIds:state.report.items.map(x => x.id)});
-    else if (action === 'retry-wrong') {
-      const ids = (state.report?.items || []).filter(x => x.status === 'wrong').map(x => x.id);
-      if (!ids.length) { toast('本轮没有错题'); return; }
-      await startPractice({sentenceIds: ids, retryWrong: true});
-    }
-    else if (action === 'toggle-wrong') { const only = button.dataset.active !== '1'; button.dataset.active = only ? '1' : '0'; button.textContent = only ? '显示全部' : '只看错误'; $$('.report-item').forEach(x => x.classList.toggle('hidden', only && x.dataset.status !== 'wrong')); }
     else if (action === 'logout') { await api('/api/auth/logout', {method:'POST', body:'{}'}); showLogin(); }
     else if (action && action.startsWith('stats-') && typeof handleStatsAction === 'function') {
       const handled = handleStatsAction(action, button);
@@ -734,6 +790,15 @@ document.addEventListener('input', event => {
       mode: 'strict',
       startAction: 'start-due-practice',
       defaultHint: `本句集有 ${due} 句待复习，可从到期最早的句子开始。`,
+      clearActive: true,
+    });
+  }
+  if (event.target.id === 'report-custom-count') {
+    const max = Number(event.target.max);
+    bindCountPicker('report-count', max, {
+      mode: 'strict',
+      startAction: 'start-report-round',
+      defaultHint: '将从该句集中重新随机抽取题目。',
       clearActive: true,
     });
   }
