@@ -35,7 +35,7 @@ from font_active import (
     schedule_font_rebuild,
     status as font_status,
 )
-from memory import is_valid_timezone, local_date, parse_iso
+from memory import is_valid_timezone, local_date, local_day_utc_bounds, parse_iso
 from security import hash_password, verify_password
 from tokenizer import furigana_segments, local_tokenize, validate_chunks
 
@@ -189,6 +189,68 @@ def answers_match(answer, correct, chunks):
 def user_timezone(db) -> str:
     """Configured IANA timezone, or "" to fall back to the server's local timezone."""
     return setting(db, "user_timezone", "")
+
+
+_DUE_STATUS_CONDITION = "s.next_review_at<=?"
+_TODAY_STATUS_CONDITION = "re.reviewed_at>=? AND re.reviewed_at<?"
+
+
+def _study_status_context(db, now_dt: datetime | None = None) -> dict[str, str]:
+    """Shared clock and natural-day bounds for dashboard and detail queries."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    tz = user_timezone(db)
+    today_start, tomorrow_start = local_day_utc_bounds(now_dt, tz_name=tz)
+    return {
+        "now": now_dt.isoformat(timespec="seconds"),
+        "today_start": today_start.isoformat(timespec="seconds"),
+        "tomorrow_start": tomorrow_start.isoformat(timespec="seconds"),
+    }
+
+
+def _study_status_counts(db, context: dict[str, str]):
+    """Return per-collection due/today counts using the detail predicates."""
+    due = {
+        row["collection_id"]: row["n"]
+        for row in db.execute(
+            f"""SELECT s.collection_id,COUNT(*) n FROM sentences s
+                WHERE {_DUE_STATUS_CONDITION} GROUP BY s.collection_id""",
+            (context["now"],),
+        )
+    }
+    today = {
+        row["collection_id"]: row["n"]
+        for row in db.execute(
+            f"""SELECT s.collection_id,COUNT(DISTINCT re.sentence_id) n
+                FROM review_events re JOIN sentences s ON s.id=re.sentence_id
+                WHERE {_TODAY_STATUS_CONDITION} GROUP BY s.collection_id""",
+            (context["today_start"], context["tomorrow_start"]),
+        )
+    }
+    return due, today
+
+
+def _study_status_rows(db, collection_id: int, status: str, context: dict[str, str]):
+    """Fetch one collection's status rows, already filtered and sorted by SQL."""
+    if status == "due":
+        return db.execute(
+            f"""SELECT s.* FROM sentences s
+                WHERE s.collection_id=? AND {_DUE_STATUS_CONDITION}
+                ORDER BY s.next_review_at ASC,s.created_at ASC,s.id ASC""",
+            (collection_id, context["now"]),
+        ).fetchall()
+    return db.execute(
+        f"""SELECT s.*,today_events.today_last_review_at
+            FROM sentences s
+            JOIN (
+              SELECT re.sentence_id,MAX(re.reviewed_at) today_last_review_at
+              FROM review_events re
+              WHERE {_TODAY_STATUS_CONDITION}
+              GROUP BY re.sentence_id
+            ) today_events ON today_events.sentence_id=s.id
+            WHERE s.collection_id=?
+            ORDER BY today_events.today_last_review_at DESC,s.id DESC""",
+        (context["today_start"], context["tomorrow_start"], collection_id),
+    ).fetchall()
 
 
 def _server_utc_offset_label() -> str:
@@ -441,39 +503,39 @@ def create_app(test_config=None):
 
     @app.get("/api/dashboard")
     def dashboard():
-        now = now_iso()
-        # 足够覆盖任意时区偏移(-12~+14)下的本地"今天"，把范围过滤下推到 SQL，
-        # 避免全表扫描 review_events。
-        lower_bound = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat(timespec="seconds")
         with get_db() as db:
-            tz = user_timezone(db)
-            today = local_date(tz_name=tz)
+            context = _study_status_context(db)
             collections = [dict(row) for row in db.execute("""
               SELECT c.id,c.name,COUNT(s.id) total,
                 SUM(CASE WHEN s.last_review_at IS NOT NULL THEN 1 ELSE 0 END) learned
               FROM collections c LEFT JOIN sentences s ON s.collection_id=c.id
               GROUP BY c.id ORDER BY c.created_at
             """)]
-            # Align "today" with stats_learning: local calendar day + review_events
-            # (result != skipped), distinct sentence_id per collection.
-            event_rows = db.execute(
-                """SELECT re.sentence_id, re.reviewed_at, s.collection_id
-                   FROM review_events re
-                   JOIN sentences s ON s.id = re.sentence_id
-                   WHERE re.reviewed_at >= ?""",
-                (lower_bound,),
-            ).fetchall()
-            today_ids: dict[int, set[int]] = {}
-            for row in event_rows:
-                dt = parse_iso(row["reviewed_at"])
-                if not dt or local_date(dt, tz_name=tz) != today:
-                    continue
-                today_ids.setdefault(row["collection_id"], set()).add(row["sentence_id"])
+            due_counts, today_counts = _study_status_counts(db, context)
             for item in collections:
                 item["total"], item["learned"] = int(item["total"] or 0), int(item["learned"] or 0)
-                item["due"] = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=? AND next_review_at<=?", (item["id"], now)).fetchone()["n"]
-                item["today"] = len(today_ids.get(item["id"], set()))
+                item["due"] = int(due_counts.get(item["id"], 0))
+                item["today"] = int(today_counts.get(item["id"], 0))
         return jsonify(collections=collections)
+
+    @app.get("/api/collections/<int:collection_id>/study-status/<status>")
+    def collection_study_status(collection_id, status):
+        if status not in {"due", "today"}:
+            return jsonify(error="学习状态不存在"), 404
+        with get_db() as db:
+            collection = db.execute(
+                "SELECT id,name FROM collections WHERE id=?", (collection_id,)
+            ).fetchone()
+            if not collection:
+                return jsonify(error="句集不存在"), 404
+            rows = _study_status_rows(db, collection_id, status, _study_status_context(db))
+        sentences = [sentence_dict(row) for row in rows]
+        return jsonify(
+            collection=dict(collection),
+            status=status,
+            total=len(sentences),
+            sentences=sentences,
+        )
 
     @app.post("/api/collections")
     def create_collection():

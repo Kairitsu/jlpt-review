@@ -140,7 +140,7 @@ function openRetryRoundDialog() {
   $('#dialog').dataset.retryCollectionId = collection?.id || '';
 }
 
-const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats']);
+const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats', 'due', 'today']);
 function setChrome(practice = false) {
   const header = $('#main-header');
   header.classList.toggle('hidden', practice);
@@ -149,23 +149,26 @@ function setChrome(practice = false) {
     header.innerHTML = `<button class="brand plain-button" data-action="${secondary ? 'back' : 'home'}" aria-label="${secondary ? '返回上一页' : '返回首页'}">${secondary ? '<span class="back-arrow" aria-hidden="true">←</span>' : '<span class="brand-mark">文</span>'}<strong>句子重组</strong></button><button class="icon-button" data-route="settings" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>`;
   }
   $('#bottom-nav').classList.toggle('hidden', practice);
-  $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'report' || state.route === 'settings' || state.route === 'stats');
+  $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'report' || state.route === 'settings' || state.route === 'stats' || state.route === 'due' || state.route === 'today');
   $$('#bottom-nav button').forEach(button => button.classList.toggle('active', button.dataset.route === state.route));
 }
-function historyEntry(name) {
-  return {route:name, collectionId:state.activeCollection, reportId:state.report?.id, editingId:state.editing?.id};
+function historyEntry(name, options = {}) {
+  const entry = {route:name, collectionId:state.activeCollection, reportId:state.report?.id, editingId:state.editing?.id};
+  if (name === 'due' || name === 'today') entry.fromHome = Boolean(options.fromHome);
+  return entry;
 }
 async function route(name, options = {}) {
-  const allowed = new Set(['home','library','add','reports','report','settings','practice','stats']);
+  const allowed = new Set(['home','library','add','reports','report','settings','practice','stats','due','today']);
   if (!allowed.has(name)) name = 'home';
   if (state.route === 'stats' && name !== 'stats' && typeof destroyStatsCharts === 'function') destroyStatsCharts();
   state.route = name; state.routeMeta = options;
-  if (!options.fromPop) history[options.replace ? 'replaceState' : 'pushState'](historyEntry(name), '', `#${name}`);
+  if (!options.fromPop) history[options.replace ? 'replaceState' : 'pushState'](historyEntry(name, options), '', `#${name}`);
   setChrome(name === 'practice');
   if (!options.preserveScroll) window.scrollTo(0, 0);
   try {
     if (name === 'home') await renderHome();
     else if (name === 'library') await renderLibrary(options.collectionId || state.activeCollection);
+    else if (name === 'due' || name === 'today') await renderStudyStatus(name, options.collectionId || state.activeCollection);
     else if (name === 'add') {
       if (options.editingId && (!state.editing || state.editing.id !== Number(options.editingId))) state.editing = (await api(`/api/sentences/${options.editingId}`)).sentence;
       await renderAdd();
@@ -185,6 +188,11 @@ async function route(name, options = {}) {
   } catch (error) { toast(error.message, true); if (!view.children.length) route('home', {replace:true}); }
 }
 function navigateBack() {
+  if (state.route === 'due' || state.route === 'today') {
+    if (history.state?.fromHome && history.length > 1) history.back();
+    else route('home', {replace:true});
+    return;
+  }
   if (state.route === 'settings' || state.route === 'stats') return route('home');
   if (state.route === 'add') { state.editing = null; state.draft = null; return route('library'); }
   if (state.route === 'report') return route('reports');
@@ -331,7 +339,29 @@ function renderDuePicker(data, active) {
 
 async function renderHome() {
   const data = await ensureDashboard(); const active = data.collections.find(c => c.id === state.activeCollection) || data.collections[0]; const progress = active?.total ? Math.round(active.learned * 100 / active.total) : 0;
-  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>根据中文翻译，补全日语句子</h1></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom"><div class="metric"><strong>${active?.due || 0}</strong><span>待复习</span></div><div class="metric"><strong>${active?.today || 0}</strong><span>今日学习</span></div></div><button class="btn primary" data-action="start-due" ${!active?.due ? 'disabled' : ''}>开始句子重组</button></div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div><button class="card section-card home-stats-entry" data-route="reports"><div class="section-title"><h2>练习历史</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">每轮练习都会保留，可随时回看报告</p></button><button class="card section-card home-stats-entry" data-route="stats"><div class="section-title"><h2>数据统计</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">FSRS 评分 · 复习预测 · 稳定度与难度</p></button></section>`;
+  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>根据中文翻译，补全日语句子</h1></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom" aria-label="学习状态"><button type="button" class="metric metric-button" data-route="due" aria-label="查看待复习句子，共 ${active?.due || 0} 句"><span class="metric-copy"><strong>${active?.due || 0}</strong><span>待复习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button><button type="button" class="metric metric-button" data-route="today" aria-label="查看今日学习句子，共 ${active?.today || 0} 句"><span class="metric-copy"><strong>${active?.today || 0}</strong><span>今日学习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button></div><button class="btn primary" data-action="start-due" ${!active?.due ? 'disabled' : ''}>开始句子重组</button></div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div><button class="card section-card home-stats-entry" data-route="reports"><div class="section-title"><h2>练习历史</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">每轮练习都会保留，可随时回看报告</p></button><button class="card section-card home-stats-entry" data-route="stats"><div class="section-title"><h2>数据统计</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">FSRS 评分 · 复习预测 · 稳定度与难度</p></button></section>`;
+  setChrome();
+}
+
+async function renderStudyStatus(status, collectionId) {
+  const dashboard = await ensureDashboard();
+  const requestedId = Number(collectionId);
+  const active = dashboard.collections.find(item => item.id === requestedId)
+    || dashboard.collections.find(item => item.id === state.activeCollection)
+    || dashboard.collections[0];
+  if (!active) throw new Error('当前没有可查看的句集');
+  setActiveCollection(active.id);
+  const data = await api(`/api/collections/${active.id}/study-status/${status}`);
+  const isDue = status === 'due';
+  const title = isDue ? '待复习句子' : '今日学习';
+  const summary = isDue ? `${data.total} 句待复习` : `今日学习 ${data.total} 句`;
+  const emptyText = isDue ? '当前没有待复习的句子' : '今天还没有学习过句子';
+  const rows = data.sentences.map(sentence => {
+    const time = isDue ? sentence.next_review_at : sentence.today_last_review_at;
+    const timeText = isDue ? `下次复习 ${formatDate(time)}` : `今天最后学习 ${formatDate(time)}`;
+    return `<article class="library-row study-status-row"><div><div class="library-jp" lang="ja">${esc(sentence.japanese)}</div><div class="status-translation">${esc(sentence.chinese)}</div><div class="row-stats"><span>${timeText}</span>${isDue ? '<span class="due-label">已到期</span>' : ''}</div></div></article>`;
+  }).join('');
+  view.innerHTML = `<section class="page study-status-page"><div class="page-head"><div><h1>${title}</h1><p>“${esc(data.collection.name)}” · ${summary}</p></div></div><div class="card library-list study-status-list">${rows || `<div class="empty">${emptyText}</div>`}</div></section>`;
   setChrome();
 }
 
@@ -673,7 +703,7 @@ async function renderSettings() {
 document.addEventListener('click', async event => {
   if (event.target.id === 'dialog') { closeDialog(); return; }
   const button = event.target.closest('button'); if (!button) return;
-  if (button.dataset.route) { if (button.dataset.route === state.route) return; state.editing = null; route(button.dataset.route); return; }
+  if (button.dataset.route) { if (button.dataset.route === state.route) return; state.editing = null; const fromHome = state.route === 'home' && (button.dataset.route === 'due' || button.dataset.route === 'today'); route(button.dataset.route, {fromHome}); return; }
   const action = button.dataset.action;
   if (suppressPracticeClick && (action === 'choose' || action === 'unchoose')) return;
   try {
@@ -806,7 +836,7 @@ document.addEventListener('input', event => {
 document.addEventListener('submit', async event => {
   event.preventDefault();
   try {
-    if (event.target.id === 'login-form') { const body = Object.fromEntries(new FormData(event.target)); await api('/api/auth/login', {method:'POST', body:JSON.stringify(body)}); hideLogin(); await loadTimezoneState(); route('home', {replace:true}); }
+    if (event.target.id === 'login-form') { const body = Object.fromEntries(new FormData(event.target)); await api('/api/auth/login', {method:'POST', body:JSON.stringify(body)}); hideLogin(); await loadTimezoneState(); const entry = history.state || {route:'home'}; route(entry.route || 'home', {...entry, replace:true}); }
     else if (event.target.id === 'auth-form') { const form = new FormData(event.target), clearAuth = form.get('clearAuth') === 'on'; const body = {username:form.get('username'), password:form.get('password'), clearAuth}; await api('/api/settings/auth', {method:'PUT', body:JSON.stringify(body)}); toast(clearAuth ? '应用认证已关闭' : '访问认证已保存并立即生效'); await renderSettings(); }
     else if (event.target.id === 'timezone-form') { const tz = new FormData(event.target).get('timezone') || ''; const result = await api('/api/settings/timezone', {method:'PUT', body:JSON.stringify({timezone: tz})}); state.timezone = result.timezone || ''; state.dashboard = null; if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); toast('时区设置已保存'); await renderSettings(); }
   } catch (error) { if (event.target.id === 'login-form') $('#login-error').textContent = error.message; else toast(error.data?.details?.join('；') || error.message, true); }
@@ -815,9 +845,12 @@ window.addEventListener('popstate', event => { const entry = event.state || {rou
 
 (async () => {
   try {
+    const hashRoute = window.location.hash.replace(/^#/, '');
+    const initialRoute = new Set(['due', 'today']).has(hashRoute) ? hashRoute : 'home';
+    const initialEntry = {route:initialRoute, collectionId:state.activeCollection, fromHome:Boolean(history.state?.fromHome)};
     const auth = await api('/api/auth/status');
-    history.replaceState({route:'home'}, '', '#home');
+    history.replaceState(initialEntry, '', `#${initialRoute}`);
     if (auth.configured && !auth.authenticated) { showLogin(); }
-    else { await loadTimezoneState(); route('home', {replace:true}); }
+    else { await loadTimezoneState(); route(initialRoute, {...initialEntry, replace:true}); }
   } catch (error) { toast(error.message, true); }
 })();
