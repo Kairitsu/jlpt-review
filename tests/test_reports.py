@@ -91,6 +91,7 @@ def test_report_and_history_use_persisted_fsrs_rating_counts(tmp_path, monkeypat
     ]
     assert report["collection"] == {
         "id": collection["id"], "name": collection["name"], "available": 5,
+        "dueCount": 1,
     }
 
     history = client.get("/api/reports").get_json()["reports"]
@@ -114,6 +115,7 @@ def test_report_keeps_original_collection_when_sentence_moves(tmp_path, monkeypa
     report = client.get(f"/api/reports/{session_id}").get_json()["report"]
     assert report["collection"]["id"] == source["id"]
     assert report["collection"]["available"] == 0
+    assert report["collection"]["dueCount"] == 0
     assert report["items"][0]["collectionId"] == source["id"]
 
 
@@ -141,6 +143,241 @@ def test_legacy_report_resolves_collection_from_live_sentence(tmp_path, monkeypa
     report = client.get(f"/api/reports/{session_id}").get_json()["report"]
     assert report["collection"]["id"] == target_id
     assert report["collection"]["available"] == 1
+    assert report["collection"]["dueCount"] == 0
+
+
+def test_report_retry_uses_current_due_scope_and_revalidates_count(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    source = client.get("/api/dashboard").get_json()["collections"][0]
+    other_id = client.post("/api/collections", json={"name": "其他句集"}).get_json()["id"]
+    report_sentence = make_sentence(client, source["id"], "completed")
+    due_early = make_sentence(client, source["id"], "due-early")
+    due_late = make_sentence(client, source["id"], "due-late")
+    future = make_sentence(client, source["id"], "future")
+    other_due = make_sentence(client, other_id, "other-due")
+    session_id = complete_good_session(client, report_sentence)
+
+    with db.get_db() as connection:
+        connection.executemany(
+            "UPDATE sentences SET next_review_at=? WHERE id=?",
+            [
+                ("2099-01-01T00:00:00+00:00", report_sentence["id"]),
+                ("2000-01-01T00:00:01+00:00", due_early["id"]),
+                ("2000-01-01T00:00:02+00:00", due_late["id"]),
+                ("2099-01-01T00:00:00+00:00", future["id"]),
+                ("1999-01-01T00:00:00+00:00", other_due["id"]),
+            ],
+        )
+
+    report = client.get(f"/api/reports/{session_id}").get_json()["report"]
+    assert report["collection"] == {
+        "id": source["id"], "name": source["name"], "available": 4,
+        "dueCount": 2,
+    }
+    assert report["retry"] == {"availableCount": 2, "unansweredCount": 0}
+
+    # Simulate a stale open dialog: one candidate is no longer due before Start.
+    with db.get_db() as connection:
+        connection.execute(
+            "UPDATE sentences SET next_review_at=? WHERE id=?",
+            ("2099-01-01T00:00:00+00:00", due_early["id"]),
+        )
+    retry = client.post(
+        "/api/practice/sessions",
+        json={"scope": "report_retry", "reportId": session_id, "count": 2},
+    )
+    assert retry.status_code == 201
+    payload = retry.get_json()
+    assert [item["id"] for item in payload["sentences"]] == [due_late["id"]]
+    assert "只有 1 句" in payload["notice"]
+    with db.get_db() as connection:
+        practice = connection.execute(
+            "SELECT source FROM practice_sessions WHERE id=?", (payload["sessionId"],)
+        ).fetchone()
+    assert practice["source"] == "report_retry"
+
+    # A stale page must not fall back to all collection sentences when none are due.
+    with db.get_db() as connection:
+        connection.execute(
+            "UPDATE sentences SET next_review_at=? WHERE id=?",
+            ("2099-01-01T00:00:00+00:00", due_late["id"]),
+        )
+    empty = client.post(
+        "/api/practice/sessions",
+        json={"scope": "report_retry", "reportId": session_id, "count": 2},
+    )
+    assert empty.status_code == 400
+    assert empty.get_json()["error"] == "当前没有可再次练习的句子"
+
+
+def test_force_complete_persists_unanswered_without_touching_fsrs(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]
+    answered = make_sentence(client, collection["id"], "answered")
+    wrong = make_sentence(client, collection["id"], "wrong")
+    unanswered = make_sentence(client, collection["id"], "unanswered")
+    practice = client.post(
+        "/api/practice/sessions",
+        json={"sentenceIds": [answered["id"], wrong["id"], unanswered["id"]]},
+    ).get_json()
+    session_id = practice["sessionId"]
+    assert attempt(client, session_id, answered, correct=True).status_code == 200
+    assert attempt(client, session_id, wrong).status_code == 200
+
+    with db.get_db() as connection:
+        before = dict(connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (unanswered["id"],)
+        ).fetchone())
+
+    payload = {
+        "easySentenceIds": [answered["id"]],
+        "draftAnswers": [
+            {"sentenceId": answered["id"], "answerOrder": answered["correctOrder"]},
+            {"sentenceId": wrong["id"], "answerOrder": []},
+            {"sentenceId": unanswered["id"], "answerOrder": unanswered["correctOrder"]},
+        ],
+    }
+    blocked = client.post(f"/api/practice/sessions/{session_id}/complete", json=payload)
+    assert blocked.status_code == 409
+    assert blocked.get_json()["unansweredCount"] == 1
+    assert blocked.get_json()["requiresConfirmation"] is True
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT completed_at FROM practice_sessions WHERE id=?", (session_id,)
+        ).fetchone()["completed_at"] is None
+
+    completed = client.post(
+        f"/api/practice/sessions/{session_id}/complete",
+        json={**payload, "confirmUnanswered": True},
+    )
+    assert completed.status_code == 200
+    assert completed.get_json()["unansweredCount"] == 1
+    with db.get_db() as connection:
+        after = dict(connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (unanswered["id"],)
+        ).fetchone())
+        for field in (
+            "fsrs_state", "fsrs_step", "stability", "difficulty",
+            "last_review_at", "next_review_at", "fsrs_version",
+        ):
+            assert after[field] == before[field]
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE sentence_id=?", (unanswered["id"],)
+        ).fetchone()["n"] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE session_id=?", (session_id,)
+        ).fetchone()["n"] == 2
+        item = connection.execute(
+            "SELECT * FROM practice_items WHERE session_id=? AND sentence_id=?",
+            (session_id, unanswered["id"]),
+        ).fetchone()
+        assert item["unanswered_at"] is not None
+        assert item["finalized_at"] is None and item["fsrs_rating"] is None
+
+    report = client.get(f"/api/reports/{session_id}").get_json()["report"]
+    assert report["unansweredCount"] == 1
+    assert len(report["items"]) == 3
+    unanswered_item = next(item for item in report["items"] if item["id"] == unanswered["id"])
+    assert unanswered_item["status"] == "unanswered"
+    assert unanswered_item["answerText"] == unanswered["japanese"]
+    assert unanswered_item["rating"] is None
+    assert report["ratingCounts"] == {
+        "again": 1, "hard": 0, "good": 0, "easy": 1, "skipped": 0,
+    }
+
+    duplicate = client.post(
+        f"/api/practice/sessions/{session_id}/complete",
+        json={**payload, "confirmUnanswered": True},
+    )
+    assert duplicate.status_code == 200 and duplicate.get_json()["duplicate"] is True
+    with db.get_db() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE session_id=?", (session_id,)
+        ).fetchone()["n"] == 2
+
+
+def test_report_retry_prioritizes_unanswered_and_deduplicates_due(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]
+    unanswered_future = make_sentence(client, collection["id"], "u-future")
+    unanswered_due = make_sentence(client, collection["id"], "u-due")
+    answered = make_sentence(client, collection["id"], "answered-retry")
+    due_early = make_sentence(client, collection["id"], "due-early-retry")
+    due_late = make_sentence(client, collection["id"], "due-late-retry")
+    practice = client.post(
+        "/api/practice/sessions",
+        json={"sentenceIds": [unanswered_future["id"], unanswered_due["id"], answered["id"]]},
+    ).get_json()
+    session_id = practice["sessionId"]
+    assert attempt(client, session_id, answered, correct=True).status_code == 200
+    assert client.post(
+        f"/api/practice/sessions/{session_id}/complete",
+        json={"confirmUnanswered": True},
+    ).status_code == 200
+
+    with db.get_db() as connection:
+        connection.executemany(
+            "UPDATE sentences SET next_review_at=? WHERE id=?",
+            [
+                ("2099-01-01T00:00:00+00:00", unanswered_future["id"]),
+                ("2000-01-01T00:00:03+00:00", unanswered_due["id"]),
+                ("2099-01-01T00:00:00+00:00", answered["id"]),
+                ("2000-01-01T00:00:01+00:00", due_early["id"]),
+                ("2000-01-01T00:00:02+00:00", due_late["id"]),
+            ],
+        )
+
+    report = client.get(f"/api/reports/{session_id}").get_json()["report"]
+    assert report["retry"] == {"availableCount": 4, "unansweredCount": 2}
+    retry_one = client.post("/api/practice/sessions", json={
+        "scope": "report_retry", "reportId": session_id, "count": 1,
+    }).get_json()
+    assert [item["id"] for item in retry_one["sentences"]] == [unanswered_future["id"]]
+    retry_three = client.post("/api/practice/sessions", json={
+        "scope": "report_retry", "reportId": session_id, "count": 3,
+    }).get_json()
+    assert [item["id"] for item in retry_three["sentences"]] == [
+        unanswered_future["id"], unanswered_due["id"], due_early["id"],
+    ]
+
+
+def test_unanswered_schema_migration_preserves_existing_reports(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]
+    sentence = make_sentence(client, collection["id"], "migration")
+    session_id = complete_good_session(client, sentence)
+    with db.get_db() as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
+            for table in ("sentences", "practice_sessions", "practice_items", "attempts", "review_events")
+        }
+        connection.execute("DROP INDEX IF EXISTS idx_practice_items_unanswered")
+        connection.execute("ALTER TABLE practice_items DROP COLUMN unanswered_at")
+        connection.execute("ALTER TABLE practice_items DROP COLUMN draft_answer_order_json")
+        connection.execute("ALTER TABLE practice_items DROP COLUMN sentence_snapshot_json")
+        connection.execute("ALTER TABLE practice_sessions DROP COLUMN unanswered")
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version='practice_unanswered_v1'"
+        )
+
+    migrated_client, migrated_db = load_app(tmp_path, monkeypatch)
+    with migrated_db.get_db() as connection:
+        after = {
+            table: connection.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
+            for table in ("sentences", "practice_sessions", "practice_items", "attempts", "review_events")
+        }
+        assert after == before
+        assert {row["name"] for row in connection.execute("PRAGMA table_info(practice_sessions)")} >= {"unanswered"}
+        assert {row["name"] for row in connection.execute("PRAGMA table_info(practice_items)")} >= {
+            "unanswered_at", "draft_answer_order_json", "sentence_snapshot_json",
+        }
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM schema_migrations WHERE version='practice_unanswered_v1'"
+        ).fetchone()["n"] == 1
+    report = migrated_client.get(f"/api/reports/{session_id}")
+    assert report.status_code == 200
+    assert report.get_json()["report"]["items"][0]["status"] == "correct"
 
 
 def test_report_without_surviving_items_returns_empty_safe_metadata(tmp_path, monkeypatch):
@@ -167,3 +404,40 @@ def test_report_frontend_has_only_new_actions_and_route_scoped_fab():
     assert "retry-wrong" not in source
     assert "data-action=\"open-retry-round\"" in source
     assert "state.route === 'report'" in source
+    assert "const max = Number(retry.availableCount || 0)" in source
+    assert "state.report = (await api(`/api/reports/${reportId}`)).report;" in source
+    assert "await startPractice({ scope: 'report_retry', reportId, count });" in source
+    assert "当前没有可再次练习的句子" in source
+    assert 'data-action="skip"' not in source
+    assert "practice.items.flatMap" in source
+    assert "data-action=\"previous-question\"" in source
+    assert "'next-question'" in source
+    assert "'submit-round'" in source
+    assert "navigatePractice(delta)" in source
+    navigate_flow = source.split("function navigatePractice(delta) {", 1)[1].split(
+        "function roundSubmissionPayload", 1
+    )[0]
+    assert "/attempts" not in navigate_flow and "/complete" not in navigate_flow
+    assert "将从该句集中重新随机抽取题目。" not in source
+
+
+def test_practice_exit_uses_cancellable_internal_dialog_and_only_finalizes_current_item():
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+    exit_flow = source.split("async function confirmExitPractice(button) {", 1)[1].split(
+        "const secondaryRoutes", 1
+    )[0]
+
+    assert source.count('data-action="exit-practice"') == 2
+    assert "openExitPracticeDialog()" in source
+    assert "退出本轮练习？" in source
+    assert "继续练习" in source
+    assert "data-action=\"confirm-exit-practice\"" in source
+    assert "else if (action === 'exit-practice') openExitPracticeDialog();" in source
+    assert "退出后，本轮未完成的题目不会生成完整报告。确定退出吗？" not in source
+    assert "if (item?.checked) await finalizeCurrentQuestion();" in exit_flow
+    assert "/api/practice/sessions/${practice.sessionId}/complete" not in exit_flow
+    assert "buttons.forEach(item => { item.disabled = true; });" in exit_flow
+    assert "buttons.forEach(item => { item.disabled = false; });" in exit_flow
+    assert "if (errorEl) errorEl.textContent = error.message;" in exit_flow
+    assert "isExitPracticeDialogOpen() || isUnansweredPracticeDialogOpen()" in source
+    assert "event.target.id === 'dialog'" in source

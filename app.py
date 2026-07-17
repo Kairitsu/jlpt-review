@@ -149,7 +149,15 @@ def _report_collection(db, item_rows):
     available = db.execute(
         "SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection["id"],)
     ).fetchone()["n"]
-    return {"id": collection["id"], "name": collection["name"], "available": available}
+    due_count = _due_sentence_count(
+        db, _study_status_context(db), collection_id=collection["id"]
+    )
+    return {
+        "id": collection["id"],
+        "name": collection["name"],
+        "available": available,
+        "dueCount": due_count,
+    }
 
 
 def answers_match(answer, correct, chunks):
@@ -229,15 +237,84 @@ def _study_status_counts(db, context: dict[str, str]):
     return due, today
 
 
+def _due_sentence_count(
+    db, context: dict[str, str], collection_id: int | None = None
+) -> int:
+    """Count due sentences with the same predicate used by dashboard status."""
+    params = [context["now"]]
+    where = _DUE_STATUS_CONDITION
+    if collection_id is not None:
+        where += " AND s.collection_id=?"
+        params.append(collection_id)
+    return int(db.execute(
+        f"SELECT COUNT(*) n FROM sentences s WHERE {where}", params
+    ).fetchone()["n"])
+
+
+def _due_sentence_rows(
+    db,
+    context: dict[str, str],
+    collection_id: int | None = None,
+    limit: int | None = None,
+):
+    """Fetch due sentences in the canonical review-queue order."""
+    params = [context["now"]]
+    where = _DUE_STATUS_CONDITION
+    if collection_id is not None:
+        where += " AND s.collection_id=?"
+        params.append(collection_id)
+    query = (
+        f"SELECT s.* FROM sentences s WHERE {where} "
+        "ORDER BY s.next_review_at ASC,s.created_at ASC,s.id ASC"
+    )
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return db.execute(query, params).fetchall()
+
+
+def _report_item_rows(db, session_id: int):
+    """Return persisted report rows, including explicitly unanswered items."""
+    return db.execute(
+        """SELECT
+             pi.session_id,pi.sentence_id,pi.position,pi.finalized_at,pi.unanswered_at,
+             pi.final_status,pi.fsrs_rating,pi.easy_selected,
+             CASE WHEN pi.unanswered_at IS NOT NULL
+                  THEN pi.draft_answer_order_json ELSE a.answer_order_json END answer_order_json,
+             COALESCE(a.sentence_snapshot_json,pi.sentence_snapshot_json) sentence_snapshot_json
+           FROM practice_items pi
+           LEFT JOIN attempts a ON a.id=(
+             SELECT a2.id FROM attempts a2
+             WHERE a2.session_id=pi.session_id AND a2.sentence_id=pi.sentence_id
+             ORDER BY a2.id DESC LIMIT 1
+           )
+           WHERE pi.session_id=?
+             AND (pi.finalized_at IS NOT NULL OR pi.unanswered_at IS NOT NULL)
+           ORDER BY pi.position""",
+        (session_id,),
+    ).fetchall()
+
+
+def _report_retry_sentence_rows(db, session_id: int, collection_id: int | None):
+    """Prioritize this report's unanswered rows, then append currently due rows."""
+    unanswered = db.execute(
+        """SELECT s.* FROM practice_items pi
+           JOIN sentences s ON s.id=pi.sentence_id
+           WHERE pi.session_id=? AND pi.unanswered_at IS NOT NULL
+           ORDER BY pi.position""",
+        (session_id,),
+    ).fetchall()
+    unanswered_ids = {row["id"] for row in unanswered}
+    due = _due_sentence_rows(
+        db, _study_status_context(db), collection_id=collection_id
+    ) if collection_id is not None else []
+    return [*unanswered, *(row for row in due if row["id"] not in unanswered_ids)]
+
+
 def _study_status_rows(db, collection_id: int, status: str, context: dict[str, str]):
     """Fetch one collection's status rows, already filtered and sorted by SQL."""
     if status == "due":
-        return db.execute(
-            f"""SELECT s.* FROM sentences s
-                WHERE s.collection_id=? AND {_DUE_STATUS_CONDITION}
-                ORDER BY s.next_review_at ASC,s.created_at ASC,s.id ASC""",
-            (collection_id, context["now"]),
-        ).fetchall()
+        return _due_sentence_rows(db, context, collection_id=collection_id)
     return db.execute(
         f"""SELECT s.*,today_events.today_last_review_at
             FROM sentences s
@@ -277,6 +354,14 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, easy: bool, ena
     ).fetchone()
     if not item:
         return None, "练习或句子不存在"
+    if item["unanswered_at"]:
+        return {
+            "finalized": True,
+            "status": "unanswered",
+            "rating": None,
+            "ratingLabel": None,
+            "duplicate": True,
+        }, None
     if item["finalized_at"]:
         rating = Rating(item["fsrs_rating"]) if item["fsrs_rating"] else None
         return {
@@ -355,6 +440,83 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, easy: bool, ena
         "ratingLabel": RATING_LABELS_ZH[rating],
         "nextReviewAt": after["next_review_at"],
     }, None
+
+
+def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
+    """Validate and persist temporary arrangements supplied at round submission."""
+    if drafts is None:
+        return None
+    if not isinstance(drafts, list):
+        return "临时排列格式无效"
+
+    rows = db.execute(
+        """SELECT pi.sentence_id,pi.sentence_snapshot_json,s.chunks_json,s.chinese,
+                  s.japanese,s.correct_order_json,s.furigana_json,s.collection_id
+           FROM practice_items pi
+           LEFT JOIN sentences s ON s.id=pi.sentence_id
+           WHERE pi.session_id=?""",
+        (session_id,),
+    ).fetchall()
+    by_id = {row["sentence_id"]: row for row in rows}
+    updates = []
+    seen = set()
+    for draft in drafts:
+        if not isinstance(draft, dict):
+            return "临时排列格式无效"
+        try:
+            sentence_id = int(draft.get("sentenceId"))
+        except (TypeError, ValueError):
+            return "临时排列格式无效"
+        answer = draft.get("answerOrder")
+        if sentence_id in seen or sentence_id not in by_id or not isinstance(answer, list):
+            return "临时排列格式无效"
+        seen.add(sentence_id)
+        row = by_id[sentence_id]
+        snapshot = json_load(row["sentence_snapshot_json"], {})
+        if not snapshot and row["chunks_json"] is not None:
+            snapshot = {
+                "id": sentence_id,
+                "chinese": row["chinese"],
+                "japanese": row["japanese"],
+                "chunks": json_load(row["chunks_json"], []),
+                "correctOrder": json_load(row["correct_order_json"], []),
+                "furigana": json_load(row["furigana_json"], []),
+                "collectionId": row["collection_id"],
+            }
+        valid_ids = {
+            chunk.get("id") for chunk in snapshot.get("chunks", [])
+            if isinstance(chunk, dict) and isinstance(chunk.get("id"), str)
+        }
+        if any(not isinstance(value, str) or value not in valid_ids for value in answer):
+            return "临时排列包含无效词块"
+        if len(answer) > len(valid_ids) or len(set(answer)) != len(answer):
+            return "临时排列包含无效词块"
+        updates.append((json.dumps(answer), json.dumps(snapshot, ensure_ascii=False), session_id, sentence_id))
+
+    db.executemany(
+        """UPDATE practice_items
+           SET draft_answer_order_json=?,sentence_snapshot_json=COALESCE(sentence_snapshot_json,?)
+           WHERE session_id=? AND sentence_id=?""",
+        updates,
+    )
+    return None
+
+
+def _session_unanswered_rows(db, session_id: int):
+    """Determine unanswered items from persisted valid check attempts only."""
+    return db.execute(
+        """SELECT pi.sentence_id,pi.position FROM practice_items pi
+           WHERE pi.session_id=?
+             AND pi.finalized_at IS NULL
+             AND pi.unanswered_at IS NULL
+             AND NOT EXISTS(
+               SELECT 1 FROM attempts a
+               WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id
+                 AND a.status IN ('correct','wrong')
+             )
+           ORDER BY pi.position""",
+        (session_id,),
+    ).fetchall()
 
 
 def create_app(test_config=None):
@@ -726,6 +888,32 @@ def create_app(test_config=None):
                 rows = db.execute(f"SELECT id FROM sentences WHERE id IN ({placeholders})", clean).fetchall()
                 selected = [row["id"] for row in rows]
                 source = "selected"
+            elif body.get("scope") == "report_retry":
+                try:
+                    report_id = int(body.get("reportId"))
+                except (TypeError, ValueError):
+                    return jsonify(error="报告参数无效"), 400
+                report_row = db.execute(
+                    """SELECT id FROM practice_sessions
+                       WHERE id=? AND completed_at IS NOT NULL AND report_deleted_at IS NULL""",
+                    (report_id,),
+                ).fetchone()
+                if not report_row:
+                    return jsonify(error="报告不存在"), 404
+                report_items = _report_item_rows(db, report_id)
+                collection = _report_collection(db, report_items)
+                candidates = _report_retry_sentence_rows(
+                    db, report_id, collection["id"] if collection else None
+                )
+                available = len(candidates)
+                if not available:
+                    return jsonify(error="当前没有可再次练习的句子"), 400
+                limit, msg = _resolve_limit(body.get("count"), available, "当前可再次练习")
+                if limit is None:
+                    return jsonify(error=msg), 400
+                notice = msg
+                selected = [row["id"] for row in candidates[:limit]]
+                source = "report_retry"
             elif body.get("scope") == "collection" and body.get("collectionId"):
                 collection_id = int(body["collectionId"])
                 available = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection_id,)).fetchone()["n"]
@@ -738,31 +926,44 @@ def create_app(test_config=None):
                 selected = [row["id"] for row in db.execute("SELECT id FROM sentences WHERE collection_id=? ORDER BY RANDOM() LIMIT ?", (collection_id, limit))]
                 source = "collection"
             else:
-                params, where = [now_iso()], "next_review_at<=?"
-                if body.get("collectionId"):
-                    where += " AND collection_id=?"; params.append(int(body["collectionId"]))
-                requested = body.get("count")
-                if requested in (None, "all"):
-                    query, query_params = f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at", params
-                else:
-                    available = db.execute(f"SELECT COUNT(*) n FROM sentences WHERE {where}", params).fetchone()["n"]
-                    subject = "当前句集待复习" if body.get("collectionId") else "当前待复习"
-                    limit, msg = _resolve_limit(requested, available, subject)
-                    if limit is None:
-                        return jsonify(error=msg), 400
-                    notice = msg
-                    query, query_params = f"SELECT id FROM sentences WHERE {where} ORDER BY next_review_at,created_at LIMIT ?", [*params, limit]
-                selected = [row["id"] for row in db.execute(query, query_params)]
+                collection_id = None
+                if body.get("collectionId") not in (None, ""):
+                    try:
+                        collection_id = int(body["collectionId"])
+                    except (TypeError, ValueError):
+                        return jsonify(error="参数无效"), 400
+                context = _study_status_context(db)
+                available = _due_sentence_count(db, context, collection_id=collection_id)
+                subject = "当前句集待复习" if collection_id is not None else "当前待复习"
+                limit, msg = _resolve_limit(body.get("count"), available, subject)
+                if limit is None:
+                    return jsonify(error=msg), 400
+                notice = msg
+                selected = [
+                    row["id"]
+                    for row in _due_sentence_rows(
+                        db, context, collection_id=collection_id, limit=limit
+                    )
+                ]
                 source = "due"
             if not selected:
                 return jsonify(error="当前没有待复习句子"), 400
             cursor = db.execute("INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at) VALUES(?,?,?,?)", (source, json.dumps(selected), len(selected), now_iso()))
             session_id = cursor.lastrowid
-            db.executemany(
-                "INSERT INTO practice_items(session_id,sentence_id,position) VALUES(?,?,?)",
-                [(session_id, sentence_id, position) for position, sentence_id in enumerate(selected)],
-            )
             rows = db.execute(f"SELECT * FROM sentences WHERE id IN ({','.join('?' for _ in selected)})", selected).fetchall()
+            rows_by_id = {row["id"]: row for row in rows}
+            db.executemany(
+                """INSERT INTO practice_items(
+                     session_id,sentence_id,position,sentence_snapshot_json
+                   ) VALUES(?,?,?,?)""",
+                [
+                    (
+                        session_id, sentence_id, position,
+                        json.dumps(sentence_snapshot(rows_by_id[sentence_id]), ensure_ascii=False),
+                    )
+                    for position, sentence_id in enumerate(selected)
+                ],
+            )
             mapped = {row["id"]: sentence_dict(row) for row in rows}
         return jsonify(sessionId=session_id, sentences=[mapped[x] for x in selected], notice=notice), 201
 
@@ -791,6 +992,8 @@ def create_app(test_config=None):
             ).fetchone()
             if not practice or not row or not item_row:
                 return jsonify(error="练习或句子不存在"), 404
+            if practice["completed_at"]:
+                return jsonify(error="本轮练习已经提交"), 409
             if item_row["finalized_at"]:
                 return jsonify(error="当前题已经结束"), 409
             item = sentence_dict(row)
@@ -828,21 +1031,77 @@ def create_app(test_config=None):
 
     @app.post("/api/practice/sessions/<int:session_id>/complete")
     def complete_session(session_id):
+        body = request.get_json(silent=True) or {}
+        confirm_unanswered = body.get("confirmUnanswered") is True
+        raw_easy_ids = body.get("easySentenceIds", [])
+        if not isinstance(raw_easy_ids, list):
+            return jsonify(error="太简单题目格式无效"), 400
+        try:
+            easy_ids = {int(value) for value in raw_easy_ids}
+        except (TypeError, ValueError):
+            return jsonify(error="太简单题目格式无效"), 400
         with get_db() as db:
             db.execute("BEGIN IMMEDIATE")
-            practice = db.execute("SELECT total FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
+            practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
             if not practice:
                 return jsonify(error="练习不存在"), 404
+            if practice["completed_at"]:
+                return jsonify(
+                    ok=True,
+                    reportId=session_id,
+                    unansweredCount=int(practice["unanswered"] or 0),
+                    duplicate=True,
+                )
+            item_ids = {
+                row["sentence_id"]
+                for row in db.execute(
+                    "SELECT sentence_id FROM practice_items WHERE session_id=?", (session_id,)
+                )
+            }
+            if not easy_ids.issubset(item_ids):
+                return jsonify(error="太简单题目不属于本轮练习"), 400
+            draft_error = _persist_session_drafts(
+                db, session_id, body.get("draftAnswers")
+            )
+            if draft_error:
+                return jsonify(error=draft_error), 400
+            unanswered_rows = _session_unanswered_rows(db, session_id)
+            unanswered_count = len(unanswered_rows)
+            if unanswered_count and not confirm_unanswered:
+                return jsonify(
+                    error=f"本轮还有 {unanswered_count} 题未回答",
+                    unansweredCount=unanswered_count,
+                    requiresConfirmation=True,
+                ), 409
             pending = db.execute(
                 """SELECT pi.sentence_id FROM practice_items pi
                    WHERE pi.session_id=? AND pi.finalized_at IS NULL
-                     AND EXISTS(SELECT 1 FROM attempts a WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id)""",
+                     AND pi.unanswered_at IS NULL
+                     AND EXISTS(
+                       SELECT 1 FROM attempts a
+                       WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id
+                         AND a.status IN ('correct','wrong')
+                     )""",
                 (session_id,),
             ).fetchall()
             for pending_item in pending:
-                _finalize_question(
-                    db, session_id, pending_item["sentence_id"], easy=False,
+                _, error = _finalize_question(
+                    db, session_id, pending_item["sentence_id"],
+                    easy=pending_item["sentence_id"] in easy_ids,
                     enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]),
+                )
+                if error:
+                    raise RuntimeError(error)
+            stamp = now_iso()
+            if unanswered_rows:
+                db.executemany(
+                    """UPDATE practice_items SET unanswered_at=?
+                       WHERE session_id=? AND sentence_id=?
+                         AND finalized_at IS NULL AND unanswered_at IS NULL""",
+                    [
+                        (stamp, session_id, row["sentence_id"])
+                        for row in unanswered_rows
+                    ],
                 )
             counts = {
                 row["final_status"]: row["n"]
@@ -853,11 +1112,14 @@ def create_app(test_config=None):
                 )
             }
             db.execute(
-                """UPDATE practice_sessions SET correct=?,wrong=?,skipped=?,
+                """UPDATE practice_sessions SET correct=?,wrong=?,skipped=?,unanswered=?,
                    completed_at=COALESCE(completed_at,?) WHERE id=?""",
-                (counts.get("correct", 0), counts.get("wrong", 0), counts.get("skipped", 0), now_iso(), session_id),
+                (
+                    counts.get("correct", 0), counts.get("wrong", 0),
+                    counts.get("skipped", 0), unanswered_count, stamp, session_id,
+                ),
             )
-        return jsonify(ok=True, reportId=session_id)
+        return jsonify(ok=True, reportId=session_id, unansweredCount=unanswered_count)
 
     @app.get("/api/reports")
     def reports():
@@ -878,40 +1140,45 @@ def create_app(test_config=None):
             counts_by_session.setdefault(rating_row["session_id"], []).append(rating_row)
         for row in rows:
             row["ratingCounts"] = _rating_counts(counts_by_session.get(row["id"], []))
+            row["unansweredCount"] = int(row.get("unanswered") or 0)
         return jsonify(reports=rows)
 
     @app.get("/api/reports/<int:session_id>")
     def report(session_id):
         with get_db() as db:
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
-            items_rows = db.execute(
-                """SELECT pi.*, a.answer_order_json, a.sentence_snapshot_json
-                   FROM practice_items pi
-                   LEFT JOIN attempts a ON a.id=(
-                     SELECT a2.id FROM attempts a2
-                     WHERE a2.session_id=pi.session_id AND a2.sentence_id=pi.sentence_id
-                     ORDER BY a2.id DESC LIMIT 1
-                   )
-                   WHERE pi.session_id=? AND pi.finalized_at IS NOT NULL ORDER BY pi.position""",
-                (session_id,),
-            ).fetchall()
             if not practice or practice["report_deleted_at"]:
                 return jsonify(error="报告不存在"), 404
+            items_rows = _report_item_rows(db, session_id)
             collection = _report_collection(db, items_rows)
+            retry_rows = _report_retry_sentence_rows(
+                db, session_id, collection["id"] if collection else None
+            ) if practice["completed_at"] else []
+            retry_unanswered = sum(
+                1 for row in items_rows
+                if row["unanswered_at"] is not None
+                and any(candidate["id"] == row["sentence_id"] for candidate in retry_rows)
+            )
         items = []
         for attempt in items_rows:
             snap = json_load(attempt["sentence_snapshot_json"], {})
             by_id = {chunk["id"]: chunk for chunk in snap.get("chunks", [])}
             answer = json_load(attempt["answer_order_json"], [])
             rating = Rating(attempt["fsrs_rating"]) if attempt["fsrs_rating"] else None
+            status = "unanswered" if attempt["unanswered_at"] else attempt["final_status"]
             items.append({
-                "status": attempt["final_status"], "answerOrder": answer,
+                "status": status, "answerOrder": answer,
                 "answerText": "".join(by_id.get(value, {}).get("text", "") for value in answer),
                 "rating": RATING_NAMES.get(rating), "ratingLabel": RATING_LABELS_ZH.get(rating), **snap,
             })
         payload = dict(practice)
         payload["ratingCounts"] = _rating_counts(items_rows)
+        payload["unansweredCount"] = int(practice["unanswered"] or 0)
         payload["collection"] = collection
+        payload["retry"] = {
+            "availableCount": len(retry_rows),
+            "unansweredCount": retry_unanswered,
+        }
         payload["items"] = items
         return jsonify(report=payload)
 

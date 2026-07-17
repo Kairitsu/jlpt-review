@@ -12,6 +12,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "japanese_sentence_review.sqlite3"
 FSRS_MIGRATION = "fsrs_v1_reset"
 NO_SHORT_STEPS_MIGRATION = "fsrs_no_short_steps_v1"
+UNANSWERED_REPORT_MIGRATION = "practice_unanswered_v1"
 
 
 def now_iso() -> str:
@@ -88,6 +89,7 @@ def _create_review_tables(db) -> None:
         correct INTEGER NOT NULL DEFAULT 0,
         wrong INTEGER NOT NULL DEFAULT 0,
         skipped INTEGER NOT NULL DEFAULT 0,
+        unanswered INTEGER NOT NULL DEFAULT 0,
         completed_at TEXT,
         report_deleted_at TEXT,
         created_at TEXT NOT NULL
@@ -97,9 +99,12 @@ def _create_review_tables(db) -> None:
         sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
         position INTEGER NOT NULL,
         finalized_at TEXT,
+        unanswered_at TEXT,
         final_status TEXT CHECK(final_status IN ('correct','wrong','skipped')),
         fsrs_rating INTEGER CHECK(fsrs_rating BETWEEN 1 AND 4),
         easy_selected INTEGER NOT NULL DEFAULT 0 CHECK(easy_selected IN (0,1)),
+        draft_answer_order_json TEXT NOT NULL DEFAULT '[]',
+        sentence_snapshot_json TEXT,
         PRIMARY KEY(session_id, sentence_id),
         UNIQUE(session_id, position)
     )""")
@@ -146,6 +151,7 @@ def _create_indexes(db) -> None:
         "CREATE INDEX IF NOT EXISTS idx_sessions_created ON practice_sessions(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_review_events_reviewed ON review_events(reviewed_at)",
         "CREATE INDEX IF NOT EXISTS idx_review_events_sentence ON review_events(sentence_id, reviewed_at)",
+        "CREATE INDEX IF NOT EXISTS idx_practice_items_unanswered ON practice_items(session_id, unanswered_at)",
     )
     for statement in statements:
         db.execute(statement)
@@ -174,6 +180,30 @@ def _reset_legacy_to_fsrs(db, stamp: str) -> None:
         _create_sentences_table(db)
 
     _create_review_tables(db)
+
+
+def _migrate_unanswered_reports(db, stamp: str) -> None:
+    """Add unanswered-report persistence without rewriting or clearing history."""
+    session_columns = _columns(db, "practice_sessions")
+    if "unanswered" not in session_columns:
+        db.execute(
+            "ALTER TABLE practice_sessions ADD COLUMN unanswered INTEGER NOT NULL DEFAULT 0"
+        )
+
+    item_columns = _columns(db, "practice_items")
+    if "unanswered_at" not in item_columns:
+        db.execute("ALTER TABLE practice_items ADD COLUMN unanswered_at TEXT")
+    if "draft_answer_order_json" not in item_columns:
+        db.execute(
+            "ALTER TABLE practice_items ADD COLUMN draft_answer_order_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "sentence_snapshot_json" not in item_columns:
+        db.execute("ALTER TABLE practice_items ADD COLUMN sentence_snapshot_json TEXT")
+
+    db.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)",
+        (UNANSWERED_REPORT_MIGRATION, stamp),
+    )
 
 
 def _backup_database_for_migration(db, version: str) -> Path:
@@ -265,6 +295,7 @@ def init_db(*, enable_fuzzing: bool = True) -> None:
         else:
             _create_sentences_table(db)
             _create_review_tables(db)
+        _migrate_unanswered_reports(db, stamp)
         _create_indexes(db)
 
         db.execute("DELETE FROM settings WHERE key IN ('scheduler_mode','base_url','model','custom_params','api_key_encrypted')")

@@ -119,12 +119,17 @@ function openMoveSentencesDialog(ids) {
   $('#dialog').dataset.moveIds = ids.join(',');
 }
 
-function openRetryRoundDialog() {
+async function openRetryRoundDialog() {
+  const reportId = state.report?.id;
+  if (!reportId) return;
+  state.report = (await api(`/api/reports/${reportId}`)).report;
   const collection = state.report?.collection;
-  const max = Number(collection?.available || 0);
+  const retry = state.report?.retry || {};
+  const max = Number(retry.availableCount || 0);
+  const unanswered = Number(retry.unansweredCount || 0);
   const collectionLabel = collection
-    ? `“${esc(collection.name)}”当前共有 <strong>${max}</strong> 句可练习。`
-    : '无法确定这份报告对应的句集，相关句子可能已被删除。';
+    ? `“${esc(collection.name)}”当前可练习 <strong>${max}</strong> 句，其中包含本轮未回答 <strong>${unanswered}</strong> 句。`
+    : `当前可练习 <strong>${max}</strong> 句，其中包含本轮未回答 <strong>${unanswered}</strong> 句。`;
   const picker = renderCountPicker({
     idPrefix: 'report-count',
     max,
@@ -132,12 +137,49 @@ function openRetryRoundDialog() {
     startAction: 'start-report-round',
     startLabel: '开始练习',
     groupAriaLabel: '下一轮题目数量',
-    initialHint: max ? `将从该句集中重新随机抽取题目。` : '',
+    initialHint: max ? '优先选择本轮未回答题目，其余按到期顺序补充。' : '',
     includeStartButton: false,
-    emptyHtml: '<span class="status-note retry-empty">当前没有可用于新一轮练习的题目。</span>',
+    emptyHtml: '<span class="status-note retry-empty">当前没有可再次练习的句子。</span>',
   });
   openDialog(`<div class="retry-round-dialog"><h1>再练一轮</h1><p class="retry-collection-total">${collectionLabel}</p>${picker}<div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="start-report-round" ${!max ? 'disabled' : ''}>开始练习</button></div></div>`, { className: 'retry-round-modal', label: '再练一轮' });
-  $('#dialog').dataset.retryCollectionId = collection?.id || '';
+  $('#dialog').dataset.retryReportId = reportId;
+}
+
+function openExitPracticeDialog() {
+  if (!state.practice) return;
+  openDialog(`<div class="exit-practice-dialog"><h1>退出本轮练习？</h1><p class="exit-practice-copy">退出后，本轮未完成的题目不会生成完整报告。</p><p class="status-note exit-practice-note">已经完成并写入 FSRS 的题目进度不会撤销。</p><p id="exit-practice-error" class="form-error exit-practice-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">继续练习</button><button class="btn danger" data-action="confirm-exit-practice">确认退出</button></div></div>`, { className: 'exit-practice-modal', label: '退出本轮练习？' });
+}
+
+function isExitPracticeDialogOpen() {
+  const dialog = $('#dialog');
+  return Boolean(dialog && !dialog.classList.contains('hidden') && $('.exit-practice-dialog', dialog));
+}
+
+async function confirmExitPractice(button) {
+  const practice = state.practice;
+  if (!practice || practice.exiting) return;
+  practice.exiting = true;
+  const dialog = $('#dialog');
+  const buttons = $$('button', dialog);
+  buttons.forEach(item => { item.disabled = true; });
+  const oldLabel = button.textContent;
+  button.textContent = '正在退出…';
+  const errorEl = $('#exit-practice-error');
+  if (errorEl) errorEl.textContent = '';
+  try {
+    const item = currentPracticeItem(practice);
+    if (item?.checked) await finalizeCurrentQuestion();
+    if (typeof window.clearStatsCache === 'function') window.clearStatsCache();
+    practice.exiting = false;
+    closeDialog();
+    await route('home');
+  } catch (error) {
+    practice.exiting = false;
+    buttons.forEach(item => { item.disabled = false; });
+    button.textContent = oldLabel;
+    if (errorEl) errorEl.textContent = error.message;
+    toast(error.message, true);
+  }
 }
 
 const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats', 'due', 'today']);
@@ -395,51 +437,76 @@ async function reloadLibrary() { const query = new URLSearchParams({collectionId
 async function startPractice(payload) {
   const result = await api('/api/practice/sessions', {method:'POST', body:JSON.stringify(payload)});
   if (result.notice) toast(result.notice);
-  state.practice = {sessionId:result.sessionId, sentences:result.sentences, index:0, selected:[], checked:false, result:null, candidates:[], submitting:false, attemptStatuses:[]};
-  prepareQuestion(); route('practice');
+  state.practice = {
+    sessionId: result.sessionId,
+    sentences: result.sentences,
+    index: 0,
+    items: result.sentences.map(sentence => ({
+      selected: [], checked: false, result: null,
+      candidates: shuffle(sentence.chunks.map(chunk => chunk.id)),
+      submitting: false, attemptStatuses: [], easySelected: false,
+      finalized: false, completion: null, questionStartedAt: Date.now(),
+    })),
+    submittingRound: false,
+    exiting: false,
+  };
+  route('practice');
 }
 function shuffle(items) { const result = [...items]; for (let i = result.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [result[i], result[j]] = [result[j], result[i]]; } return result; }
-function prepareQuestion() { const p = state.practice, s = p.sentences[p.index]; p.selected = []; p.checked = false; p.result = null; p.submitting = false; p.attemptStatuses = []; p.candidates = shuffle(s.chunks.map(c => c.id)); p.questionStartedAt = Date.now(); }
-function selectionHtml(s, p, map) {
+function currentPracticeItem(practice = state.practice) {
+  return practice?.items?.[practice.index] || null;
+}
+function validCheckStatuses(item) {
+  return (item?.attemptStatuses || []).filter(status => status === 'correct' || status === 'wrong');
+}
+function practiceUnansweredIndexes(practice = state.practice) {
+  if (!practice) return [];
+  return practice.items.flatMap((item, index) => validCheckStatuses(item).length ? [] : [index]);
+}
+function selectionHtml(s, item, map) {
   // Grade by chunk text so duplicate surfaces (e.g. two 「し」) match regardless of which id instance was used.
   const correctTexts = (s.correctOrder || []).map(id => map[id]?.text || '');
-  if (!p.selected.length) {
+  if (!item.selected.length) {
     return `<div class="chosen-list"><div class="placeholder">看中文翻译，点击或拖拽下方词块，组成句子</div></div>`;
   }
-  return `<div class="chosen-list">${p.selected.map((id, i) => {
+  return `<div class="chosen-list">${item.selected.map((id, i) => {
     const text = map[id]?.text || '';
-    const cls = p.checked ? (text === correctTexts[i] ? 'good' : 'bad') : '';
-    return `<button class="chosen ${cls}" lang="ja" data-action="unchoose" data-index="${i}" data-id="${id}" ${p.checked ? 'disabled' : ''}>${esc(text)}</button>`;
+    const cls = item.checked ? (text === correctTexts[i] ? 'good' : 'bad') : '';
+    return `<button class="chosen ${cls}" lang="ja" data-action="unchoose" data-index="${i}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${esc(text)}</button>`;
   }).join('')}</div>`;
 }
-function practiceReadyToCheck(p = state.practice) { return Boolean(p) && !p.checked && !p.submitting && p.selected.length === p.candidates.length; }
+function practiceReadyToCheck(item = currentPracticeItem()) { return Boolean(item) && !item.checked && !item.submitting && item.selected.length === item.candidates.length; }
 function moveSelectedTo(id, targetIndex) {
   const p = state.practice;
-  if (!p || p.checked || p.submitting) return;
-  const from = p.selected.indexOf(id);
+  const item = currentPracticeItem(p);
+  if (!p || !item || item.checked || item.submitting || p.submittingRound) return;
+  const from = item.selected.indexOf(id);
   if (from === targetIndex || (from !== -1 && from + 1 === targetIndex)) return;
-  if (from !== -1) p.selected.splice(from, 1);
+  if (from !== -1) item.selected.splice(from, 1);
   let insertAt = targetIndex;
   if (from !== -1 && from < targetIndex) insertAt -= 1;
-  insertAt = Math.max(0, Math.min(insertAt, p.selected.length));
-  p.selected.splice(insertAt, 0, id);
+  insertAt = Math.max(0, Math.min(insertAt, item.selected.length));
+  item.selected.splice(insertAt, 0, id);
   updatePracticeSelection();
 }
 function removeSelectedId(id) {
   const p = state.practice;
-  if (!p || p.checked || p.submitting) return;
-  const from = p.selected.indexOf(id);
+  const item = currentPracticeItem(p);
+  if (!p || !item || item.checked || item.submitting || p.submittingRound) return;
+  const from = item.selected.indexOf(id);
   if (from === -1) return;
-  p.selected.splice(from, 1);
+  item.selected.splice(from, 1);
   updatePracticeSelection();
 }
 function updatePracticeSelection() {
-  const p = state.practice, s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
+  const p = state.practice, item = currentPracticeItem(p), s = p?.sentences[p.index];
+  if (!p || !item || !s) return;
+  const map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const composer = $('#practice-composer'); if (!composer) return;
-  composer.innerHTML = selectionHtml(s, p, map);
-  $$('.candidate', view).forEach(button => { const used = p.selected.includes(button.dataset.id); button.disabled = used || p.checked || p.submitting; button.classList.toggle('used', used); });
+  composer.innerHTML = selectionHtml(s, item, map);
+  $$('.candidate', view).forEach(button => { const used = item.selected.includes(button.dataset.id); button.disabled = used || item.checked || item.submitting || p.submittingRound; button.classList.toggle('used', used); });
   const checkButton = $('[data-action="check"]', view);
-  if (checkButton) checkButton.disabled = !practiceReadyToCheck(p);
+  if (checkButton) checkButton.disabled = !practiceReadyToCheck(item);
 }
 
 /** Practice-page pointer drag session (document-level; survives innerHTML re-renders of chips only via abort). */
@@ -575,7 +642,9 @@ function beginPracticeDrag(session, event) {
 
 function onPracticePointerDown(event) {
   if (event.button != null && event.button !== 0) return;
-  if (state.route !== 'practice' || !state.practice || state.practice.checked || state.practice.submitting) return;
+  const practice = state.practice;
+  const item = currentPracticeItem(practice);
+  if (state.route !== 'practice' || !practice || !item || item.checked || item.submitting || practice.submittingRound) return;
   if (practiceDrag) return;
   const chip = event.target.closest?.('.chosen, .candidate');
   if (!chip || !view.contains(chip)) return;
@@ -583,8 +652,8 @@ function onPracticePointerDown(event) {
   const id = chip.dataset.id;
   if (!id) return;
   const source = chip.classList.contains('chosen') ? 'chosen' : 'candidate';
-  if (source === 'candidate' && (!state.practice.candidates.includes(id) || state.practice.selected.includes(id))) return;
-  if (source === 'chosen' && !state.practice.selected.includes(id)) return;
+  if (source === 'candidate' && (!item.candidates.includes(id) || item.selected.includes(id))) return;
+  if (source === 'chosen' && !item.selected.includes(id)) return;
   practiceDrag = {
     pointerId: event.pointerId,
     id,
@@ -643,6 +712,11 @@ function onPracticePointerCancel(event) {
 }
 
 function onPracticeKeyDown(event) {
+  if (event.key === 'Escape' && (isExitPracticeDialogOpen() || isUnansweredPracticeDialogOpen())) {
+    event.preventDefault();
+    if (!state.practice?.exiting && !state.practice?.submittingRound) closeDialog();
+    return;
+  }
   if (event.key === 'Escape' && practiceDrag) {
     event.preventDefault();
     abortPracticeDrag();
@@ -655,53 +729,151 @@ document.addEventListener('pointerup', onPracticePointerUp);
 document.addEventListener('pointercancel', onPracticePointerCancel);
 document.addEventListener('keydown', onPracticeKeyDown);
 function renderPractice() {
-  const p = state.practice; if (!p) return route('home', {replace:true}); const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c])); const pct = Math.round(p.index * 100 / p.sentences.length), ready = practiceReadyToCheck(p), busy = p.submitting;
-  const easyOption = p.checked && p.result?.correct && p.attemptStatuses.length === 1 ? '<label class="check-row easy-rating"><input id="easy-rating" type="checkbox">太简单（按 Easy 记录）</label>' : '';
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, p, map)}</div><div class="candidate-area"><div class="chunk-list">${p.candidates.map(id => `<button class="candidate ${p.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${p.selected.includes(id) || p.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${p.checked ? answerDetails(s, map, p) : ''}${easyOption}<div class="practice-actions"><button class="btn outline" data-action="skip" ${p.checked || busy ? 'disabled' : ''}>跳过练习</button><button class="btn ghost" data-action="reset" ${p.checked || busy ? 'disabled' : ''}>重置</button>${p.checked ? '<button class="btn outline retry-current" data-action="retry-current">重新练习本题</button>' : ''}<button class="btn primary" data-action="${p.checked ? 'next' : 'check'}" ${!p.checked && !ready ? 'disabled' : ''}>${p.checked ? '下一题' : '核对答案'}</button></div></section>`;
+  const p = state.practice;
+  const item = currentPracticeItem(p);
+  if (!p || !item) return route('home', {replace:true});
+  const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
+  const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
+  const ready = practiceReadyToCheck(item), busy = item.submitting || p.submittingRound;
+  const easyOption = item.checked && item.result?.correct && validCheckStatuses(item).length === 1
+    ? `<label class="check-row easy-rating"><input id="easy-rating" type="checkbox" ${item.easySelected ? 'checked' : ''} ${busy ? 'disabled' : ''}>太简单（按 Easy 记录）</label>`
+    : '';
+  const last = p.index === p.sentences.length - 1;
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}${easyOption}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${item.checked || !ready || busy ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
-function answerDetails(s, map, p) {
-  const user = p.selected.map(id => map[id]?.text || '').join('');
+function answerDetails(s, map, item) {
+  const user = item.selected.map(id => map[id]?.text || '').join('');
   const correctJp = (Array.isArray(s.furigana) && s.furigana.length) ? rubyHtml(s.furigana) : esc(s.japanese);
-  return `<div class="card answer-card"><h3>${p.result?.correct ? '回答正确' : '正确答案'}</h3>${!p.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${correctJp}</div><p>${esc(s.chinese)}</p></div>`;
+  return `<div class="card answer-card"><h3>${item.result?.correct ? '回答正确' : '正确答案'}</h3>${!item.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${correctJp}</div><p>${esc(s.chinese)}</p></div>`;
 }
 async function record(action) {
   const p = state.practice;
-  if (!p || p.submitting) return;
-  if (action === 'check' && !practiceReadyToCheck(p)) { toast('请先把所有词块摆放完整'); return; }
+  const item = currentPracticeItem(p);
+  if (!p || !item || item.submitting || p.submittingRound || action !== 'check') return;
+  if (!practiceReadyToCheck(item)) { toast('请先把所有词块摆放完整'); return; }
   const s = p.sentences[p.index];
-  const durationMs = Math.max(0, Date.now() - (p.questionStartedAt || Date.now()));
-  p.submitting = true;
+  const durationMs = Math.max(0, Date.now() - (item.questionStartedAt || Date.now()));
+  item.submitting = true;
   renderPractice();
   try {
-    p.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:p.selected, durationMs})});
-    p.attemptStatuses.push(p.result.status);
-    p.checked = true;
+    item.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:item.selected, durationMs})});
+    item.attemptStatuses.push(item.result.status);
+    item.checked = true;
   } catch (error) {
-    p.submitting = false;
+    item.submitting = false;
     renderPractice();
     throw error;
   }
-  p.submitting = false;
+  item.submitting = false;
   renderPractice();
 }
-async function finalizeCurrentQuestion() { const p = state.practice, s = p?.sentences[p.index]; if (!p || !s || !p.checked) return null; const easy = Boolean($('#easy-rating')?.checked); return api(`/api/practice/sessions/${p.sessionId}/sentences/${s.id}/complete`, {method:'POST', body:JSON.stringify({easy})}); }
-async function nextQuestion() { const p = state.practice; await finalizeCurrentQuestion(); if (p.index < p.sentences.length - 1) { p.index++; prepareQuestion(); renderPractice(); return; } await api(`/api/practice/sessions/${p.sessionId}/complete`, {method:'POST', body:'{}'}); if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); state.report = (await api(`/api/reports/${p.sessionId}`)).report; route('report', {reportId:p.sessionId}); }
+async function finalizeCurrentQuestion() {
+  const p = state.practice, item = currentPracticeItem(p), s = p?.sentences[p.index];
+  if (!p || !item || !s || !item.checked || item.finalized) return item?.completion || null;
+  item.completion = await api(`/api/practice/sessions/${p.sessionId}/sentences/${s.id}/complete`, {method:'POST', body:JSON.stringify({easy:item.easySelected})});
+  item.finalized = true;
+  return item.completion;
+}
+function navigatePractice(delta) {
+  const p = state.practice;
+  const item = currentPracticeItem(p);
+  if (!p || !item || item.submitting || p.submittingRound) return;
+  const nextIndex = p.index + delta;
+  if (nextIndex < 0 || nextIndex >= p.sentences.length) return;
+  abortPracticeDrag();
+  p.index = nextIndex;
+  const nextItem = currentPracticeItem(p);
+  if (nextItem && !nextItem.checked) nextItem.questionStartedAt = Date.now();
+  renderPractice();
+}
+function roundSubmissionPayload(practice, confirmUnanswered) {
+  return {
+    confirmUnanswered,
+    clientUnansweredCount: practiceUnansweredIndexes(practice).length,
+    easySentenceIds: practice.sentences.flatMap((sentence, index) => practice.items[index].easySelected ? [sentence.id] : []),
+    draftAnswers: practice.sentences.map((sentence, index) => ({
+      sentenceId: sentence.id,
+      answerOrder: [...practice.items[index].selected],
+    })),
+  };
+}
+function openUnansweredPracticeDialog(count) {
+  const p = state.practice;
+  if (!p) return;
+  p.serverUnansweredCount = count;
+  openDialog(`<div class="unanswered-practice-dialog"><h1>本轮还有 ${count} 题未回答</h1><p class="unanswered-practice-copy">未回答的题目不会写入 FSRS 复习记录，也不会被判定为忘记。它们的记忆状态、稳定度、难度和下次复习时间都不会发生变化；如果题目原本已经到期，它仍会保持待复习状态。</p><p id="unanswered-practice-error" class="form-error unanswered-practice-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="continue-unanswered">返回继续作答</button><button class="btn primary" data-action="confirm-submit-unanswered">仍然提交</button></div></div>`, { className: 'unanswered-practice-modal', label: `本轮还有 ${count} 题未回答` });
+}
+function isUnansweredPracticeDialogOpen() {
+  const dialog = $('#dialog');
+  return Boolean(dialog && !dialog.classList.contains('hidden') && $('.unanswered-practice-dialog', dialog));
+}
+function continueUnansweredPractice() {
+  const p = state.practice;
+  if (!p || p.submittingRound) return;
+  const first = practiceUnansweredIndexes(p)[0];
+  closeDialog();
+  if (Number.isInteger(first)) p.index = first;
+  renderPractice();
+}
+async function submitPracticeRound({ confirmUnanswered = false, button = null } = {}) {
+  const p = state.practice;
+  if (!p || p.submittingRound) return;
+  p.submittingRound = true;
+  let dialogButtons = [];
+  let oldLabel = '';
+  if (button) {
+    dialogButtons = $$('button', $('#dialog'));
+    dialogButtons.forEach(item => { item.disabled = true; });
+    oldLabel = button.textContent;
+    button.textContent = '正在提交…';
+    const errorEl = $('#unanswered-practice-error');
+    if (errorEl) errorEl.textContent = '';
+  } else {
+    renderPractice();
+  }
+  try {
+    await api(`/api/practice/sessions/${p.sessionId}/complete`, {method:'POST', body:JSON.stringify(roundSubmissionPayload(p, confirmUnanswered))});
+    if (typeof window.clearStatsCache === 'function') window.clearStatsCache();
+    state.report = (await api(`/api/reports/${p.sessionId}`)).report;
+    closeDialog();
+    route('report', {reportId:p.sessionId});
+  } catch (error) {
+    p.submittingRound = false;
+    if (!confirmUnanswered && error.status === 409 && error.data?.requiresConfirmation) {
+      renderPractice();
+      openUnansweredPracticeDialog(Number(error.data.unansweredCount || 0));
+      return;
+    }
+    if (button) {
+      dialogButtons.forEach(item => { item.disabled = false; });
+      button.textContent = oldLabel;
+      const errorEl = $('#unanswered-practice-error');
+      if (errorEl) errorEl.textContent = error.message;
+    } else {
+      renderPractice();
+    }
+    throw error;
+  }
+}
 
-function ratingSummaryText(report) { const c = report.ratingCounts || {}; return `忘记 ${c.again || 0} · 模糊 ${c.hard || 0} · 认识 ${c.good || 0} · 轻松掌握 ${c.easy || 0}${c.skipped ? ` · 跳过 ${c.skipped}` : ''}`; }
+function ratingSummaryText(report) { const c = report.ratingCounts || {}; return `忘记 ${c.again || 0} · 模糊 ${c.hard || 0} · 认识 ${c.good || 0} · 轻松掌握 ${c.easy || 0}${c.skipped ? ` · 跳过 ${c.skipped}` : ''}${report.unansweredCount ? ` · 未回答 ${report.unansweredCount}` : ''}`; }
 async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<div class="history-row"><button class="row-open" data-action="open-report" data-id="${r.id}"><span class="row-icon fsrs-report-icon">FSRS</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>本轮 ${r.total} 句 · ${ratingSummaryText(r)}</small></span></button><div class="row-actions"><button class="small-btn" data-action="delete-report" data-id="${r.id}" aria-label="删除这条记录">删除</button><span class="arrow">›</span></div></div>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
-function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); const c = r.ratingCounts || {}; const skipped = c.skipped || 0; view.innerHTML = `<section class="page"><div class="page-head report-head"><div><h1>本轮练习报告</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div class="report-actions"><button class="btn outline" data-action="home">返回首页</button><button class="btn primary" data-action="open-retry-round">再练一轮</button></div></div><div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>本轮句数</div><div class="card stat-card"><strong>${c.again || 0}</strong>忘记</div><div class="card stat-card"><strong>${c.hard || 0}</strong>模糊</div><div class="card stat-card"><strong>${c.good || 0}</strong>认识</div><div class="card stat-card"><strong>${c.easy || 0}</strong>轻松掌握</div></div>${skipped ? `<p class="report-skip-note">另有 ${skipped} 句跳过，未计入 FSRS 评分。</p>` : ''}<div id="report-items">${reportItems(r.items)}</div></section>`; setChrome(); }
-function reportItems(items) { return items.length ? items.map(item => `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过'}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div></article>`).join('') : '<div class="card empty">这份旧报告的题目明细已不可用。</div>'; }
+function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); const c = r.ratingCounts || {}; const skipped = c.skipped || 0, unanswered = Number(r.unansweredCount || 0); view.innerHTML = `<section class="page"><div class="page-head report-head"><div><h1>本轮练习报告</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div class="report-actions"><button class="btn outline" data-action="home">返回首页</button><button class="btn primary" data-action="open-retry-round">再练一轮</button></div></div><div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>本轮句数</div><div class="card stat-card"><strong>${c.again || 0}</strong>忘记</div><div class="card stat-card"><strong>${c.hard || 0}</strong>模糊</div><div class="card stat-card"><strong>${c.good || 0}</strong>认识</div><div class="card stat-card"><strong>${c.easy || 0}</strong>轻松掌握</div></div>${unanswered ? `<p class="report-unanswered-note">另有 ${unanswered} 题未回答，未计入 FSRS。</p>` : ''}${skipped ? `<p class="report-skip-note">另有 ${skipped} 句历史跳过记录，未计入 FSRS 评分。</p>` : ''}<div id="report-items">${reportItems(r.items)}</div></section>`; setChrome(); }
+function reportItems(items) { return items.length ? items.map(item => { const unanswered = item.status === 'unanswered'; const statusLabel = unanswered ? '未回答' : (item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过'); return `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${statusLabel}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div>${unanswered ? '<div class="report-line"><span>说明</span><div>未计入 FSRS</div></div>' : ''}</article>`; }).join('') : '<div class="card empty">这份旧报告的题目明细已不可用。</div>'; }
 
 async function renderSettings() {
   const [authCfg, tzCfg, fsrsCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone'), api('/api/settings/fsrs')]);
   const timezoneCard = `<form id="timezone-form" class="card"><div class="settings-title"><div><h2>时区</h2><p>"今日学习"和「统计」页的分桶都按自然日归类，这里设置的时区决定自然日的分界点；不设置时默认按服务器所在时区计算。</p></div><span class="config-status ${tzCfg.timezone ? 'ok' : 'warn'}">${tzCfg.timezone ? '已设置' : '未设置'}</span></div><label class="field">时区<select name="timezone" id="timezone-select">${timezoneOptionsHtml(tzCfg.timezone)}</select></label>${tzCfg.timezone ? '' : `<p class="status-note">当前按服务器时区（UTC${tzCfg.serverUtcOffset}）计算，如果你实际所在地区和服务器不同，建议在上方选择你自己的时区。</p>`}<div class="form-actions"><button class="btn primary" type="submit">保存时区设置</button></div></form>`;
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答；离开当前题时才按整道题的作答过程生成一次 FSRS 评分。跳过不更新，未答对为忘记，错后答对为模糊，首次答对为认识，主动选择“太简单”为轻松掌握。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看 FSRS 评分、复习预测、稳定度、难度和预计保持率。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答；提交本轮时才按每道已回答题目的作答过程生成一次 FSRS 评分。未回答题目不更新，未答对为忘记，错后答对为模糊，首次答对为认识，主动选择“太简单”为轻松掌握。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看 FSRS 评分、复习预测、稳定度、难度和预计保持率。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
 
 document.addEventListener('click', async event => {
-  if (event.target.id === 'dialog') { closeDialog(); return; }
+  if (event.target.id === 'dialog') {
+    if (!state.practice?.exiting && !state.practice?.submittingRound) closeDialog();
+    return;
+  }
   const button = event.target.closest('button'); if (!button) return;
   if (button.dataset.route) { if (button.dataset.route === state.route) return; state.editing = null; const fromHome = state.route === 'home' && (button.dataset.route === 'due' || button.dataset.route === 'today'); route(button.dataset.route, {fromHome}); return; }
   const action = button.dataset.action;
@@ -733,27 +905,27 @@ document.addEventListener('click', async event => {
       const { custom, selected } = readCountPickerSelection('count', { trimCustom: false });
       await startPractice({ scope: 'collection', collectionId: state.activeCollection, count: custom || selected });
     }
-    else if (action === 'open-retry-round') openRetryRoundDialog();
+    else if (action === 'open-retry-round') await openRetryRoundDialog();
     else if (action === 'set-report-count') {
       selectCountOption('report-count', button);
       const max = Number($('#report-custom-count')?.max || 0);
-      bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '将从该句集中重新随机抽取题目。' });
+      bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '优先选择本轮未回答题目，其余按到期顺序补充。' });
     }
     else if (action === 'start-report-round') {
-      const collectionId = Number($('#dialog').dataset.retryCollectionId || 0);
+      const reportId = Number($('#dialog').dataset.retryReportId || 0);
       const max = Number($('#report-custom-count')?.max || 0);
       const { custom, selected } = readCountPickerSelection('report-count', { trimCustom: true });
       const count = custom ? Number(custom) : selected;
-      if (!collectionId || !max) return;
+      if (!reportId || !max) return;
       if (custom && (!Number.isInteger(count) || count < 1 || count > max)) {
-        bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '将从该句集中重新随机抽取题目。' });
+        bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '优先选择本轮未回答题目，其余按到期顺序补充。' });
         return;
       }
       button.disabled = true;
       const oldLabel = button.textContent;
       button.textContent = '正在开始…';
       try {
-        await startPractice({ scope: 'collection', collectionId, count });
+        await startPractice({ scope: 'report_retry', reportId, count });
         closeDialog();
       } catch (error) {
         button.disabled = false;
@@ -771,21 +943,27 @@ document.addEventListener('click', async event => {
     else if (action === 'practice-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await startPractice({sentenceIds:ids}); }
     else if (action === 'edit-sentence') { state.editing = (await api(`/api/sentences/${button.dataset.id}`)).sentence; route('add', {editingId:state.editing.id}); }
     else if (action === 'delete-sentence') { if (confirm('确定删除这条句子吗？')) { await api(`/api/sentences/${button.dataset.id}`, {method:'DELETE'}); reloadLibrary(); } }
-    else if (action === 'close-dialog') closeDialog();
+    else if (action === 'close-dialog') {
+      if (!state.practice?.exiting && !state.practice?.submittingRound) closeDialog();
+    }
     else if (action === 'manage-collection') { await ensureDashboard(); openManageCollectionDialog(); }
     else if (action === 'rename-collection') { const name = $('#rename-collection-name')?.value.trim(); if (!name) throw new Error('句集名称不能为空'); const id = state.activeCollection; await api(`/api/collections/${id}`, {method:'PATCH', body:JSON.stringify({name})}); state.dashboard = null; closeDialog(); toast('句集已重命名'); await renderLibrary(id); }
     else if (action === 'delete-collection-ask') openDeleteCollectionConfirm();
     else if (action === 'delete-collection-confirm') { const id = state.activeCollection; await api(`/api/collections/${id}?cascade=1`, {method:'DELETE'}); state.dashboard = null; closeDialog(); toast('句集已删除'); await renderLibrary(); }
     else if (action === 'move-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await ensureDashboard(); openMoveSentencesDialog(ids); }
     else if (action === 'confirm-move-sentences') { const ids = ($('#dialog').dataset.moveIds || '').split(',').filter(Boolean).map(Number); const targetCollectionId = Number($('#move-target-collection')?.value); if (!ids.length) throw new Error('请至少勾选一条句子'); if (!targetCollectionId) throw new Error('请选择目标句集'); const result = await api('/api/sentences/move', {method:'POST', body:JSON.stringify({sentenceIds:ids, targetCollectionId})}); state.dashboard = null; closeDialog(); toast(`已转移 ${result.moved} 句`); await renderLibrary(state.activeCollection); }
-    else if (action === 'choose') { const p = state.practice, id = button.dataset.id; if (!p || p.checked || p.submitting || !p.candidates.includes(id) || p.selected.includes(id) || p.selected.length >= p.candidates.length) return; p.selected.push(id); updatePracticeSelection(); }
-    else if (action === 'unchoose') { const p = state.practice, index = Number(button.dataset.index); if (!p || p.checked || p.submitting || !Number.isInteger(index) || index < 0 || index >= p.selected.length) return; p.selected.splice(index, 1); updatePracticeSelection(); }
-    else if (action === 'reset') { const p = state.practice; if (!p || p.checked || p.submitting) return; p.selected = []; updatePracticeSelection(); }
+    else if (action === 'choose') { const p = state.practice, item = currentPracticeItem(p), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !item.candidates.includes(id) || item.selected.includes(id) || item.selected.length >= item.candidates.length) return; item.selected.push(id); updatePracticeSelection(); }
+    else if (action === 'unchoose') { const p = state.practice, item = currentPracticeItem(p), index = Number(button.dataset.index); if (!p || !item || item.checked || item.submitting || p.submittingRound || !Number.isInteger(index) || index < 0 || index >= item.selected.length) return; item.selected.splice(index, 1); updatePracticeSelection(); }
+    else if (action === 'reset') { const p = state.practice, item = currentPracticeItem(p); if (!p || !item || item.checked || item.submitting || p.submittingRound) return; item.selected = []; updatePracticeSelection(); }
     else if (action === 'check') { if (!practiceReadyToCheck()) { toast('请先把所有词块摆放完整'); return; } await record('check'); }
-    else if (action === 'skip') await record('skip');
-    else if (action === 'retry-current') { state.practice.selected = []; state.practice.checked = false; state.practice.result = null; state.practice.submitting = false; state.practice.questionStartedAt = Date.now(); renderPractice(); }
-    else if (action === 'next') await nextQuestion();
-    else if (action === 'exit-practice') { if (confirm('退出后，本轮未完成的题目不会生成完整报告。确定退出吗？')) { if (state.practice?.checked) await finalizeCurrentQuestion(); route('home'); } }
+    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; item.selected = []; item.checked = false; item.result = null; item.submitting = false; item.easySelected = false; item.questionStartedAt = Date.now(); renderPractice(); }
+    else if (action === 'previous-question') navigatePractice(-1);
+    else if (action === 'next-question') navigatePractice(1);
+    else if (action === 'submit-round') await submitPracticeRound();
+    else if (action === 'continue-unanswered') continueUnansweredPractice();
+    else if (action === 'confirm-submit-unanswered') await submitPracticeRound({confirmUnanswered:true, button});
+    else if (action === 'exit-practice') openExitPracticeDialog();
+    else if (action === 'confirm-exit-practice') await confirmExitPractice(button);
     else if (action === 'open-report') { state.report = (await api(`/api/reports/${button.dataset.id}`)).report; route('report', {reportId:state.report.id}); }
     else if (action === 'delete-report') openDeleteReportConfirm(button.dataset.id);
     else if (action === 'delete-report-confirm') {
@@ -804,6 +982,7 @@ document.addEventListener('click', async event => {
 });
 
 document.addEventListener('change', event => {
+  if (event.target.id === 'easy-rating') { const item = currentPracticeItem(); if (item) item.easySelected = event.target.checked; return; }
   if (event.target.classList.contains('sentence-check')) { updateMoveSelectedBtn(); return; }
   if (event.target.id === 'home-collection' || event.target.id === 'due-collection') { setActiveCollection(event.target.value); if (event.target.id === 'due-collection') state.homeDuePicker = true; renderHome().catch(error => toast(error.message, true)); return; }
   if (event.target.id === 'library-collection') { state.activeCollection = Number(event.target.value); localStorage.setItem('activeCollection', state.activeCollection); route('library', {collectionId:state.activeCollection, replace:true}); }
@@ -828,7 +1007,7 @@ document.addEventListener('input', event => {
     bindCountPicker('report-count', max, {
       mode: 'strict',
       startAction: 'start-report-round',
-      defaultHint: '将从该句集中重新随机抽取题目。',
+      defaultHint: '优先选择本轮未回答题目，其余按到期顺序补充。',
       clearActive: true,
     });
   }

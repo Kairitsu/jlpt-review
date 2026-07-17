@@ -88,6 +88,13 @@
 .retry-round-modal .status-note{width:100%;text-align:left;line-height:1.6}
 .retry-round-modal .status-note:empty{display:none}
 .retry-round-modal .retry-empty{margin:0}
+.exit-practice-modal{width:min(520px,100%)}
+.exit-practice-dialog h1{margin-top:0}
+.exit-practice-copy{margin:10px 0 0;text-align:center;color:var(--ink);line-height:1.7}
+.exit-practice-note{margin:10px 0 0;text-align:center;line-height:1.65}
+.exit-practice-error{margin:10px 0 -8px;min-height:0;text-align:center!important}
+.exit-practice-error:empty{display:none}
+.exit-practice-modal .btn:disabled{opacity:.55;cursor:wait}
 
 @media(max-width:800px){
   .report-head{gap:16px}
@@ -100,4 +107,37 @@
   .retry-round-modal{padding:22px 18px}
   .retry-round-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
   .retry-round-modal .form-actions .btn{width:100%;padding-inline:12px}
+  .exit-practice-modal{padding:24px 18px}
+  .exit-practice-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
+  .exit-practice-modal .form-actions .btn{width:100%;padding-inline:12px}
+}
+
+/* ---- Free practice navigation and unanswered submission ---- */
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.practice-actions,.practice-actions:has(.retry-current){grid-template-columns:minmax(116px,1fr) minmax(116px,1fr) auto auto minmax(160px,1.35fr);align-items:stretch}
+.practice-actions .btn{min-width:0;min-height:48px;padding-inline:18px;white-space:nowrap}
+.practice-check{grid-column:5;font-size:16px}
+.report-item.unanswered{border-left:5px solid #d3ab5a}
+.report-unanswered-note{margin:-8px 0 22px;color:var(--muted);font-size:14px}
+.unanswered-practice-modal{width:min(620px,100%)}
+.unanswered-practice-dialog h1{margin-top:0}
+.unanswered-practice-copy{margin:14px 0 0!important;text-align:left!important;color:var(--ink)!important;line-height:1.8}
+.unanswered-practice-error{margin:10px 0 -8px;min-height:0;text-align:center!important}
+.unanswered-practice-error:empty{display:none}
+.unanswered-practice-modal .btn:disabled{cursor:wait}
+
+@media(max-width:800px){
+  .practice-actions,.practice-actions:has(.retry-current){grid-template-columns:1fr 1fr}
+  .practice-actions .btn{width:100%;min-height:48px;padding-inline:12px}
+  .practice-prev{order:1}
+  .practice-next{order:2}
+  .practice-reset{order:3}
+  .retry-current{order:4}
+  .practice-check{grid-column:1/-1;order:5}
+}
+
+@media(max-width:480px){
+  .unanswered-practice-modal{padding:22px 18px}
+  .unanswered-practice-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
+  .unanswered-practice-modal .form-actions .btn{width:100%;min-height:48px;padding-inline:10px}
 }
