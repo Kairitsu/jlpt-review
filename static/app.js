@@ -146,8 +146,16 @@ async function openRetryRoundDialog() {
 }
 
 function openExitPracticeDialog() {
-  if (!state.practice) return;
-  openDialog(`<div class="exit-practice-dialog"><h1>退出本轮练习？</h1><p class="exit-practice-copy">退出后，本轮未完成的题目不会生成完整报告。</p><p class="status-note exit-practice-note">已经完成并写入 FSRS 的题目进度不会撤销。</p><p id="exit-practice-error" class="form-error exit-practice-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">继续练习</button><button class="btn danger" data-action="confirm-exit-practice">确认退出</button></div></div>`, { className: 'exit-practice-modal', label: '退出本轮练习？' });
+  const practice = state.practice;
+  if (!practice) return;
+  const total = practice.sentences.length;
+  const completed = completedPracticeCount(practice);
+  const unanswered = Math.max(0, total - completed);
+  if (!completed) {
+    openDialog(`<div class="exit-practice-dialog"><h1>当前还没有完成任何题目</h1><p class="exit-practice-copy">本轮原计划 ${total} 题，目前还有 ${unanswered} 题未完成。</p><p class="status-note exit-practice-note">直接放弃不会生成练习报告，也不会更新任何 FSRS 数据。</p><div class="form-actions"><button class="btn outline" data-action="close-dialog">继续练习</button><button class="btn danger" data-action="abandon-practice">放弃本轮</button></div></div>`, { className: 'exit-practice-modal', label: '当前还没有完成任何题目' });
+    return;
+  }
+  openDialog(`<div class="exit-practice-dialog"><h1>提前结束并提交？</h1><div class="exit-practice-counts"><div><strong>${completed}</strong><span>已经完成</span></div><div><strong>${unanswered}</strong><span>尚未完成</span></div></div><p class="exit-practice-copy">确认退出后，已完成题目会按现有评分规则保存到 FSRS，并生成正式练习报告。</p><p class="status-note exit-practice-note">未完成题目不会计入 FSRS，也不会被判定为错误或遗忘，原有记忆和到期状态保持不变。</p><p id="exit-practice-error" class="form-error exit-practice-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">继续练习</button><button class="btn danger" data-action="confirm-exit-practice">提前结束并生成报告</button></div></div>`, { className: 'exit-practice-modal', label: '提前结束并提交？' });
 }
 
 function isExitPracticeDialogOpen() {
@@ -167,12 +175,18 @@ async function confirmExitPractice(button) {
   const errorEl = $('#exit-practice-error');
   if (errorEl) errorEl.textContent = '';
   try {
-    const item = currentPracticeItem(practice);
-    if (item?.checked) await finalizeCurrentQuestion();
+    const submission = await api(`/api/practice/sessions/${practice.sessionId}/complete`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ...roundSubmissionPayload(practice, true),
+        completionMode: 'early_exit',
+      }),
+    });
+    state.report = (await api(`/api/reports/${submission.reportId}`)).report;
     if (typeof window.clearStatsCache === 'function') window.clearStatsCache();
     practice.exiting = false;
     closeDialog();
-    await route('home');
+    await route('report', { reportId: submission.reportId });
   } catch (error) {
     practice.exiting = false;
     buttons.forEach(item => { item.disabled = false; });
@@ -180,6 +194,14 @@ async function confirmExitPractice(button) {
     if (errorEl) errorEl.textContent = error.message;
     toast(error.message, true);
   }
+}
+
+async function abandonPractice() {
+  if (!state.practice || state.practice.exiting) return;
+  abortPracticeDrag();
+  state.practice = null;
+  closeDialog();
+  await route('home');
 }
 
 const secondaryRoutes = new Set(['library', 'add', 'reports', 'report', 'settings', 'stats', 'due', 'today']);
@@ -444,7 +466,7 @@ async function startPractice(payload) {
     items: result.sentences.map(sentence => ({
       selected: [], checked: false, result: null,
       candidates: shuffle(sentence.chunks.map(chunk => chunk.id)),
-      submitting: false, attemptStatuses: [], easySelected: false,
+      submitting: false, attemptStatuses: [], pendingAttempt: null,
       finalized: false, completion: null, questionStartedAt: Date.now(),
     })),
     submittingRound: false,
@@ -453,11 +475,24 @@ async function startPractice(payload) {
   route('practice');
 }
 function shuffle(items) { const result = [...items]; for (let i = result.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [result[i], result[j]] = [result[j], result[i]]; } return result; }
+let clientAttemptSequence = 0;
+function createClientAttemptId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  clientAttemptSequence += 1;
+  return `check-${Date.now()}-${clientAttemptSequence}-${Math.random().toString(36).slice(2)}`;
+}
 function currentPracticeItem(practice = state.practice) {
   return practice?.items?.[practice.index] || null;
 }
 function validCheckStatuses(item) {
   return (item?.attemptStatuses || []).filter(status => status === 'correct' || status === 'wrong');
+}
+function completedPracticeCount(practice = state.practice) {
+  if (!practice) return 0;
+  return practice.items.filter(item => (
+    validCheckStatuses(item).length > 0
+    || (item.finalized && item.completion?.status !== 'unanswered')
+  )).length;
 }
 function practiceUnansweredIndexes(practice = state.practice) {
   if (!practice) return [];
@@ -735,11 +770,8 @@ function renderPractice() {
   const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
   const ready = practiceReadyToCheck(item), busy = item.submitting || p.submittingRound;
-  const easyOption = item.checked && item.result?.correct && validCheckStatuses(item).length === 1
-    ? `<label class="check-row easy-rating"><input id="easy-rating" type="checkbox" ${item.easySelected ? 'checked' : ''} ${busy ? 'disabled' : ''}>太简单（按 Easy 记录）</label>`
-    : '';
   const last = p.index === p.sentences.length - 1;
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}${easyOption}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${item.checked || !ready || busy ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${item.checked || !ready || busy ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, item) {
@@ -753,12 +785,18 @@ async function record(action) {
   if (!p || !item || item.submitting || p.submittingRound || action !== 'check') return;
   if (!practiceReadyToCheck(item)) { toast('请先把所有词块摆放完整'); return; }
   const s = p.sentences[p.index];
+  const answerOrder = [...item.selected];
+  const answerKey = JSON.stringify(answerOrder);
+  if (!item.pendingAttempt || item.pendingAttempt.answerKey !== answerKey) {
+    item.pendingAttempt = { id: createClientAttemptId(), answerKey };
+  }
   const durationMs = Math.max(0, Date.now() - (item.questionStartedAt || Date.now()));
   item.submitting = true;
   renderPractice();
   try {
-    item.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, answerOrder:item.selected, durationMs})});
+    item.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, attemptId:item.pendingAttempt.id, answerOrder, durationMs})});
     item.attemptStatuses.push(item.result.status);
+    item.pendingAttempt = null;
     item.checked = true;
   } catch (error) {
     item.submitting = false;
@@ -767,13 +805,6 @@ async function record(action) {
   }
   item.submitting = false;
   renderPractice();
-}
-async function finalizeCurrentQuestion() {
-  const p = state.practice, item = currentPracticeItem(p), s = p?.sentences[p.index];
-  if (!p || !item || !s || !item.checked || item.finalized) return item?.completion || null;
-  item.completion = await api(`/api/practice/sessions/${p.sessionId}/sentences/${s.id}/complete`, {method:'POST', body:JSON.stringify({easy:item.easySelected})});
-  item.finalized = true;
-  return item.completion;
 }
 function navigatePractice(delta) {
   const p = state.practice;
@@ -791,7 +822,6 @@ function roundSubmissionPayload(practice, confirmUnanswered) {
   return {
     confirmUnanswered,
     clientUnansweredCount: practiceUnansweredIndexes(practice).length,
-    easySentenceIds: practice.sentences.flatMap((sentence, index) => practice.items[index].easySelected ? [sentence.id] : []),
     draftAnswers: practice.sentences.map((sentence, index) => ({
       sentenceId: sentence.id,
       answerOrder: [...practice.items[index].selected],
@@ -858,14 +888,15 @@ async function submitPracticeRound({ confirmUnanswered = false, button = null } 
 }
 
 function ratingSummaryText(report) { const c = report.ratingCounts || {}; return `忘记 ${c.again || 0} · 模糊 ${c.hard || 0} · 认识 ${c.good || 0} · 轻松掌握 ${c.easy || 0}${c.skipped ? ` · 跳过 ${c.skipped}` : ''}${report.unansweredCount ? ` · 未回答 ${report.unansweredCount}` : ''}`; }
-async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<div class="history-row"><button class="row-open" data-action="open-report" data-id="${r.id}"><span class="row-icon fsrs-report-icon">FSRS</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>本轮 ${r.total} 句 · ${ratingSummaryText(r)}</small></span></button><div class="row-actions"><button class="small-btn" data-action="delete-report" data-id="${r.id}" aria-label="删除这条记录">删除</button><span class="arrow">›</span></div></div>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
-function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); const c = r.ratingCounts || {}; const skipped = c.skipped || 0, unanswered = Number(r.unansweredCount || 0); view.innerHTML = `<section class="page"><div class="page-head report-head"><div><h1>本轮练习报告</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div class="report-actions"><button class="btn outline" data-action="home">返回首页</button><button class="btn primary" data-action="open-retry-round">再练一轮</button></div></div><div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>本轮句数</div><div class="card stat-card"><strong>${c.again || 0}</strong>忘记</div><div class="card stat-card"><strong>${c.hard || 0}</strong>模糊</div><div class="card stat-card"><strong>${c.good || 0}</strong>认识</div><div class="card stat-card"><strong>${c.easy || 0}</strong>轻松掌握</div></div>${unanswered ? `<p class="report-unanswered-note">另有 ${unanswered} 题未回答，未计入 FSRS。</p>` : ''}${skipped ? `<p class="report-skip-note">另有 ${skipped} 句历史跳过记录，未计入 FSRS 评分。</p>` : ''}<div id="report-items">${reportItems(r.items)}</div></section>`; setChrome(); }
+function historyRoundText(report) { const completed = Number(report.completedCount ?? ((report.correct || 0) + (report.wrong || 0) + (report.skipped || 0))), unanswered = Number(report.unansweredCount || 0); return report.endedEarly ? `提前结束 · 原计划 ${report.total} 句 · 完成 ${completed} 句 · 未完成 ${unanswered} 句` : `本轮 ${report.total} 句`; }
+async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<div class="history-row"><button class="row-open" data-action="open-report" data-id="${r.id}"><span class="row-icon fsrs-report-icon">FSRS</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>${historyRoundText(r)} · ${ratingSummaryText(r)}</small></span></button><div class="row-actions"><button class="small-btn" data-action="delete-report" data-id="${r.id}" aria-label="删除这条记录">删除</button><span class="arrow">›</span></div></div>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
+function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); const c = r.ratingCounts || {}; const skipped = c.skipped || 0, unanswered = Number(r.unansweredCount || 0), completed = Number(r.completedCount ?? ((r.correct || 0) + (r.wrong || 0) + (r.skipped || 0))), endedEarly = Boolean(r.endedEarly); const completedItems = (r.items || []).filter(item => item.status !== 'unanswered'), unansweredItems = (r.items || []).filter(item => item.status === 'unanswered'); const details = r.items?.length ? `<div class="report-items-section"><div class="report-section-heading"><h2>已完成题目</h2><span>${completed} 题</span></div>${completedItems.length ? reportItems(completedItems) : '<div class="card empty">没有已完成题目明细。</div>'}</div>${unansweredItems.length ? `<div class="report-items-section unanswered-items"><div class="report-section-heading"><h2>未完成题目</h2><span>${unanswered} 题 · 未计入 FSRS</span></div>${reportItems(unansweredItems)}</div>` : ''}` : reportItems([]); view.innerHTML = `<section class="page"><div class="page-head report-head"><div><h1>本轮练习报告${endedEarly ? '<span class="early-exit-badge">提前结束</span>' : ''}</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div class="report-actions"><button class="btn outline" data-action="home">返回首页</button><button class="btn primary" data-action="open-retry-round">再练一轮</button></div></div>${endedEarly ? `<p class="early-exit-report-note">本轮已提前结束：原计划 ${r.total} 题，实际完成 ${completed} 题，未完成 ${unanswered} 题。未完成题目未计入正确率或 FSRS。</p>` : ''}<div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>原计划</div><div class="card stat-card"><strong>${completed}</strong>实际完成</div><div class="card stat-card"><strong>${unanswered}</strong>未完成</div><div class="card stat-card"><strong>${c.again || 0}</strong>忘记</div><div class="card stat-card"><strong>${c.hard || 0}</strong>模糊</div><div class="card stat-card"><strong>${c.good || 0}</strong>认识</div><div class="card stat-card"><strong>${c.easy || 0}</strong>轻松掌握</div></div>${unanswered ? `<p class="report-unanswered-note">${unanswered} 题未完成，未计入 FSRS，也未判定为错误或遗忘。</p>` : ''}${skipped ? `<p class="report-skip-note">另有 ${skipped} 句历史跳过记录，未计入 FSRS 评分。</p>` : ''}<div id="report-items">${details}</div></section>`; setChrome(); }
 function reportItems(items) { return items.length ? items.map(item => { const unanswered = item.status === 'unanswered'; const statusLabel = unanswered ? '未回答' : (item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过'); return `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${statusLabel}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div>${unanswered ? '<div class="report-line"><span>说明</span><div>未计入 FSRS</div></div>' : ''}</article>`; }).join('') : '<div class="card empty">这份旧报告的题目明细已不可用。</div>'; }
 
 async function renderSettings() {
   const [authCfg, tzCfg, fsrsCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone'), api('/api/settings/fsrs')]);
   const timezoneCard = `<form id="timezone-form" class="card"><div class="settings-title"><div><h2>时区</h2><p>"今日学习"和「统计」页的分桶都按自然日归类，这里设置的时区决定自然日的分界点；不设置时默认按服务器所在时区计算。</p></div><span class="config-status ${tzCfg.timezone ? 'ok' : 'warn'}">${tzCfg.timezone ? '已设置' : '未设置'}</span></div><label class="field">时区<select name="timezone" id="timezone-select">${timezoneOptionsHtml(tzCfg.timezone)}</select></label>${tzCfg.timezone ? '' : `<p class="status-note">当前按服务器时区（UTC${tzCfg.serverUtcOffset}）计算，如果你实际所在地区和服务器不同，建议在上方选择你自己的时区。</p>`}<div class="form-actions"><button class="btn primary" type="submit">保存时区设置</button></div></form>`;
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答；提交本轮时才按每道已回答题目的作答过程生成一次 FSRS 评分。未回答题目不更新，未答对为忘记，错后答对为模糊，首次答对为认识，主动选择“太简单”为轻松掌握。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看 FSRS 评分、复习预测、稳定度、难度和预计保持率。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答，正式提交时由后端自动评分：第一次核对即答对为“认识”，连续第二轮起仍首次答对为“轻松掌握”；第一次答错、第二次答对为“模糊”；第一次答错后未再次核对，或第二次仍然答错，为“忘记”。从未核对的题目不计入 FSRS。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「统计」页查看 FSRS 评分、复习预测、稳定度、难度和预计保持率。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
 
@@ -956,7 +987,7 @@ document.addEventListener('click', async event => {
     else if (action === 'unchoose') { const p = state.practice, item = currentPracticeItem(p), index = Number(button.dataset.index); if (!p || !item || item.checked || item.submitting || p.submittingRound || !Number.isInteger(index) || index < 0 || index >= item.selected.length) return; item.selected.splice(index, 1); updatePracticeSelection(); }
     else if (action === 'reset') { const p = state.practice, item = currentPracticeItem(p); if (!p || !item || item.checked || item.submitting || p.submittingRound) return; item.selected = []; updatePracticeSelection(); }
     else if (action === 'check') { if (!practiceReadyToCheck()) { toast('请先把所有词块摆放完整'); return; } await record('check'); }
-    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; item.selected = []; item.checked = false; item.result = null; item.submitting = false; item.easySelected = false; item.questionStartedAt = Date.now(); renderPractice(); }
+    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; item.selected = []; item.checked = false; item.result = null; item.submitting = false; item.pendingAttempt = null; item.questionStartedAt = Date.now(); renderPractice(); }
     else if (action === 'previous-question') navigatePractice(-1);
     else if (action === 'next-question') navigatePractice(1);
     else if (action === 'submit-round') await submitPracticeRound();
@@ -964,6 +995,7 @@ document.addEventListener('click', async event => {
     else if (action === 'confirm-submit-unanswered') await submitPracticeRound({confirmUnanswered:true, button});
     else if (action === 'exit-practice') openExitPracticeDialog();
     else if (action === 'confirm-exit-practice') await confirmExitPractice(button);
+    else if (action === 'abandon-practice') await abandonPractice();
     else if (action === 'open-report') { state.report = (await api(`/api/reports/${button.dataset.id}`)).report; route('report', {reportId:state.report.id}); }
     else if (action === 'delete-report') openDeleteReportConfirm(button.dataset.id);
     else if (action === 'delete-report-confirm') {
@@ -982,7 +1014,6 @@ document.addEventListener('click', async event => {
 });
 
 document.addEventListener('change', event => {
-  if (event.target.id === 'easy-rating') { const item = currentPracticeItem(); if (item) item.easySelected = event.target.checked; return; }
   if (event.target.classList.contains('sentence-check')) { updateMoveSelectedBtn(); return; }
   if (event.target.id === 'home-collection' || event.target.id === 'due-collection') { setActiveCollection(event.target.value); if (event.target.id === 'due-collection') state.homeDuePicker = true; renderHome().catch(error => toast(error.message, true)); return; }
   if (event.target.id === 'library-collection') { state.activeCollection = Number(event.target.value); localStorage.setItem('activeCollection', state.activeCollection); route('library', {collectionId:state.activeCollection, replace:true}); }

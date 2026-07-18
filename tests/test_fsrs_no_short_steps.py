@@ -1,4 +1,5 @@
 import importlib
+import uuid
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -65,6 +66,7 @@ def complete_good(client, sentence):
     ).get_json()
     session_id = practice["sessionId"]
     attempt = client.post(f"/api/practice/sessions/{session_id}/attempts", json={
+        "attemptId": str(uuid.uuid4()),
         "sentenceId": sentence["id"],
         "action": "check",
         "answerOrder": sentence["correctOrder"],

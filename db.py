@@ -6,13 +6,15 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fsrs_service import FSRS_VERSION, reschedule_from_review_events
+from fsrs_service import FSRS_VERSION, attempt_facts, reschedule_from_review_events
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "japanese_sentence_review.sqlite3"
 FSRS_MIGRATION = "fsrs_v1_reset"
 NO_SHORT_STEPS_MIGRATION = "fsrs_no_short_steps_v1"
 UNANSWERED_REPORT_MIGRATION = "practice_unanswered_v1"
+COMPLETION_MODE_MIGRATION = "practice_completion_mode_v1"
+AUTOMATIC_RATING_MIGRATION = "fsrs_automatic_rating_v2"
 
 
 def now_iso() -> str:
@@ -90,6 +92,8 @@ def _create_review_tables(db) -> None:
         wrong INTEGER NOT NULL DEFAULT 0,
         skipped INTEGER NOT NULL DEFAULT 0,
         unanswered INTEGER NOT NULL DEFAULT 0,
+        completion_mode TEXT NOT NULL DEFAULT 'normal'
+            CHECK(completion_mode IN ('normal','early_exit')),
         completed_at TEXT,
         report_deleted_at TEXT,
         created_at TEXT NOT NULL
@@ -112,6 +116,8 @@ def _create_review_tables(db) -> None:
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
         sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
+        client_attempt_id TEXT,
+        attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
         status TEXT NOT NULL CHECK(status IN ('correct','wrong','skipped')),
         answer_order_json TEXT NOT NULL DEFAULT '[]',
         sentence_snapshot_json TEXT NOT NULL,
@@ -123,6 +129,12 @@ def _create_review_tables(db) -> None:
         sentence_id INTEGER NOT NULL REFERENCES sentences(id) ON DELETE CASCADE,
         session_id INTEGER NOT NULL REFERENCES practice_sessions(id) ON DELETE RESTRICT,
         rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 4),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        first_attempt_correct INTEGER CHECK(first_attempt_correct IN (0,1)),
+        second_attempt_correct INTEGER CHECK(second_attempt_correct IN (0,1)),
+        final_attempt_correct INTEGER CHECK(final_attempt_correct IN (0,1)),
+        rating_policy_version INTEGER NOT NULL DEFAULT 1
+            CHECK(rating_policy_version > 0),
         reviewed_at TEXT NOT NULL,
         duration_ms INTEGER NOT NULL DEFAULT 0,
         is_new INTEGER NOT NULL DEFAULT 0 CHECK(is_new IN (0,1)),
@@ -148,6 +160,8 @@ def _create_indexes(db) -> None:
         "CREATE INDEX IF NOT EXISTS idx_sentences_due ON sentences(next_review_at)",
         "CREATE INDEX IF NOT EXISTS idx_attempts_session_sentence ON attempts(session_id, sentence_id, id)",
         "CREATE INDEX IF NOT EXISTS idx_attempts_sentence ON attempts(sentence_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_attempts_client_id ON attempts(client_attempt_id) WHERE client_attempt_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_attempts_number ON attempts(session_id,sentence_id,attempt_number)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_created ON practice_sessions(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_review_events_reviewed ON review_events(reviewed_at)",
         "CREATE INDEX IF NOT EXISTS idx_review_events_sentence ON review_events(sentence_id, reviewed_at)",
@@ -203,6 +217,88 @@ def _migrate_unanswered_reports(db, stamp: str) -> None:
     db.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)",
         (UNANSWERED_REPORT_MIGRATION, stamp),
+    )
+
+
+def _migrate_completion_mode(db, stamp: str) -> None:
+    """Add an explicit normal/early-exit report marker without touching history."""
+    if "completion_mode" not in _columns(db, "practice_sessions"):
+        db.execute(
+            "ALTER TABLE practice_sessions ADD COLUMN "
+            "completion_mode TEXT NOT NULL DEFAULT 'normal'"
+        )
+    db.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)",
+        (COMPLETION_MODE_MIGRATION, stamp),
+    )
+
+
+def _migrate_automatic_rating(db, stamp: str) -> None:
+    """Add v2 audit facts and idempotency keys without changing old ratings."""
+    attempt_columns = _columns(db, "attempts")
+    if "client_attempt_id" not in attempt_columns:
+        db.execute("ALTER TABLE attempts ADD COLUMN client_attempt_id TEXT")
+    if "attempt_number" not in attempt_columns:
+        db.execute("ALTER TABLE attempts ADD COLUMN attempt_number INTEGER")
+
+    # Existing attempt ids already provide a reliable per-item order. Preserve
+    # every row and assign that order once so new writes can continue from it.
+    db.execute(
+        """UPDATE attempts AS target
+           SET attempt_number=(
+             SELECT COUNT(*) FROM attempts AS preceding
+             WHERE preceding.session_id=target.session_id
+               AND preceding.sentence_id=target.sentence_id
+               AND preceding.id<=target.id
+           )
+           WHERE attempt_number IS NULL"""
+    )
+
+    event_columns = _columns(db, "review_events")
+    additions = (
+        ("attempt_count", "INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0)"),
+        ("first_attempt_correct", "INTEGER CHECK(first_attempt_correct IN (0,1))"),
+        ("second_attempt_correct", "INTEGER CHECK(second_attempt_correct IN (0,1))"),
+        ("final_attempt_correct", "INTEGER CHECK(final_attempt_correct IN (0,1))"),
+        ("rating_policy_version", "INTEGER NOT NULL DEFAULT 1 CHECK(rating_policy_version > 0)"),
+    )
+    for column, definition in additions:
+        if column not in event_columns:
+            db.execute(f"ALTER TABLE review_events ADD COLUMN {column} {definition}")
+
+    # Old ratings remain immutable. Only backfill raw facts where the original
+    # ordered check rows make them directly auditable.
+    legacy_events = db.execute(
+        """SELECT id,session_id,sentence_id FROM review_events
+           WHERE attempt_count=0 AND first_attempt_correct IS NULL"""
+    ).fetchall()
+    for event in legacy_events:
+        attempts = db.execute(
+            """SELECT status FROM attempts
+               WHERE session_id=? AND sentence_id=?
+               ORDER BY attempt_number,id""",
+            (event["session_id"], event["sentence_id"]),
+        ).fetchall()
+        facts = attempt_facts(attempts)
+        if not facts.attempt_count:
+            continue
+        db.execute(
+            """UPDATE review_events
+               SET attempt_count=?,first_attempt_correct=?,
+                   second_attempt_correct=?,final_attempt_correct=?
+               WHERE id=?""",
+            (
+                facts.attempt_count,
+                int(facts.first_attempt_correct),
+                None if facts.second_attempt_correct is None else int(facts.second_attempt_correct),
+                int(facts.final_attempt_correct),
+                event["id"],
+            ),
+        )
+
+    db.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)",
+        (AUTOMATIC_RATING_MIGRATION, stamp),
     )
 
 
@@ -296,6 +392,8 @@ def init_db(*, enable_fuzzing: bool = True) -> None:
             _create_sentences_table(db)
             _create_review_tables(db)
         _migrate_unanswered_reports(db, stamp)
+        _migrate_completion_mode(db, stamp)
+        _migrate_automatic_rating(db, stamp)
         _create_indexes(db)
 
         db.execute("DELETE FROM settings WHERE key IN ('scheduler_mode','base_url','model','custom_params','api_key_encrypted')")

@@ -1,6 +1,7 @@
 import importlib
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -41,6 +42,7 @@ def start(client, sentence, retry_wrong=False):
 
 def check(client, session_id, sentence, correct, duration_ms=1000):
     return client.post(f"/api/practice/sessions/{session_id}/attempts", json={
+        "attemptId": str(uuid.uuid4()),
         "sentenceId": sentence["id"],
         "action": "check",
         "answerOrder": sentence["correctOrder"] if correct else [],
@@ -92,22 +94,22 @@ def test_check_only_appends_raw_attempt_without_changing_fsrs(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize(
-    "checks,easy,expected",
+    "checks,legacy_easy,expected",
     [
         ([False], False, "again"),
         ([False, True], False, "hard"),
         ([True], False, "good"),
-        ([True], True, "easy"),
+        ([True], True, "good"),
     ],
 )
-def test_final_rating_updates_once(checks, easy, expected, tmp_path, monkeypatch):
+def test_final_rating_updates_once(checks, legacy_easy, expected, tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
     sentence = make_sentence(client, collection, expected)
     session_id = start(client, sentence, retry_wrong=True)
     for correct in checks:
         assert check(client, session_id, sentence, correct).status_code == 200
-    completed = finish(client, session_id, sentence, easy=easy)
+    completed = finish(client, session_id, sentence, easy=legacy_easy)
     assert completed.status_code == 200
     assert completed.get_json()["rating"] == expected
     row = stored_card(db, sentence["id"])
@@ -119,7 +121,7 @@ def test_final_rating_updates_once(checks, easy, expected, tmp_path, monkeypatch
         assert event["fsrs_version"] == "6.3.1"
         assert event["duration_ms"] == len(checks) * 1000
 
-    duplicate = finish(client, session_id, sentence, easy=not easy)
+    duplicate = finish(client, session_id, sentence, easy=not legacy_easy)
     assert duplicate.status_code == 200 and duplicate.get_json()["duplicate"] is True
     assert stored_card(db, sentence["id"])["next_review_at"] == row["next_review_at"]
     with db.get_db() as connection:
@@ -133,6 +135,7 @@ def test_skip_finalizes_without_fsrs_change(tmp_path, monkeypatch):
     session_id = start(client, sentence)
     before = stored_card(db, sentence["id"])
     response = client.post(f"/api/practice/sessions/{session_id}/attempts", json={
+        "attemptId": str(uuid.uuid4()),
         "sentenceId": sentence["id"], "action": "skip", "answerOrder": [],
     })
     assert response.status_code == 200

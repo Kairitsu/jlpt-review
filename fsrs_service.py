@@ -1,4 +1,4 @@
-"""The application's only review scheduler integration.
+"""The application's only automatic-rating and review-scheduler integration.
 
 This module is deliberately a thin persistence boundary around the official
 ``fsrs`` package.  No FSRS equations are duplicated in application code.
@@ -12,6 +12,7 @@ from typing import Iterable, Mapping, Sequence
 from fsrs import Card, Rating, ReviewLog, Scheduler, State
 
 FSRS_VERSION = "6.3.1"
+RATING_POLICY_VERSION = 2
 DESIRED_RETENTION = 0.90
 MAXIMUM_INTERVAL_DAYS = 36500
 LEARNING_STEPS = ()
@@ -89,22 +90,55 @@ def card_fields(card: Card) -> dict:
     }
 
 
-def rating_from_attempts(attempts: Iterable[Mapping], *, easy: bool = False) -> Rating | None:
-    """Map one question's complete raw attempt history to a final FSRS rating.
+@dataclass(frozen=True)
+class AttemptFacts:
+    """Auditable facts from the real check actions in one session item."""
 
-    A final skip is not reviewed.  Otherwise a question ending without a
-    correct answer is Again, a recovery after any wrong check is Hard, and a
-    first-check success is Good or Easy according to the explicit user choice.
+    attempt_count: int
+    first_attempt_correct: bool | None
+    second_attempt_correct: bool | None
+    final_attempt_correct: bool | None
+
+
+def attempt_facts(attempts: Iterable[Mapping]) -> AttemptFacts:
+    """Extract ordered check facts while ignoring legacy skip records."""
+    checks = [
+        row for row in attempts if row["status"] in {"correct", "wrong"}
+    ]
+    if not checks:
+        return AttemptFacts(0, None, None, None)
+    correctness = [row["status"] == "correct" for row in checks]
+    return AttemptFacts(
+        attempt_count=len(correctness),
+        first_attempt_correct=correctness[0],
+        second_attempt_correct=correctness[1] if len(correctness) > 1 else None,
+        final_attempt_correct=correctness[-1],
+    )
+
+
+def determine_fsrs_rating(
+    attempts: Iterable[Mapping],
+    *,
+    previous_first_attempt_correct: bool | None,
+) -> Rating | None:
+    """Return the sole automatic rating for one finalized practice item.
+
+    Only real check order and the previous reliable first-check fact matter.
+    Duration, client-provided ratings, and checks after the second one cannot
+    change the result.
     """
-    rows = list(attempts)
-    if not rows or rows[-1]["status"] == "skipped":
+    facts = attempt_facts(attempts)
+    if facts.attempt_count == 0:
         return None
-    checks = [row for row in rows if row["status"] != "skipped"]
-    if not checks or checks[-1]["status"] != "correct":
-        return Rating.Again
-    if any(row["status"] == "wrong" for row in checks[:-1]):
+    if facts.first_attempt_correct:
+        return (
+            Rating.Easy
+            if previous_first_attempt_correct is True
+            else Rating.Good
+        )
+    if facts.second_attempt_correct is True:
         return Rating.Hard
-    return Rating.Easy if easy else Rating.Good
+    return Rating.Again
 
 
 @dataclass(frozen=True)

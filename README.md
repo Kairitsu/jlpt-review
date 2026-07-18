@@ -36,7 +36,7 @@ JLPT Review 将日语句子转换为主动回忆练习：
 - 支持重置当前排列
 - 核对后显示正确句子和假名注音
 - 答错后可立即重新练习当前题
-- 首次答对时可主动标记为“太简单”
+- 首次答对后若上一轮也是首次答对，自动记为“轻松掌握”
 - 使用“上一题”和“下一题”自由切换题目
 - 切换未作答题目时不会自动显示答案
 
@@ -107,15 +107,16 @@ JLPT Review 将日语句子转换为主动回忆练习：
 
 | 作答情况 | FSRS 评分 | 页面显示 |
 | --- | --- | --- |
-| 最终仍未答对 | Again | 忘记 |
-| 曾经答错，之后答对 | Hard | 模糊 |
-| 第一次核对即答对 | Good | 认识 |
-| 第一次答对并选择“太简单” | Easy | 轻松掌握 |
 | 从未核对答案 | 不更新 | 未回答 |
+| 第一次核对即答对，上一轮可靠复习不是首次答对或不存在 | Good | 认识 |
+| 第一次核对即答对，上一轮可靠复习也是首次答对 | Easy | 轻松掌握 |
+| 第一次答错、第二次答对 | Hard | 模糊 |
+| 第一次答错后未再次核对，或第二次仍然答错 | Again | 忘记 |
+| 第三次或更多次才答对 | Again | 忘记 |
 
-答题耗时会保存到复习记录中，但不会自动将题目标记为 Easy。
+第二次答错后评分锁定为 Again；第一次即答对后，后续可选重练不会改变本轮评分。答题耗时只用于统计，不参与评分。Easy 完全由连续两轮首次核对即答对自动产生，前端不能指定评分。
 
-每个句子在同一轮练习中最多产生一次 FSRS 更新。重复提交不会导致重复调度。
+每个句子在同一轮练习中最多产生一次 FSRS 更新。重复提交不会导致重复调度。核对请求使用客户端 `attemptId` 幂等写入，不会覆盖历史核对记录。
 
 ### 未回答题目处理
 
@@ -585,8 +586,9 @@ flask --app app run --host 127.0.0.1 --port 3220
 | `PUT /api/sentences/:id` | 编辑句子 |
 | `POST /api/sentences/move` | 批量转移句子 |
 | `POST /api/practice/sessions` | 创建练习会话 |
-| `POST /api/practice/sessions/:id/attempts` | 保存一次原始核对结果 |
-| `POST /api/practice/sessions/:id/complete` | 提交整轮练习 |
+| `POST /api/practice/sessions/:id/attempts` | 使用必填 `attemptId` 幂等追加一次原始核对记录，不更新 FSRS |
+| `POST /api/practice/sessions/:id/sentences/:sentenceId/complete` | 幂等地完成一题并更新一次 FSRS |
+| `POST /api/practice/sessions/:id/complete` | 正常或提前完成会话，并通过统一规则结算已有核对的题目 |
 | `GET /api/reports` | 获取练习历史 |
 | `GET /api/reports/:id` | 获取报告明细 |
 | `DELETE /api/reports/:id` | 隐藏练习报告 |

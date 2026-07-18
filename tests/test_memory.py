@@ -5,9 +5,10 @@ from fsrs import Rating, State
 
 from fsrs_service import (
     FSRS_VERSION,
+    attempt_facts,
     card_fields,
+    determine_fsrs_rating,
     new_card,
-    rating_from_attempts,
     review,
 )
 from memory import is_valid_timezone, local_date, parse_iso
@@ -36,17 +37,31 @@ def test_new_card_is_due_fsrs_learning_card():
 
 
 @pytest.mark.parametrize(
-    "attempts,easy,expected",
+    "attempts,previous_first_correct,expected",
     [
-        ([{"status": "skipped"}], False, None),
-        ([{"status": "wrong"}], False, Rating.Again),
-        ([{"status": "wrong"}, {"status": "correct"}], False, Rating.Hard),
+        ([], None, None),
+        ([{"status": "skipped"}], None, None),
+        ([{"status": "wrong"}], None, Rating.Again),
+        ([{"status": "wrong"}, {"status": "correct"}], None, Rating.Hard),
+        ([{"status": "wrong"}, {"status": "wrong"}, {"status": "correct"}], None, Rating.Again),
+        ([{"status": "correct"}], None, Rating.Good),
         ([{"status": "correct"}], False, Rating.Good),
         ([{"status": "correct"}], True, Rating.Easy),
+        ([{"status": "correct"}, {"status": "wrong"}], True, Rating.Easy),
     ],
 )
-def test_rating_mapping(attempts, easy, expected):
-    assert rating_from_attempts(attempts, easy=easy) == expected
+def test_rating_mapping(attempts, previous_first_correct, expected):
+    assert determine_fsrs_rating(
+        attempts,
+        previous_first_attempt_correct=previous_first_correct,
+    ) == expected
+
+
+def test_attempt_facts_distinguish_no_second_check_from_second_wrong():
+    no_second = attempt_facts([{"status": "wrong"}])
+    second_wrong = attempt_facts([{"status": "wrong"}, {"status": "wrong"}])
+    assert no_second.second_attempt_correct is None
+    assert second_wrong.second_attempt_correct is False
 
 
 @pytest.mark.parametrize("rating", list(Rating))

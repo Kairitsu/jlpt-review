@@ -1,5 +1,6 @@
 import importlib
 import json
+import uuid
 from pathlib import Path
 
 
@@ -31,6 +32,7 @@ def make_sentence(client, collection_id, index):
 
 def attempt(client, session_id, sentence, *, correct=False, skip=False):
     return client.post(f"/api/practice/sessions/{session_id}/attempts", json={
+        "attemptId": str(uuid.uuid4()),
         "sentenceId": sentence["id"],
         "action": "skip" if skip else "check",
         "answerOrder": sentence["correctOrder"] if correct else [],
@@ -75,7 +77,8 @@ def test_report_and_history_use_persisted_fsrs_rating_counts(tmp_path, monkeypat
     # Good: correct on the first check.
     assert attempt(client, session_id, sentences[2], correct=True).status_code == 200
     finish_question(client, session_id, sentences[2])
-    # Easy: correct on the first check with the explicit easy selection.
+    # Legacy Easy input is ignored: another first-check success is still Good
+    # because it belongs to a different sentence with no reliable history.
     assert attempt(client, session_id, sentences[3], correct=True).status_code == 200
     finish_question(client, session_id, sentences[3], easy=True)
     # Skipped: no FSRS rating.
@@ -84,10 +87,10 @@ def test_report_and_history_use_persisted_fsrs_rating_counts(tmp_path, monkeypat
     assert client.post(f"/api/practice/sessions/{session_id}/complete", json={}).status_code == 200
 
     report = client.get(f"/api/reports/{session_id}").get_json()["report"]
-    expected = {"again": 1, "hard": 1, "good": 1, "easy": 1, "skipped": 1}
+    expected = {"again": 1, "hard": 1, "good": 2, "easy": 0, "skipped": 1}
     assert report["ratingCounts"] == expected
     assert [item["rating"] for item in report["items"]] == [
-        "again", "hard", "good", "easy", None,
+        "again", "hard", "good", "good", None,
     ]
     assert report["collection"] == {
         "id": collection["id"], "name": collection["name"], "available": 5,
@@ -283,7 +286,7 @@ def test_force_complete_persists_unanswered_without_touching_fsrs(tmp_path, monk
     assert unanswered_item["answerText"] == unanswered["japanese"]
     assert unanswered_item["rating"] is None
     assert report["ratingCounts"] == {
-        "again": 1, "hard": 0, "good": 0, "easy": 1, "skipped": 0,
+        "again": 1, "hard": 0, "good": 1, "easy": 0, "skipped": 0,
     }
 
     duplicate = client.post(
@@ -421,7 +424,7 @@ def test_report_frontend_has_only_new_actions_and_route_scoped_fab():
     assert "将从该句集中重新随机抽取题目。" not in source
 
 
-def test_practice_exit_uses_cancellable_internal_dialog_and_only_finalizes_current_item():
+def test_practice_exit_uses_shared_idempotent_round_submission_and_report_route():
     source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
     exit_flow = source.split("async function confirmExitPractice(button) {", 1)[1].split(
         "const secondaryRoutes", 1
@@ -429,15 +432,24 @@ def test_practice_exit_uses_cancellable_internal_dialog_and_only_finalizes_curre
 
     assert source.count('data-action="exit-practice"') == 2
     assert "openExitPracticeDialog()" in source
-    assert "退出本轮练习？" in source
+    assert "提前结束并提交？" in source
+    assert "当前还没有完成任何题目" in source
+    assert "已经完成" in source and "尚未完成" in source
+    assert "未完成题目不会计入 FSRS，也不会被判定为错误或遗忘" in source
     assert "继续练习" in source
     assert "data-action=\"confirm-exit-practice\"" in source
+    assert "data-action=\"abandon-practice\"" in source
     assert "else if (action === 'exit-practice') openExitPracticeDialog();" in source
-    assert "退出后，本轮未完成的题目不会生成完整报告。确定退出吗？" not in source
-    assert "if (item?.checked) await finalizeCurrentQuestion();" in exit_flow
-    assert "/api/practice/sessions/${practice.sessionId}/complete" not in exit_flow
+    assert "completedPracticeCount(practice)" in source
+    assert "...roundSubmissionPayload(practice, true)" in exit_flow
+    assert "completionMode: 'early_exit'" in exit_flow
+    assert "/api/practice/sessions/${practice.sessionId}/complete" in exit_flow
+    assert "/sentences/${" not in exit_flow
+    assert "route('report', { reportId: submission.reportId })" in exit_flow
+    assert "finalizeCurrentQuestion" not in source
     assert "buttons.forEach(item => { item.disabled = true; });" in exit_flow
     assert "buttons.forEach(item => { item.disabled = false; });" in exit_flow
     assert "if (errorEl) errorEl.textContent = error.message;" in exit_flow
+    assert "if (!practice || practice.exiting) return;" in exit_flow
     assert "isExitPracticeDialogOpen() || isUnansweredPracticeDialogOpen()" in source
     assert "event.target.id === 'dialog'" in source

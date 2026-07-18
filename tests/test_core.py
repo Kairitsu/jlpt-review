@@ -1,6 +1,7 @@
 import importlib
 import json
 import sqlite3
+import uuid
 import pytest
 
 
@@ -80,7 +81,7 @@ def test_crud_practice_srs_report(tmp_path, monkeypatch):
     assert created.status_code == 201
     sentence = created.get_json()["sentence"]
     practice = client.post("/api/practice/sessions", json={"sentenceIds":[sentence["id"]]}).get_json()
-    wrong = client.post(f'/api/practice/sessions/{practice["sessionId"]}/attempts', json={"sentenceId":sentence["id"],"action":"check","answerOrder":list(reversed(sentence["correctOrder"]))})
+    wrong = client.post(f'/api/practice/sessions/{practice["sessionId"]}/attempts', json={"attemptId":str(uuid.uuid4()),"sentenceId":sentence["id"],"action":"check","answerOrder":list(reversed(sentence["correctOrder"]))})
     assert wrong.get_json()["status"] == "wrong"
     client.post(f'/api/practice/sessions/{practice["sessionId"]}/complete', json={})
     report = client.get(f'/api/reports/{practice["sessionId"]}').get_json()["report"]
@@ -154,9 +155,9 @@ def test_retry_current_replaces_attempt_and_final_result(tmp_path, monkeypatch):
     }).get_json()["sentence"]
     practice = client.post("/api/practice/sessions", json={"sentenceIds":[sentence["id"]]}).get_json()
     endpoint = f'/api/practice/sessions/{practice["sessionId"]}/attempts'
-    first = client.post(endpoint, json={"sentenceId":sentence["id"], "action":"check", "answerOrder":["first-ni"]})
+    first = client.post(endpoint, json={"attemptId":str(uuid.uuid4()), "sentenceId":sentence["id"], "action":"check", "answerOrder":["first-ni"]})
     assert first.get_json()["status"] == "wrong"
-    final = client.post(endpoint, json={"sentenceId":sentence["id"], "action":"check", "answerOrder":sentence["correctOrder"]})
+    final = client.post(endpoint, json={"attemptId":str(uuid.uuid4()), "sentenceId":sentence["id"], "action":"check", "answerOrder":sentence["correctOrder"]})
     assert final.get_json()["status"] == "correct"
     client.post(f'/api/practice/sessions/{practice["sessionId"]}/complete', json={})
     report = client.get(f'/api/reports/{practice["sessionId"]}').get_json()["report"]
@@ -185,6 +186,7 @@ def test_duplicate_chunk_text_matching_via_record_attempt(tmp_path, monkeypatch)
 
     # Id instances of the two 「に」 swapped; text sequence still に猫に.
     swapped = client.post(endpoint, json={
+        "attemptId": str(uuid.uuid4()),
         "sentenceId": sentence["id"],
         "action": "check",
         "answerOrder": ["second-ni", "middle", "first-ni"],
@@ -196,6 +198,7 @@ def test_duplicate_chunk_text_matching_via_record_attempt(tmp_path, monkeypatch)
 
     # Real order error must still fail.
     wrong = client.post(endpoint, json={
+        "attemptId": str(uuid.uuid4()),
         "sentenceId": sentence["id"],
         "action": "check",
         "answerOrder": ["middle", "first-ni", "second-ni"],
@@ -305,7 +308,7 @@ def _practice_once(client, sentence):
     practice = client.post("/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}).get_json()
     client.post(
         f'/api/practice/sessions/{practice["sessionId"]}/attempts',
-        json={"sentenceId": sentence["id"], "action": "check", "answerOrder": sentence["correctOrder"], "durationMs": 3000},
+        json={"attemptId": str(uuid.uuid4()), "sentenceId": sentence["id"], "action": "check", "answerOrder": sentence["correctOrder"], "durationMs": 3000},
     )
     client.post(
         f'/api/practice/sessions/{practice["sessionId"]}/sentences/{sentence["id"]}/complete',
@@ -411,7 +414,7 @@ def test_record_attempt_invalid_sentence_id_returns_400(tmp_path, monkeypatch):
     session_id = practice.get_json()["sessionId"]
     response = client.post(
         f"/api/practice/sessions/{session_id}/attempts",
-        json={"sentenceId": "bad", "action": "check", "answerOrder": []},
+        json={"attemptId": str(uuid.uuid4()), "sentenceId": "bad", "action": "check", "answerOrder": []},
     )
     assert response.status_code == 400
     assert response.get_json()["error"] == "参数无效"

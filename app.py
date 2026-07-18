@@ -19,11 +19,13 @@ from fsrs_service import (
     DESIRED_RETENTION,
     FSRS_VERSION,
     MAXIMUM_INTERVAL_DAYS,
+    RATING_POLICY_VERSION,
     RATING_LABELS_ZH,
     RATING_NAMES,
+    attempt_facts,
     card_fields,
+    determine_fsrs_rating,
     new_card,
-    rating_from_attempts,
     retrievability,
     review as fsrs_review,
 )
@@ -100,6 +102,19 @@ def _rating_counts(rows):
         elif row["final_status"] == "skipped":
             counts["skipped"] += 1
     return counts
+
+
+def _session_completion_metadata(row):
+    """Return stable report metadata for normal and early-exit submissions."""
+    completion_mode = row["completion_mode"] or "normal"
+    completed_count = sum(int(row[key] or 0) for key in ("correct", "wrong", "skipped"))
+    return {
+        "completionMode": completion_mode,
+        "endedEarly": completion_mode == "early_exit",
+        "plannedCount": int(row["total"] or 0),
+        "completedCount": completed_count,
+        "unansweredCount": int(row["unanswered"] or 0),
+    }
 
 
 def _report_collection(db, item_rows):
@@ -346,7 +361,38 @@ def _server_utc_offset_label() -> str:
     return f"{sign}{total_minutes // 60:02d}:{total_minutes % 60:02d}"
 
 
-def _finalize_question(db, session_id: int, sentence_id: int, *, easy: bool, enable_fuzzing: bool):
+def _previous_first_attempt_correct(db, session_id: int, sentence_id: int) -> bool | None:
+    """Return the preceding session's latest reliable first-check fact.
+
+    SQLite ``BEGIN IMMEDIATE`` serializes this read with the FSRS write, so two
+    finalizers cannot both consume the same stale sentence state.
+    """
+    row = db.execute(
+        """SELECT re.first_attempt_correct
+           FROM review_events re
+           JOIN practice_sessions previous_session ON previous_session.id=re.session_id
+           JOIN practice_sessions current_session ON current_session.id=?
+           JOIN practice_items pi
+             ON pi.session_id=re.session_id AND pi.sentence_id=re.sentence_id
+           WHERE re.sentence_id=?
+             AND re.session_id<>?
+             AND re.first_attempt_correct IS NOT NULL
+             AND pi.finalized_at IS NOT NULL
+             AND (
+               previous_session.created_at<current_session.created_at
+               OR (
+                 previous_session.created_at=current_session.created_at
+                 AND previous_session.id<current_session.id
+               )
+             )
+           ORDER BY previous_session.created_at DESC,previous_session.id DESC,re.id DESC
+           LIMIT 1""",
+        (session_id, sentence_id, session_id),
+    ).fetchone()
+    return None if row is None else bool(row["first_attempt_correct"])
+
+
+def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing: bool):
     """Finalize exactly one practice item inside the caller's transaction."""
     item = db.execute(
         "SELECT * FROM practice_items WHERE session_id=? AND sentence_id=?",
@@ -373,12 +419,23 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, easy: bool, ena
         }, None
 
     attempts = db.execute(
-        "SELECT * FROM attempts WHERE session_id=? AND sentence_id=? ORDER BY id",
+        """SELECT * FROM attempts
+           WHERE session_id=? AND sentence_id=?
+           ORDER BY attempt_number,id""",
         (session_id, sentence_id),
     ).fetchall()
     if not attempts:
         return None, "当前题还没有作答记录"
-    rating = rating_from_attempts(attempts, easy=easy)
+    facts = attempt_facts(attempts)
+    previous_first_correct = (
+        _previous_first_attempt_correct(db, session_id, sentence_id)
+        if facts.first_attempt_correct is True
+        else None
+    )
+    rating = determine_fsrs_rating(
+        attempts,
+        previous_first_attempt_correct=previous_first_correct,
+    )
     stamp = now_iso()
     final_status = "skipped" if rating is None else (
         "wrong" if rating is Rating.Again else "correct"
@@ -415,13 +472,19 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, easy: bool, ena
     before = outcome.before
     db.execute(
         """INSERT INTO review_events(
-             sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
+             sentence_id,session_id,rating,attempt_count,first_attempt_correct,
+             second_attempt_correct,final_attempt_correct,rating_policy_version,
+             reviewed_at,duration_ms,is_new,
              fsrs_state_before,fsrs_state_after,fsrs_step_before,fsrs_step_after,
              stability_before,stability_after,difficulty_before,difficulty_after,
              next_review_before,next_review_after,fsrs_version,created_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            sentence_id, session_id, int(rating), after["last_review_at"], duration_ms,
+            sentence_id, session_id, int(rating), facts.attempt_count,
+            int(facts.first_attempt_correct),
+            None if facts.second_attempt_correct is None else int(facts.second_attempt_correct),
+            int(facts.final_attempt_correct), RATING_POLICY_VERSION,
+            after["last_review_at"], duration_ms,
             1 if before["last_review_at"] is None else 0,
             before["fsrs_state"], after["fsrs_state"], before["fsrs_step"], after["fsrs_step"],
             before["stability"], after["stability"], before["difficulty"], after["difficulty"],
@@ -431,7 +494,7 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, easy: bool, ena
     db.execute(
         """UPDATE practice_items SET finalized_at=?,final_status=?,fsrs_rating=?,easy_selected=?
            WHERE session_id=? AND sentence_id=? AND finalized_at IS NULL""",
-        (stamp, final_status, int(rating), int(rating is Rating.Easy), session_id, sentence_id),
+        (stamp, final_status, int(rating), 0, session_id, sentence_id),
     )
     return {
         "finalized": True,
@@ -517,6 +580,23 @@ def _session_unanswered_rows(db, session_id: int):
            ORDER BY pi.position""",
         (session_id,),
     ).fetchall()
+
+
+def _session_completed_item_count(db, session_id: int) -> int:
+    """Count submitted items, including any item already finalized separately."""
+    return int(db.execute(
+        """SELECT COUNT(*) n FROM practice_items pi
+           WHERE pi.session_id=?
+             AND (
+               pi.finalized_at IS NOT NULL
+               OR EXISTS(
+                 SELECT 1 FROM attempts a
+                 WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id
+                   AND a.status IN ('correct','wrong')
+               )
+             )""",
+        (session_id,),
+    ).fetchone()["n"])
 
 
 def create_app(test_config=None):
@@ -975,6 +1055,16 @@ def create_app(test_config=None):
         except (ValueError, TypeError):
             return jsonify(error="参数无效"), 400
         action = str(body.get("action", "check"))
+        if action not in {"check", "skip"}:
+            return jsonify(error="核对动作无效"), 400
+        client_attempt_id = body.get("attemptId")
+        if (
+            not isinstance(client_attempt_id, str)
+            or not client_attempt_id.strip()
+            or len(client_attempt_id) > 128
+        ):
+            return jsonify(error="缺少有效的 attemptId"), 400
+        client_attempt_id = client_attempt_id.strip()
         answer = body.get("answerOrder")
         if not isinstance(answer, list):
             answer = []
@@ -984,32 +1074,63 @@ def create_app(test_config=None):
             duration_ms = 0
         stamp = now_iso()
         with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            duplicate = db.execute(
+                "SELECT * FROM attempts WHERE client_attempt_id=?",
+                (client_attempt_id,),
+            ).fetchone()
+            if duplicate:
+                if (
+                    duplicate["session_id"] != session_id
+                    or duplicate["sentence_id"] != sentence_id
+                ):
+                    return jsonify(error="attemptId 已用于其他核对请求"), 409
+                snapshot = json_load(duplicate["sentence_snapshot_json"], {})
+                status = duplicate["status"]
+                return jsonify(
+                    attemptId=duplicate["id"],
+                    clientAttemptId=duplicate["client_attempt_id"],
+                    attemptNumber=duplicate["attempt_number"],
+                    status=status,
+                    correctOrder=snapshot.get("correctOrder", []),
+                    correct=status == "correct",
+                    duplicate=True,
+                )
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
             row = db.execute("SELECT * FROM sentences WHERE id=?", (sentence_id,)).fetchone()
             item_row = db.execute(
-                "SELECT finalized_at FROM practice_items WHERE session_id=? AND sentence_id=?",
+                """SELECT finalized_at,unanswered_at FROM practice_items
+                   WHERE session_id=? AND sentence_id=?""",
                 (session_id, sentence_id),
             ).fetchone()
             if not practice or not row or not item_row:
                 return jsonify(error="练习或句子不存在"), 404
             if practice["completed_at"]:
                 return jsonify(error="本轮练习已经提交"), 409
-            if item_row["finalized_at"]:
+            if item_row["finalized_at"] or item_row["unanswered_at"]:
                 return jsonify(error="当前题已经结束"), 409
             item = sentence_dict(row)
             status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"], item["chunks"]) else "wrong")
+            attempt_number = db.execute(
+                """SELECT COALESCE(MAX(attempt_number),0)+1 next_number
+                   FROM attempts WHERE session_id=? AND sentence_id=?""",
+                (session_id, sentence_id),
+            ).fetchone()["next_number"]
             cursor = db.execute(
                 """INSERT INTO attempts(
-                     session_id,sentence_id,status,answer_order_json,sentence_snapshot_json,
-                     duration_ms,created_at
-                   ) VALUES(?,?,?,?,?,?,?)""",
+                     session_id,sentence_id,client_attempt_id,attempt_number,status,
+                     answer_order_json,sentence_snapshot_json,duration_ms,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
-                    session_id, sentence_id, status, json.dumps(answer),
+                    session_id, sentence_id, client_attempt_id, attempt_number,
+                    status, json.dumps(answer),
                     json.dumps(sentence_snapshot(row), ensure_ascii=False), duration_ms, stamp,
                 ),
             )
         return jsonify(
             attemptId=cursor.lastrowid,
+            clientAttemptId=client_attempt_id,
+            attemptNumber=attempt_number,
             status=status,
             correctOrder=item["correctOrder"],
             correct=status == "correct",
@@ -1022,7 +1143,6 @@ def create_app(test_config=None):
             db.execute("BEGIN IMMEDIATE")
             result, error = _finalize_question(
                 db, session_id, sentence_id,
-                easy=bool(body.get("easy")),
                 enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]),
             )
             if error:
@@ -1032,14 +1152,12 @@ def create_app(test_config=None):
     @app.post("/api/practice/sessions/<int:session_id>/complete")
     def complete_session(session_id):
         body = request.get_json(silent=True) or {}
-        confirm_unanswered = body.get("confirmUnanswered") is True
-        raw_easy_ids = body.get("easySentenceIds", [])
-        if not isinstance(raw_easy_ids, list):
-            return jsonify(error="太简单题目格式无效"), 400
-        try:
-            easy_ids = {int(value) for value in raw_easy_ids}
-        except (TypeError, ValueError):
-            return jsonify(error="太简单题目格式无效"), 400
+        completion_mode = body.get("completionMode", "normal")
+        if completion_mode not in {"normal", "early_exit"}:
+            return jsonify(error="练习结束模式无效"), 400
+        confirm_unanswered = (
+            body.get("confirmUnanswered") is True or completion_mode == "early_exit"
+        )
         with get_db() as db:
             db.execute("BEGIN IMMEDIATE")
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
@@ -1049,17 +1167,17 @@ def create_app(test_config=None):
                 return jsonify(
                     ok=True,
                     reportId=session_id,
-                    unansweredCount=int(practice["unanswered"] or 0),
                     duplicate=True,
+                    **_session_completion_metadata(practice),
                 )
-            item_ids = {
-                row["sentence_id"]
-                for row in db.execute(
-                    "SELECT sentence_id FROM practice_items WHERE session_id=?", (session_id,)
-                )
-            }
-            if not easy_ids.issubset(item_ids):
-                return jsonify(error="太简单题目不属于本轮练习"), 400
+            completed_before_submit = _session_completed_item_count(db, session_id)
+            if completion_mode == "early_exit" and completed_before_submit == 0:
+                return jsonify(
+                    error="当前还没有完成任何题目",
+                    noCompletedItems=True,
+                    completedCount=0,
+                    unansweredCount=int(practice["total"] or 0),
+                ), 409
             draft_error = _persist_session_drafts(
                 db, session_id, body.get("draftAnswers")
             )
@@ -1087,7 +1205,6 @@ def create_app(test_config=None):
             for pending_item in pending:
                 _, error = _finalize_question(
                     db, session_id, pending_item["sentence_id"],
-                    easy=pending_item["sentence_id"] in easy_ids,
                     enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]),
                 )
                 if error:
@@ -1113,13 +1230,21 @@ def create_app(test_config=None):
             }
             db.execute(
                 """UPDATE practice_sessions SET correct=?,wrong=?,skipped=?,unanswered=?,
-                   completed_at=COALESCE(completed_at,?) WHERE id=?""",
+                   completion_mode=?,completed_at=COALESCE(completed_at,?) WHERE id=?""",
                 (
                     counts.get("correct", 0), counts.get("wrong", 0),
-                    counts.get("skipped", 0), unanswered_count, stamp, session_id,
+                    counts.get("skipped", 0), unanswered_count, completion_mode,
+                    stamp, session_id,
                 ),
             )
-        return jsonify(ok=True, reportId=session_id, unansweredCount=unanswered_count)
+            completed_practice = db.execute(
+                "SELECT * FROM practice_sessions WHERE id=?", (session_id,)
+            ).fetchone()
+        return jsonify(
+            ok=True,
+            reportId=session_id,
+            **_session_completion_metadata(completed_practice),
+        )
 
     @app.get("/api/reports")
     def reports():
@@ -1140,14 +1265,14 @@ def create_app(test_config=None):
             counts_by_session.setdefault(rating_row["session_id"], []).append(rating_row)
         for row in rows:
             row["ratingCounts"] = _rating_counts(counts_by_session.get(row["id"], []))
-            row["unansweredCount"] = int(row.get("unanswered") or 0)
+            row.update(_session_completion_metadata(row))
         return jsonify(reports=rows)
 
     @app.get("/api/reports/<int:session_id>")
     def report(session_id):
         with get_db() as db:
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
-            if not practice or practice["report_deleted_at"]:
+            if not practice or not practice["completed_at"] or practice["report_deleted_at"]:
                 return jsonify(error="报告不存在"), 404
             items_rows = _report_item_rows(db, session_id)
             collection = _report_collection(db, items_rows)
@@ -1173,7 +1298,7 @@ def create_app(test_config=None):
             })
         payload = dict(practice)
         payload["ratingCounts"] = _rating_counts(items_rows)
-        payload["unansweredCount"] = int(practice["unanswered"] or 0)
+        payload.update(_session_completion_metadata(practice))
         payload["collection"] = collection
         payload["retry"] = {
             "availableCount": len(retry_rows),
