@@ -213,13 +213,19 @@ def test_no_short_steps_migration_preserves_data_history_reports_and_stats(tmp_p
         ).fetchone())
 
     dashboard_before = client.get("/api/dashboard").get_json()
-    today_before = client.get("/api/stats/summary").get_json()["today"]
+    actual_days_before = [
+        day["actual"]
+        for day in client.get("/api/stats/summary").get_json()["timeline"]
+    ]
     backups_before = set((tmp_path / "backups").glob("*.sqlite3"))
 
     db.init_db(enable_fuzzing=False)
 
     dashboard_after = client.get("/api/dashboard").get_json()
-    today_after = client.get("/api/stats/summary").get_json()["today"]
+    actual_days_after = [
+        day["actual"]
+        for day in client.get("/api/stats/summary").get_json()["timeline"]
+    ]
     with db.get_db() as connection:
         assert preserved_counts(connection) == counts_before
         for table, rows in immutable_before.items():
@@ -247,7 +253,7 @@ def test_no_short_steps_migration_preserves_data_history_reports_and_stats(tmp_p
         ).fetchone()[0] == 1
 
     assert dashboard_after["collections"][0]["learned"] == dashboard_before["collections"][0]["learned"] == 1
-    assert today_after == today_before
+    assert actual_days_after == actual_days_before
 
     new_backups = set((tmp_path / "backups").glob("*.sqlite3")) - backups_before
     assert len(new_backups) == 1

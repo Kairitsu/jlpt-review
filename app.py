@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import sqlite3
@@ -37,7 +38,13 @@ from font_active import (
     schedule_font_rebuild,
     status as font_status,
 )
-from memory import is_valid_timezone, local_date, local_day_utc_bounds, parse_iso
+from memory import (
+    is_valid_timezone,
+    local_date,
+    local_date_utc_bounds,
+    local_day_utc_bounds,
+    parse_iso,
+)
 from security import hash_password, verify_password
 from tokenizer import furigana_segments, local_tokenize, validate_chunks
 
@@ -212,6 +219,158 @@ def answers_match(answer, correct, chunks):
 def user_timezone(db) -> str:
     """Configured IANA timezone, or "" to fall back to the server's local timezone."""
     return setting(db, "user_timezone", "")
+
+
+_STATS_RELATIVE_DAYS = (
+    (-2, "前天"),
+    (-1, "昨天"),
+    (0, "今天"),
+    (1, "明天"),
+    (2, "后天"),
+)
+_STATS_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+_STATS_RATINGS = (
+    (Rating.Again, "forgotten", "忘记"),
+    (Rating.Hard, "uncertain", "模糊"),
+    (Rating.Good, "recognized", "认识"),
+    (Rating.Easy, "mastered", "轻松掌握"),
+)
+_MEMORY_MASTERY_GROUPS = (
+    ("veryStrong", "95%–100%", "记忆非常稳固"),
+    ("strong", "90%–不足 95%", "当前较为稳固"),
+    ("atRisk", "80%–不足 90%", "已有一定遗忘风险"),
+    ("priority", "低于 80%", "建议优先复习"),
+)
+
+
+def _empty_daily_learning() -> dict:
+    return {
+        "completedCount": 0,
+        "newCount": 0,
+        "reviewCount": 0,
+        "durationMs": 0,
+        "ratingCounts": {key: 0 for _, key, _ in _STATS_RATINGS},
+    }
+
+
+def _daily_rating_summary(counts: dict[str, int]) -> dict:
+    valid_count = sum(counts.values())
+    return {
+        "validCount": valid_count,
+        "groups": [
+            {
+                "key": key,
+                "label": label,
+                "count": counts[key],
+                "percentage": round(counts[key] * 100 / valid_count, 1)
+                if valid_count else None,
+            }
+            for _, key, label in _STATS_RATINGS
+        ],
+    }
+
+
+def _stats_timeline(events, now_dt: datetime, tz_name: str) -> tuple[list[dict], list[tuple]]:
+    """Build five user-calendar days and aggregate persisted completion events."""
+    today = local_date(now_dt, tz_name=tz_name)
+    days = []
+    actual_by_date = {}
+    bounds = []
+    for offset, relative_label in _STATS_RELATIVE_DAYS:
+        day = today + timedelta(days=offset)
+        start, end = local_date_utc_bounds(day, tz_name=tz_name)
+        bounds.append((start, end))
+        actual = _empty_daily_learning() if offset <= 0 else None
+        if actual is not None:
+            actual_by_date[day.isoformat()] = actual
+        days.append({
+            "date": day.isoformat(),
+            "monthDay": f"{day.month}月{day.day}日",
+            "weekday": _STATS_WEEKDAYS[day.weekday()],
+            "relativeLabel": relative_label,
+            "isToday": offset == 0,
+            "actual": actual,
+            "due": None,
+        })
+
+    rating_key_by_value = {int(rating): key for rating, key, _ in _STATS_RATINGS}
+    for event in events:
+        reviewed_at = parse_iso(event.get("reviewed_at"))
+        if reviewed_at is None:
+            continue
+        actual = actual_by_date.get(local_date(reviewed_at, tz_name=tz_name).isoformat())
+        if actual is None:
+            continue
+        actual["completedCount"] += 1
+        if int(event.get("is_new") or 0):
+            actual["newCount"] += 1
+        else:
+            actual["reviewCount"] += 1
+        actual["durationMs"] += max(0, int(event.get("duration_ms") or 0))
+        rating_key = rating_key_by_value.get(event.get("rating"))
+        if rating_key:
+            actual["ratingCounts"][rating_key] += 1
+
+    for item in days:
+        actual = item["actual"]
+        if actual is None:
+            continue
+        counts = actual.pop("ratingCounts")
+        actual["ratings"] = _daily_rating_summary(counts)
+    return days, bounds
+
+
+def _memory_mastery_summary(sentences, now_dt: datetime) -> dict:
+    """Group official per-card recall probabilities without inventing a formula."""
+    counts = {key: 0 for key, _, _ in _MEMORY_MASTERY_GROUPS}
+    untracked_count = 0
+    for sentence in sentences:
+        if not sentence.get("last_review_at") or sentence.get("stability") is None:
+            untracked_count += 1
+            continue
+        try:
+            probability = retrievability(sentence, now_dt)
+        except (TypeError, ValueError, AttributeError):
+            untracked_count += 1
+            continue
+        if not math.isfinite(probability):
+            untracked_count += 1
+        elif probability >= 0.95:
+            counts["veryStrong"] += 1
+        elif probability >= 0.90:
+            counts["strong"] += 1
+        elif probability >= 0.80:
+            counts["atRisk"] += 1
+        else:
+            counts["priority"] += 1
+
+    effective_count = sum(counts.values())
+    groups = [
+        {
+            "key": key,
+            "label": label,
+            "count": counts[key],
+            "percentage": round(counts[key] * 100 / effective_count, 1)
+            if effective_count else None,
+            "status": status,
+            "includedInPercentage": True,
+        }
+        for key, label, status in _MEMORY_MASTERY_GROUPS
+    ]
+    groups.append({
+        "key": "untracked",
+        "label": "尚未形成有效复习记录",
+        "count": untracked_count,
+        "percentage": None,
+        "status": "尚无有效学习记录",
+        "includedInPercentage": False,
+    })
+    return {
+        "totalSentenceCount": len(sentences),
+        "effectiveSentenceCount": effective_count,
+        "untrackedSentenceCount": untracked_count,
+        "groups": groups,
+    }
 
 
 _DUE_STATUS_CONDITION = "s.next_review_at<=?"
@@ -1372,95 +1531,62 @@ def create_app(test_config=None):
             set_setting(db, "user_timezone", tz)
         return jsonify(ok=True, timezone=tz)
 
-    # ---- FSRS statistics ----
+    # ---- Learning overview statistics ----
 
     @app.get("/api/stats/summary")
     def stats_summary():
         now_dt = datetime.now(timezone.utc)
         now = now_dt.isoformat(timespec="seconds")
-        horizons = {
-            "days7": (now_dt + timedelta(days=7)).isoformat(timespec="seconds"),
-            "days30": (now_dt + timedelta(days=30)).isoformat(timespec="seconds"),
-            "days90": (now_dt + timedelta(days=90)).isoformat(timespec="seconds"),
-        }
-        lower_bound = (now_dt - timedelta(days=2)).isoformat(timespec="seconds")
         with get_db() as db:
             tz = user_timezone(db)
+            today = local_date(now_dt, tz_name=tz)
+            event_start = local_date_utc_bounds(
+                today - timedelta(days=2), tz_name=tz
+            )[0].isoformat(timespec="seconds")
+            event_end = local_date_utc_bounds(
+                today + timedelta(days=1), tz_name=tz
+            )[0].isoformat(timespec="seconds")
             events = [dict(row) for row in db.execute(
                 """SELECT rating,reviewed_at,duration_ms,is_new FROM review_events
-                   WHERE reviewed_at>=? ORDER BY reviewed_at""", (lower_bound,)
+                   WHERE reviewed_at>=? AND reviewed_at<? ORDER BY reviewed_at,id""",
+                (event_start, event_end),
             )]
             sentences = [dict(row) for row in db.execute("SELECT * FROM sentences")]
-            due_now = db.execute(
+            timeline, bounds = _stats_timeline(events, now_dt, tz)
+            current_due = db.execute(
                 "SELECT COUNT(*) n FROM sentences WHERE next_review_at<=?", (now,)
             ).fetchone()["n"]
-            forecast = {
-                key: db.execute(
-                    """SELECT COUNT(*) n FROM sentences
-                       WHERE next_review_at>? AND next_review_at<=?""", (now, cutoff)
-                ).fetchone()["n"]
-                for key, cutoff in horizons.items()
-            }
+            tomorrow_due = db.execute(
+                """SELECT COUNT(*) n FROM sentences
+                   WHERE next_review_at>=? AND next_review_at<?""",
+                (
+                    bounds[3][0].isoformat(timespec="seconds"),
+                    bounds[3][1].isoformat(timespec="seconds"),
+                ),
+            ).fetchone()["n"]
+            day_after_tomorrow_due = db.execute(
+                """SELECT COUNT(*) n FROM sentences
+                   WHERE next_review_at>=? AND next_review_at<?""",
+                (
+                    bounds[4][0].isoformat(timespec="seconds"),
+                    bounds[4][1].isoformat(timespec="seconds"),
+                ),
+            ).fetchone()["n"]
 
-        today = local_date(tz_name=tz)
-        today_events = [
-            event for event in events
-            if (parsed := parse_iso(event["reviewed_at"]))
-            and local_date(parsed, tz_name=tz) == today
-        ]
-        ratings = {name: 0 for name in ("again", "hard", "good", "easy")}
-        for event in today_events:
-            ratings[RATING_NAMES[Rating(event["rating"])]] += 1
-
-        stability_bins = [
-            {"label": "新卡", "min": None, "max": None, "count": 0},
-            {"label": "<1 天", "min": 0, "max": 1, "count": 0},
-            {"label": "1–7 天", "min": 1, "max": 7, "count": 0},
-            {"label": "7–30 天", "min": 7, "max": 30, "count": 0},
-            {"label": "30–90 天", "min": 30, "max": 90, "count": 0},
-            {"label": "≥90 天", "min": 90, "max": None, "count": 0},
-        ]
-        difficulty_bins = [
-            {"label": f"{start}–{start + 1}", "min": start, "max": start + 2, "count": 0}
-            for start in range(1, 10, 2)
-        ]
-        reviewed = []
-        for sentence in sentences:
-            stability = sentence["stability"]
-            if stability is None:
-                stability_bins[0]["count"] += 1
-            else:
-                for bucket in stability_bins[1:]:
-                    if stability >= bucket["min"] and (bucket["max"] is None or stability < bucket["max"]):
-                        bucket["count"] += 1
-                        break
-                reviewed.append(sentence)
-            difficulty = sentence["difficulty"]
-            if difficulty is not None:
-                index = min(4, max(0, int((float(difficulty) - 1) // 2)))
-                difficulty_bins[index]["count"] += 1
-
-        retention_pct = round(
-            sum(retrievability(sentence, now_dt) for sentence in reviewed) * 100 / len(reviewed), 1
-        ) if reviewed else None
+        timeline[2]["due"] = {"kind": "current", "count": current_due}
+        timeline[3]["due"] = {"kind": "scheduled", "count": tomorrow_due}
+        timeline[4]["due"] = {
+            "kind": "scheduled",
+            "count": day_after_tomorrow_due,
+        }
         return jsonify(
-            fsrs={
-                "version": FSRS_VERSION,
-                "desiredRetention": DESIRED_RETENTION,
-                "maximumIntervalDays": MAXIMUM_INTERVAL_DAYS,
+            generatedAt=now,
+            timezone={
+                "name": tz or None,
+                "source": "user" if tz else "server",
             },
-            today={
-                "learned": sum(int(event["is_new"] or 0) for event in today_events),
-                "reviewed": sum(not int(event["is_new"] or 0) for event in today_events),
-                "ratings": ratings,
-                "durationSec": round(sum(int(event["duration_ms"] or 0) for event in today_events) / 1000),
-            },
-            dueNow=due_now,
-            forecast=forecast,
-            stabilityDistribution=stability_bins,
-            difficultyDistribution=difficulty_bins,
-            retentionPct=retention_pct,
-            reviewedCards=len(reviewed),
+            timeline=timeline,
+            memoryMastery=_memory_mastery_summary(sentences, now_dt),
         )
 
     # Build content-subset fonts at startup (no-op if sources missing / already current).

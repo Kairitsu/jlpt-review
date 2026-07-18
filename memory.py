@@ -5,7 +5,7 @@ by :mod:`fsrs_service`, and all scheduler timestamps remain in UTC.
 """
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -51,9 +51,19 @@ def local_day_utc_bounds(
     follows the same server-timezone fallback as :func:`local_date`, including
     daylight-saving changes.
     """
-    zone = _resolve_zone(tz_name)
     dt = dt or datetime.now(timezone.utc)
+    zone = _resolve_zone(tz_name)
     day = dt.astimezone(zone).date() if zone else dt.astimezone().date()
+
+    return local_date_utc_bounds(day, tz_name=tz_name)
+
+
+def local_date_utc_bounds(
+    day: date,
+    tz_name: str | None = None,
+) -> tuple[datetime, datetime]:
+    """Return the UTC half-open interval for one local calendar date."""
+    zone = _resolve_zone(tz_name)
 
     def local_midnight(value):
         if zone:

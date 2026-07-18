@@ -2,10 +2,22 @@ import importlib
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fsrs import Rating, State
+
+
+FROZEN_NOW = datetime(2026, 1, 2, 15, 30, tzinfo=timezone.utc)
+
+
+class FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return FROZEN_NOW.replace(tzinfo=None)
+        return FROZEN_NOW.astimezone(tz)
 
 
 def load_app(tmp_path, monkeypatch):
@@ -60,6 +72,49 @@ def finish(client, session_id, sentence, easy=False):
 def stored_card(db, sentence_id):
     with db.get_db() as connection:
         return dict(connection.execute("SELECT * FROM sentences WHERE id=?", (sentence_id,)).fetchone())
+
+
+def add_review_event(
+    db_module,
+    sentence_id,
+    *,
+    reviewed_at,
+    rating=Rating.Good,
+    duration_ms=0,
+    is_new=False,
+):
+    with db_module.get_db() as connection:
+        sentence = connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (sentence_id,)
+        ).fetchone()
+        session_id = connection.execute(
+            """INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at)
+               VALUES('selected',?,1,?)""",
+            (json.dumps([sentence_id]), reviewed_at),
+        ).lastrowid
+        connection.execute(
+            """INSERT INTO review_events(
+                 sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
+                 fsrs_state_before,fsrs_state_after,fsrs_step_before,fsrs_step_after,
+                 stability_before,stability_after,difficulty_before,difficulty_after,
+                 next_review_before,next_review_after,fsrs_version,created_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                sentence_id, session_id, int(rating), reviewed_at,
+                duration_ms, int(is_new),
+                sentence["fsrs_state"], sentence["fsrs_state"],
+                sentence["fsrs_step"], sentence["fsrs_step"],
+                sentence["stability"], sentence["stability"],
+                sentence["difficulty"], sentence["difficulty"],
+                sentence["next_review_at"], sentence["next_review_at"],
+                sentence["fsrs_version"], reviewed_at,
+            ),
+        )
+
+
+def freeze_stats_clock(monkeypatch):
+    import app
+    monkeypatch.setattr(app, "datetime", FrozenDateTime)
 
 
 def test_new_sentence_is_immediately_due_fsrs_new_card(tmp_path, monkeypatch):
@@ -233,10 +288,13 @@ def test_timezone_only_changes_natural_day_not_fsrs_utc(tmp_path, monkeypatch):
     assert row["last_review_at"].endswith("+00:00")
     assert row["next_review_at"].endswith("+00:00")
     summary = client.get("/api/stats/summary").get_json()
-    assert summary["today"]["learned"] == 1
+    today = next(day for day in summary["timeline"] if day["isToday"])
+    assert today["actual"]["newCount"] == 1
 
 
-def test_fsrs_stats_and_read_only_settings(tmp_path, monkeypatch):
+def test_learning_overview_replaces_old_stats_fields_and_keeps_fsrs_settings(
+    tmp_path, monkeypatch
+):
     client, _ = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
     sentence = make_sentence(client, collection, "stats")
@@ -245,12 +303,221 @@ def test_fsrs_stats_and_read_only_settings(tmp_path, monkeypatch):
     check(client, session_id, sentence, True)
     finish(client, session_id, sentence)
     data = client.get("/api/stats/summary").get_json()
-    assert data["today"]["learned"] == 1
-    assert data["today"]["ratings"]["hard"] == 1
-    assert set(data["forecast"]) == {"days7", "days30", "days90"}
-    assert data["stabilityDistribution"] and data["difficultyDistribution"]
-    assert data["retentionPct"] is not None
+    today = next(day for day in data["timeline"] if day["isToday"])
+    assert today["actual"]["newCount"] == 1
+    assert next(
+        group for group in today["actual"]["ratings"]["groups"]
+        if group["label"] == "模糊"
+    )["count"] == 1
+    assert set(data) == {"generatedAt", "timezone", "timeline", "memoryMastery"}
+    for removed in (
+        "forecast", "retentionPct", "reviewedCards",
+        "stabilityDistribution", "difficultyDistribution", "fsrs", "today",
+    ):
+        assert removed not in data
     settings = client.get("/api/settings/fsrs").get_json()
     assert settings == {"system": "FSRS", "desiredRetention": 0.9, "maximumIntervalDays": 36500, "version": "6.3.1"}
     assert client.get("/api/settings/scheduler").status_code == 404
     assert client.put("/api/settings/scheduler", json={"mode": "fixed"}).status_code == 404
+
+
+def test_five_day_timeline_uses_user_timezone_event_counts_and_natural_day_due_ranges(
+    tmp_path, monkeypatch
+):
+    client, db = load_app(tmp_path, monkeypatch)
+    freeze_stats_clock(monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentences = [make_sentence(client, collection, f"timeline-{index}") for index in range(4)]
+    assert client.put(
+        "/api/settings/timezone", json={"timezone": "Asia/Shanghai"}
+    ).status_code == 200
+
+    # Frozen UTC time is 23:30 on Jan 2 in Shanghai. These events straddle UTC
+    # dates but must follow Shanghai's [00:00, 24:00) natural days.
+    add_review_event(
+        db, sentences[0]["id"], reviewed_at="2026-01-01T15:59:59+00:00",
+        rating=Rating.Again, duration_ms=500, is_new=True,
+    )
+    add_review_event(
+        db, sentences[0]["id"], reviewed_at="2026-01-01T16:00:00+00:00",
+        rating=Rating.Hard, duration_ms=30_500, is_new=True,
+    )
+    add_review_event(
+        db, sentences[0]["id"], reviewed_at="2026-01-02T15:59:59+00:00",
+        rating=Rating.Good, duration_ms=60_000, is_new=False,
+    )
+    with db.get_db() as connection:
+        connection.executemany(
+            "UPDATE sentences SET next_review_at=? WHERE id=?",
+            [
+                ("2025-12-20T00:00:00+00:00", sentences[0]["id"]),
+                (FROZEN_NOW.isoformat(timespec="seconds"), sentences[1]["id"]),
+                ("2026-01-02T16:00:00+00:00", sentences[2]["id"]),
+                ("2026-01-03T16:00:00+00:00", sentences[3]["id"]),
+            ],
+        )
+
+    data = client.get("/api/stats/summary").get_json()
+    timeline = data["timeline"]
+    assert data["generatedAt"] == FROZEN_NOW.isoformat(timespec="seconds")
+    assert data["timezone"] == {"name": "Asia/Shanghai", "source": "user"}
+    assert [day["date"] for day in timeline] == [
+        "2025-12-31", "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04",
+    ]
+    assert [day["relativeLabel"] for day in timeline] == [
+        "前天", "昨天", "今天", "明天", "后天",
+    ]
+    assert all(
+        datetime.fromisoformat(right["date"]).date()
+        - datetime.fromisoformat(left["date"]).date() == timedelta(days=1)
+        for left, right in zip(timeline, timeline[1:])
+    )
+    assert timeline[0]["actual"]["completedCount"] == 0
+    yesterday = timeline[1]["actual"]
+    assert yesterday["completedCount"] == yesterday["newCount"] + yesterday["reviewCount"] == 1
+    today = timeline[2]["actual"]
+    assert today["completedCount"] == today["newCount"] + today["reviewCount"] == 2
+    assert today["durationMs"] == 90_500
+    assert today["ratings"]["validCount"] == 2
+    assert sum(group["count"] for group in today["ratings"]["groups"]) == 2
+    assert {group["label"]: group["percentage"] for group in today["ratings"]["groups"]} == {
+        "忘记": 0.0, "模糊": 50.0, "认识": 50.0, "轻松掌握": 0.0,
+    }
+    assert timeline[3]["actual"] is None and timeline[4]["actual"] is None
+    assert timeline[0]["due"] is None and timeline[1]["due"] is None
+    assert timeline[2]["due"] == {"kind": "current", "count": 2}
+    assert timeline[3]["due"] == {"kind": "scheduled", "count": 1}
+    assert timeline[4]["due"] == {"kind": "scheduled", "count": 1}
+
+
+def test_empty_learning_days_and_ratings_distinguish_zero_from_future_no_data(
+    tmp_path, monkeypatch
+):
+    client, _ = load_app(tmp_path, monkeypatch)
+    freeze_stats_clock(monkeypatch)
+    data = client.get("/api/stats/summary").get_json()
+    for day in data["timeline"][:3]:
+        assert day["actual"]["completedCount"] == 0
+        assert day["actual"]["durationMs"] == 0
+        assert day["actual"]["ratings"]["validCount"] == 0
+        assert all(
+            group["percentage"] is None
+            for group in day["actual"]["ratings"]["groups"]
+        )
+    assert data["timeline"][3]["actual"] is None
+    assert data["timeline"][4]["actual"] is None
+    assert data["memoryMastery"]["effectiveSentenceCount"] == 0
+    assert data["memoryMastery"]["untrackedSentenceCount"] == 0
+
+
+def test_rating_percentages_exclude_skipped_unanswered_and_items_without_events(
+    tmp_path, monkeypatch
+):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    rated = make_sentence(client, collection, "rated-only")
+    skipped = make_sentence(client, collection, "skipped")
+    unanswered = make_sentence(client, collection, "unanswered")
+
+    rated_session = start(client, rated)
+    assert check(client, rated_session, rated, True, duration_ms=1_250).status_code == 200
+    assert finish(client, rated_session, rated).status_code == 200
+
+    skipped_session = start(client, skipped)
+    assert client.post(
+        f"/api/practice/sessions/{skipped_session}/attempts",
+        json={
+            "attemptId": str(uuid.uuid4()),
+            "sentenceId": skipped["id"],
+            "action": "skip",
+            "answerOrder": [],
+        },
+    ).status_code == 200
+    assert finish(client, skipped_session, skipped).status_code == 200
+
+    unanswered_session = start(client, unanswered)
+    completed = client.post(
+        f"/api/practice/sessions/{unanswered_session}/complete",
+        json={
+            "confirmUnanswered": True,
+            "draftAnswers": [{"sentenceId": unanswered["id"], "answerOrder": []}],
+        },
+    )
+    assert completed.status_code == 200
+
+    with db.get_db() as connection:
+        assert connection.execute("SELECT COUNT(*) n FROM review_events").fetchone()["n"] == 1
+    today = next(
+        day for day in client.get("/api/stats/summary").get_json()["timeline"]
+        if day["isToday"]
+    )["actual"]
+    assert today["completedCount"] == 1
+    assert today["durationMs"] == 1_250
+    assert today["ratings"]["validCount"] == 1
+    groups = {group["key"]: group for group in today["ratings"]["groups"]}
+    assert groups["recognized"]["count"] == 1
+    assert groups["recognized"]["percentage"] == 100.0
+    assert sum(group["count"] for group in groups.values()) == 1
+
+
+def test_memory_mastery_uses_official_service_boundary_and_exclusive_ranges(
+    tmp_path, monkeypatch
+):
+    client, db = load_app(tmp_path, monkeypatch)
+    freeze_stats_clock(monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    tracked = [make_sentence(client, collection, f"memory-{index}") for index in range(6)]
+    untracked = make_sentence(client, collection, "memory-untracked")
+    with db.get_db() as connection:
+        connection.executemany(
+            """UPDATE sentences
+               SET last_review_at=?,stability=1.0,difficulty=5.0 WHERE id=?""",
+            [("2026-01-01T00:00:00+00:00", item["id"]) for item in tracked],
+        )
+
+    probabilities = dict(zip(
+        [item["id"] for item in tracked],
+        [0.95, 0.949, 0.90, 0.899, 0.80, 0.799],
+        strict=True,
+    ))
+    calls = []
+    import app
+
+    def official_probability(row, now):
+        calls.append((row["id"], now))
+        return probabilities[row["id"]]
+
+    monkeypatch.setattr(app, "retrievability", official_probability)
+    mastery = client.get("/api/stats/summary").get_json()["memoryMastery"]
+    groups = {group["key"]: group for group in mastery["groups"]}
+    assert {sentence_id for sentence_id, _ in calls} == set(probabilities)
+    assert all(now == FROZEN_NOW for _, now in calls)
+    assert mastery["totalSentenceCount"] == 7
+    assert mastery["effectiveSentenceCount"] == 6
+    assert mastery["untrackedSentenceCount"] == 1
+    assert [groups[key]["count"] for key in ("veryStrong", "strong", "atRisk", "priority")] == [1, 2, 2, 1]
+    assert sum(groups[key]["count"] for key in ("veryStrong", "strong", "atRisk", "priority")) == 6
+    assert [groups[key]["percentage"] for key in ("veryStrong", "strong", "atRisk", "priority")] == [16.7, 33.3, 33.3, 16.7]
+    assert groups["untracked"] == {
+        "key": "untracked",
+        "label": "尚未形成有效复习记录",
+        "count": 1,
+        "percentage": None,
+        "status": "尚无有效学习记录",
+        "includedInPercentage": False,
+    }
+    assert untracked["id"] not in {sentence_id for sentence_id, _ in calls}
+
+
+def test_stats_frontend_keeps_chartjs_and_has_lifecycle_and_keyboard_controls():
+    root = Path(__file__).parents[1]
+    html = (root / "static" / "index.html").read_text()
+    source = (root / "static" / "stats.js").read_text()
+    assert '/static/vendor/chart.umd.min.js' in html
+    assert "destroyStatsCharts" in source
+    assert ".destroy()" in source
+    assert "stats-view" in source
+    assert "stats-series" in source
+    assert "restore" in source
+    assert "aria-pressed" in source
+    assert "keydown" in source

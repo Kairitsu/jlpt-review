@@ -15,61 +15,61 @@
 
 /* ---- Stats page ---- */
 .stats-page{padding-bottom:8px;letter-spacing:0;font-family:"Noto Sans SC",system-ui,-apple-system,sans-serif}
-.stats-grade-hint{text-align:left;margin:12px 0 0;line-height:1.75}
-.stats-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:12px 0 16px}
-.stats-tabs{display:flex;flex:1;gap:4px;background:rgba(255,255,255,.75);border:1px solid var(--border);border-radius:999px;padding:4px;overflow-x:auto}
-.stats-tab{flex:1;min-width:max-content;border:0;background:transparent;border-radius:999px;min-height:40px;padding:8px 12px;color:var(--muted);font-weight:700;font-size:13px;white-space:nowrap}
-.stats-tab.active{background:var(--mint);color:var(--primary);box-shadow:0 1px 0 rgba(20,107,90,.06)}
-.stats-card{padding:18px 16px 20px;width:100%;max-width:100%}
-.stats-panel{width:100%}
-/* Chart area: full card width; height driven by viewport, not fixed canvas pixels */
-.stats-chart-scroll{
-  width:100%;
-  max-width:100%;
-  overflow-x:auto;
-  overflow-y:hidden;
-  -webkit-overflow-scrolling:touch;
-  overscroll-behavior-x:contain;
-}
-.stats-chart-wrap{
-  position:relative;
-  width:100%;
-  min-width:100%;
-  height:clamp(360px,42vw,420px);
-}
-.stats-chart-wrap.tall{height:clamp(360px,42vw,420px)}
+.stats-card{padding:22px 24px 20px;width:100%;max-width:100%;margin-bottom:22px;overflow:hidden}
+.stats-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;margin-bottom:16px}
+.stats-card-head h2{margin:0;font-size:22px;line-height:1.35}
+.stats-card-head p{margin:3px 0 0;color:var(--muted);font-size:14px}
+.stats-timezone{display:inline-flex;align-items:center;min-height:32px;padding:4px 11px;border-radius:999px;background:var(--mint);color:var(--primary);font-size:12px;font-weight:750;white-space:nowrap}
+.stats-view-switch{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:4px;max-width:500px;margin-bottom:12px;padding:4px;border:1px solid var(--border);border-radius:16px;background:#f6fbfa}
+.stats-view-button{min-height:44px;padding:7px 12px;border:0;border-radius:12px;background:transparent;color:var(--muted);font-size:14px;font-weight:750}
+.stats-view-button.active{background:#fff;color:var(--primary);box-shadow:0 3px 10px rgba(30,91,78,.08)}
+.stats-series-controls{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+.stats-filter,.stats-restore{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:44px;padding:7px 12px;border:1px solid var(--border);border-radius:999px;background:#fff;color:var(--muted);font-size:13px;font-weight:700;line-height:1.25}
+.stats-filter i,.stats-mastery-item>i{display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--series-color);flex:0 0 auto}
+.stats-filter:not(.active){opacity:.55;text-decoration:line-through}
+.stats-filter.active{border-color:#a7c9c0;color:var(--ink);background:#f9fcfb}
+.stats-restore{color:var(--primary);border-color:transparent;background:var(--mint)}
+.stats-chart-wrap{position:relative;width:100%;min-width:0}
+.stats-calendar-chart{height:clamp(300px,31vw,350px)}
+.stats-memory-chart{height:clamp(260px,27vw,310px)}
 .stats-chart-wrap canvas{display:block;width:100%!important;height:100%!important}
-.stats-legend-row,.stats-retention-legend{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:14px;justify-content:center}
-.legend-item{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
-.legend-item i{display:inline-block;width:10px;height:10px;border-radius:3px;flex-shrink:0}
-.stats-footnote{margin:14px 0 0;text-align:center;color:var(--muted);font-size:13px}
-.stats-toolbar{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
-.stats-toggle{display:flex;flex-wrap:wrap;gap:6px}
-.stats-toggle .count-option{min-width:0;flex:0 1 auto}
-.stats-today-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px}
-.stats-today-grid>div{background:#f6fbfa;border:1px solid var(--border);border-radius:14px;padding:12px 8px;text-align:center}
-.stats-today-grid strong{display:block;font-size:20px;line-height:1.2;color:var(--ink);font-variant-numeric:tabular-nums}
-.stats-today-grid span{color:var(--muted);font-size:12px}
-.stats-pressure{display:block;width:100%;margin-top:14px;border:1px solid #f0d9a8;background:#fff8e8;color:#8a641d;border-radius:14px;padding:12px 14px;text-align:left;font-weight:650;font-size:14px}
+.stats-day-summaries{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin-top:14px}
+.stats-day-summary{min-width:0;padding:11px 12px;border:1px solid var(--border);border-radius:14px;background:#f8fcfb}
+.stats-day-summary.today{border-color:#83bcae;background:var(--mint);box-shadow:inset 0 0 0 1px rgba(20,107,90,.08)}
+.stats-day-summary strong,.stats-day-summary span,.stats-day-summary small{display:block}
+.stats-day-summary strong{color:var(--primary);font-size:15px}
+.stats-day-summary span{color:var(--muted);font-size:11px}
+.stats-day-summary small{margin-top:5px;color:var(--ink);font-size:12px;line-height:1.55}
+.stats-data-point:focus-visible{outline:3px solid rgba(20,107,90,.24);outline-offset:2px}
+.stats-grade-hint{display:grid;grid-template-columns:1fr 1fr;gap:4px 22px;margin:14px 0 0;padding:13px 15px;border-radius:14px;background:#f6fbfa;color:var(--muted);font-size:12px;line-height:1.65}
+.stats-grade-hint p{margin:0}.stats-grade-hint strong{color:var(--ink)}
+.stats-mastery-list{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin-top:14px}
+.stats-mastery-item{display:grid;grid-template-columns:auto minmax(0,1fr);gap:9px;align-items:start;padding:11px 12px;border:1px solid var(--border);border-radius:14px;background:#f8fcfb}
+.stats-mastery-item>i{margin-top:6px}
+.stats-mastery-item strong,.stats-mastery-item span,.stats-mastery-item small{display:block}
+.stats-mastery-item strong{font-size:12px;line-height:1.45}.stats-mastery-item span{margin-top:3px;color:var(--ink);font-size:12px;font-weight:700}.stats-mastery-item small{margin-top:3px;color:var(--muted);font-size:11px;line-height:1.45}
+.stats-empty-inline{margin:10px 0;padding:16px;border:1px dashed #b7d6ce;border-radius:14px;background:#f8fcfb;color:var(--muted);text-align:center;font-size:14px}
+.stats-footnote{margin:15px 0 0;text-align:left;color:var(--muted);font-size:12px;line-height:1.65}
 .home-stats-entry{display:block;width:100%;text-align:left;margin-top:22px;cursor:pointer;padding:20px 24px}
 .home-stats-entry .section-title{margin-bottom:4px}
 .bottom-nav button{min-width:72px}
 @media(max-width:800px){
-  .stats-chart-wrap,.stats-chart-wrap.tall{height:clamp(300px,48vw,380px)}
-  .stats-today-grid{grid-template-columns:repeat(2,1fr)}
+  .stats-card{padding:20px 18px}
+  .stats-day-summaries,.stats-mastery-list{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .stats-day-summary.today{grid-column:auto}
   .bottom-nav button{min-width:64px;font-size:12px;padding:0 4px}
-  .stats-toolbar{gap:12px}
 }
 @media(max-width:480px){
-  .stats-tabs{padding:3px}
-  .stats-tab{font-size:12px;padding:8px 8px;min-height:38px}
-  .stats-toolbar{flex-direction:column;align-items:stretch}
-  .stats-toggle{width:100%}
-  .stats-toggle .count-option{flex:1 1 auto;min-width:0;text-align:center}
-  /* Taller on narrow phones so charts are not pancake-flat */
-  .stats-chart-wrap,.stats-chart-wrap.tall{height:clamp(320px,55vh,400px)}
-  .stats-legend-row,.stats-retention-legend{gap:8px 12px;font-size:12px}
-  .legend-item{font-size:12px}
+  .stats-page .page-head{margin-bottom:18px}
+  .stats-card{padding:18px 14px;margin-bottom:16px}
+  .stats-card-head{gap:10px;flex-direction:column}.stats-card-head h2{font-size:20px}
+  .stats-view-switch{width:100%;max-width:none}.stats-view-button{padding:7px 5px;font-size:12px}
+  .stats-series-controls{gap:7px}.stats-filter,.stats-restore{flex:1 1 auto;min-width:calc(50% - 7px);padding-inline:9px;font-size:12px}
+  .stats-memory-controls .stats-filter{flex-basis:100%;justify-content:flex-start}
+  .stats-calendar-chart{height:320px}.stats-memory-chart{height:285px}
+  .stats-day-summaries,.stats-mastery-list{grid-template-columns:1fr}
+  .stats-grade-hint{grid-template-columns:1fr;padding:12px}
+  .stats-day-summary,.stats-mastery-item{padding:10px 11px}
 }
 
 /* ---- Practice report refresh ---- */
