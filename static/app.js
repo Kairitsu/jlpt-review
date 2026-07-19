@@ -510,7 +510,8 @@ function selectionHtml(s, item, map) {
     return `<button class="chosen ${cls}" lang="ja" data-action="unchoose" data-index="${i}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${esc(text)}</button>`;
   }).join('')}</div>`;
 }
-function practiceReadyToCheck(item = currentPracticeItem()) { return Boolean(item) && !item.checked && !item.submitting && item.selected.length === item.candidates.length; }
+function practiceAnswerComplete(item = currentPracticeItem()) { return Boolean(item) && item.selected.length === item.candidates.length; }
+function practiceReadyToCheck(item = currentPracticeItem(), practice = state.practice) { return Boolean(practice) && Boolean(item) && !item.checked && !item.submitting && !practice.submittingRound && !practice.exiting; }
 function moveSelectedTo(id, targetIndex) {
   const p = state.practice;
   const item = currentPracticeItem(p);
@@ -539,9 +540,9 @@ function updatePracticeSelection() {
   const map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const composer = $('#practice-composer'); if (!composer) return;
   composer.innerHTML = selectionHtml(s, item, map);
-  $$('.candidate', view).forEach(button => { const used = item.selected.includes(button.dataset.id); button.disabled = used || item.checked || item.submitting || p.submittingRound; button.classList.toggle('used', used); });
+  $$('.candidate', view).forEach(button => { const used = item.selected.includes(button.dataset.id); button.disabled = used || item.checked || item.submitting || p.submittingRound || p.exiting; button.classList.toggle('used', used); });
   const checkButton = $('[data-action="check"]', view);
-  if (checkButton) checkButton.disabled = !practiceReadyToCheck(item);
+  if (checkButton) checkButton.disabled = !practiceReadyToCheck(item, p);
 }
 
 /** Practice-page pointer drag session (document-level; survives innerHTML re-renders of chips only via abort). */
@@ -746,10 +747,14 @@ function onPracticePointerCancel(event) {
   abortPracticeDrag();
 }
 
+function practiceDialogBusy() {
+  if (state.route !== 'practice') return false;
+  return Boolean(state.practice?.exiting || state.practice?.submittingRound || currentPracticeItem()?.submitting);
+}
 function onPracticeKeyDown(event) {
-  if (event.key === 'Escape' && (isExitPracticeDialogOpen() || isUnansweredPracticeDialogOpen())) {
+  if (event.key === 'Escape' && (isExitPracticeDialogOpen() || isUnansweredPracticeDialogOpen() || isIncompleteAnswerDialogOpen())) {
     event.preventDefault();
-    if (!state.practice?.exiting && !state.practice?.submittingRound) closeDialog();
+    if (!practiceDialogBusy()) closeDialog();
     return;
   }
   if (event.key === 'Escape' && practiceDrag) {
@@ -769,9 +774,9 @@ function renderPractice() {
   if (!p || !item) return route('home', {replace:true});
   const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
-  const ready = practiceReadyToCheck(item), busy = item.submitting || p.submittingRound;
+  const ready = practiceReadyToCheck(item, p), busy = item.submitting || p.submittingRound || p.exiting;
   const last = p.index === p.sentences.length - 1;
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${item.checked || !ready || busy ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, item) {
@@ -779,11 +784,22 @@ function answerDetails(s, map, item) {
   const correctJp = (Array.isArray(s.furigana) && s.furigana.length) ? rubyHtml(s.furigana) : esc(s.japanese);
   return `<div class="card answer-card"><h3>${item.result?.correct ? '回答正确' : '正确答案'}</h3>${!item.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${correctJp}</div><p>${esc(s.chinese)}</p></div>`;
 }
-async function record(action) {
+function openIncompleteAnswerDialog() {
+  const p = state.practice;
+  const item = currentPracticeItem(p);
+  if (!practiceReadyToCheck(item, p) || practiceAnswerComplete(item)) return;
+  openDialog(`<div class="incomplete-answer-dialog"><h1>直接查看答案？</h1><p class="incomplete-answer-copy">当前句子尚未排列完成。直接查看答案会将本次回答记录为错误，并参与本题的自动评分。</p><p id="incomplete-answer-error" class="form-error incomplete-answer-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="continue-incomplete-answer">继续作答</button><button class="btn primary" data-action="confirm-incomplete-answer">直接查看答案</button></div></div>`, { className: 'incomplete-answer-modal', label: '直接查看答案？' });
+}
+function isIncompleteAnswerDialogOpen() {
+  const dialog = $('#dialog');
+  return Boolean(dialog && !dialog.classList.contains('hidden') && $('.incomplete-answer-dialog', dialog));
+}
+async function record(action, { confirmIncomplete = false, button = null } = {}) {
   const p = state.practice;
   const item = currentPracticeItem(p);
   if (!p || !item || item.submitting || p.submittingRound || action !== 'check') return;
-  if (!practiceReadyToCheck(item)) { toast('请先把所有词块摆放完整'); return; }
+  if (!practiceReadyToCheck(item, p)) return;
+  if (!practiceAnswerComplete(item) && !confirmIncomplete) { openIncompleteAnswerDialog(); return; }
   const s = p.sentences[p.index];
   const answerOrder = [...item.selected];
   const answerKey = JSON.stringify(answerOrder);
@@ -791,6 +807,14 @@ async function record(action) {
     item.pendingAttempt = { id: createClientAttemptId(), answerKey };
   }
   const durationMs = Math.max(0, Date.now() - (item.questionStartedAt || Date.now()));
+  const dialogButtons = button ? $$('button', $('#dialog')) : [];
+  const oldLabel = button?.textContent || '';
+  if (button) {
+    dialogButtons.forEach(item => { item.disabled = true; });
+    button.textContent = '正在查看…';
+    const errorEl = $('#incomplete-answer-error');
+    if (errorEl) errorEl.textContent = '';
+  }
   item.submitting = true;
   renderPractice();
   try {
@@ -801,9 +825,16 @@ async function record(action) {
   } catch (error) {
     item.submitting = false;
     renderPractice();
+    if (button) {
+      dialogButtons.forEach(item => { item.disabled = false; });
+      button.textContent = oldLabel;
+      const errorEl = $('#incomplete-answer-error');
+      if (errorEl) errorEl.textContent = error.message;
+    }
     throw error;
   }
   item.submitting = false;
+  if (button) closeDialog();
   renderPractice();
 }
 function navigatePractice(delta) {
@@ -902,7 +933,7 @@ async function renderSettings() {
 
 document.addEventListener('click', async event => {
   if (event.target.id === 'dialog') {
-    if (!state.practice?.exiting && !state.practice?.submittingRound) closeDialog();
+    if (!practiceDialogBusy()) closeDialog();
     return;
   }
   const button = event.target.closest('button'); if (!button) return;
@@ -970,12 +1001,32 @@ document.addEventListener('click', async event => {
     else if (action === 'split-chunk') { if (state.selectedChunks.length !== 1) throw new Error('请先选中一个要拆分的词块'); const i = state.selectedChunks[0], item = state.draft.chunks[i], pos = Number(prompt(`“${item.text}” 在第几个字符后拆分？`, Math.max(1, Math.floor(item.text.length / 2)))); if (!Number.isInteger(pos) || pos <= 0 || pos >= item.text.length) throw new Error('拆分位置必须位于词块内部'); state.draft.chunks.splice(i, 1, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(0,pos)}, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(pos)}); state.selectedChunks = []; renderPreview(); }
     else if (action === 'merge-chunks') { const [a,b] = state.selectedChunks; if (state.selectedChunks.length !== 2 || b !== a + 1) throw new Error('请按顺序选中两个相邻词块'); const x = state.draft.chunks[a], y = state.draft.chunks[b]; state.draft.chunks.splice(a, 2, {id:crypto.randomUUID().slice(0,12), text:x.text + y.text}); state.selectedChunks = []; renderPreview(); }
     else if (action === 'edit-chunk') { if (state.selectedChunks.length !== 1) throw new Error('请先选中一个词块'); const i = state.selectedChunks[0], item = state.draft.chunks[i], text = prompt('词块文字（修改后仍须无损还原原句）：', item.text); if (text === null) return; if (!text) throw new Error('词块文字不能为空'); state.draft.chunks[i] = {id:item.id, text}; renderPreview(); }
-    else if (action === 'save-sentence') { const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id)}; if (state.editing) await api(`/api/sentences/${state.editing.id}`, {method:'PUT', body:JSON.stringify(payload)}); else await api('/api/sentences', {method:'POST', body:JSON.stringify(payload)}); if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); toast('句子已保存'); state.editing = null; state.draft = null; setTimeout(() => { const link = document.querySelector('link[href*="faces.css"]'); if (link) link.href = `/api/fonts/faces.css?t=${Date.now()}`; }, 2800); route('library'); }
+    else if (action === 'save-sentence') {
+      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id)};
+      const wasEditing = Boolean(state.editing);
+      if (wasEditing) await api(`/api/sentences/${state.editing.id}`, {method:'PUT', body:JSON.stringify(payload)});
+      else await api('/api/sentences', {method:'POST', body:JSON.stringify(payload)});
+      if (typeof window.clearStatsCache === 'function') window.clearStatsCache();
+      toast('句子已保存');
+      state.editing = null; state.draft = null; state.selectedChunks = [];
+      setTimeout(() => { const link = document.querySelector('link[href*="faces.css"]'); if (link) link.href = `/api/fonts/faces.css?t=${Date.now()}`; }, 2800);
+      if (wasEditing) { route('library'); }
+      else {
+        const collectionId = Number($('#collection')?.value);
+        if (collectionId) { state.activeCollection = collectionId; localStorage.setItem('activeCollection', collectionId); }
+        const chinese = $('#chinese'), japanese = $('#japanese'), slot = $('#preview-slot');
+        if (chinese) chinese.value = '';
+        if (japanese) japanese.value = '';
+        if (slot) slot.innerHTML = '';
+        window.scrollTo(0, 0);
+        chinese?.focus();
+      }
+    }
     else if (action === 'practice-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await startPractice({sentenceIds:ids}); }
     else if (action === 'edit-sentence') { state.editing = (await api(`/api/sentences/${button.dataset.id}`)).sentence; route('add', {editingId:state.editing.id}); }
     else if (action === 'delete-sentence') { if (confirm('确定删除这条句子吗？')) { await api(`/api/sentences/${button.dataset.id}`, {method:'DELETE'}); if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); reloadLibrary(); } }
     else if (action === 'close-dialog') {
-      if (!state.practice?.exiting && !state.practice?.submittingRound) closeDialog();
+      if (!practiceDialogBusy()) closeDialog();
     }
     else if (action === 'manage-collection') { await ensureDashboard(); openManageCollectionDialog(); }
     else if (action === 'rename-collection') { const name = $('#rename-collection-name')?.value.trim(); if (!name) throw new Error('句集名称不能为空'); const id = state.activeCollection; await api(`/api/collections/${id}`, {method:'PATCH', body:JSON.stringify({name})}); state.dashboard = null; closeDialog(); toast('句集已重命名'); await renderLibrary(id); }
@@ -986,7 +1037,9 @@ document.addEventListener('click', async event => {
     else if (action === 'choose') { const p = state.practice, item = currentPracticeItem(p), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !item.candidates.includes(id) || item.selected.includes(id) || item.selected.length >= item.candidates.length) return; item.selected.push(id); updatePracticeSelection(); }
     else if (action === 'unchoose') { const p = state.practice, item = currentPracticeItem(p), index = Number(button.dataset.index); if (!p || !item || item.checked || item.submitting || p.submittingRound || !Number.isInteger(index) || index < 0 || index >= item.selected.length) return; item.selected.splice(index, 1); updatePracticeSelection(); }
     else if (action === 'reset') { const p = state.practice, item = currentPracticeItem(p); if (!p || !item || item.checked || item.submitting || p.submittingRound) return; item.selected = []; updatePracticeSelection(); }
-    else if (action === 'check') { if (!practiceReadyToCheck()) { toast('请先把所有词块摆放完整'); return; } await record('check'); }
+    else if (action === 'check') await record('check');
+    else if (action === 'continue-incomplete-answer') { if (!practiceDialogBusy()) closeDialog(); }
+    else if (action === 'confirm-incomplete-answer') await record('check', {confirmIncomplete:true, button});
     else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; item.selected = []; item.checked = false; item.result = null; item.submitting = false; item.pendingAttempt = null; item.questionStartedAt = Date.now(); renderPractice(); }
     else if (action === 'previous-question') navigatePractice(-1);
     else if (action === 'next-question') navigatePractice(1);

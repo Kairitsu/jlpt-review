@@ -136,6 +136,12 @@
 .unanswered-practice-error{margin:10px 0 -8px;min-height:0;text-align:center!important}
 .unanswered-practice-error:empty{display:none}
 .unanswered-practice-modal .btn:disabled{cursor:wait}
+.incomplete-answer-modal{width:min(560px,100%)}
+.incomplete-answer-dialog h1{margin-top:0}
+.incomplete-answer-copy{margin:14px 0 0!important;text-align:left!important;color:var(--ink)!important;line-height:1.8}
+.incomplete-answer-error{margin:10px 0 -8px;min-height:0;text-align:center!important}
+.incomplete-answer-error:empty{display:none}
+.incomplete-answer-modal .btn:disabled{cursor:wait}
 
 @media(max-width:800px){
   .practice-actions,.practice-actions:has(.retry-current){grid-template-columns:1fr 1fr}
@@ -148,7 +154,7 @@
 }
 
 @media(max-width:480px){
-  .unanswered-practice-modal{padding:22px 18px}
-  .unanswered-practice-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
-  .unanswered-practice-modal .form-actions .btn{width:100%;min-height:48px;padding-inline:10px}
+  .unanswered-practice-modal,.incomplete-answer-modal{padding:22px 18px}
+  .unanswered-practice-modal .form-actions,.incomplete-answer-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
+  .unanswered-practice-modal .form-actions .btn,.incomplete-answer-modal .form-actions .btn{width:100%;min-height:48px;padding-inline:10px}
 }

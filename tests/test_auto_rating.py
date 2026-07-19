@@ -61,6 +61,26 @@ def submit_check(
     attempt_id=None,
     duration_ms=0,
 ):
+    answer_order = sentence["correctOrder"] if correct else []
+    return submit_answer_order(
+        client,
+        session_id,
+        sentence,
+        answer_order,
+        attempt_id=attempt_id,
+        duration_ms=duration_ms,
+    )
+
+
+def submit_answer_order(
+    client,
+    session_id,
+    sentence,
+    answer_order,
+    *,
+    attempt_id=None,
+    duration_ms=0,
+):
     attempt_id = attempt_id or str(uuid.uuid4())
     response = client.post(
         f"/api/practice/sessions/{session_id}/attempts",
@@ -68,7 +88,7 @@ def submit_check(
             "attemptId": attempt_id,
             "sentenceId": sentence["id"],
             "action": "check",
-            "answerOrder": sentence["correctOrder"] if correct else [],
+            "answerOrder": answer_order,
             "durationMs": duration_ms,
         },
     )
@@ -263,6 +283,61 @@ def test_duplicate_attempt_request_returns_original_and_cannot_invent_second_wro
         client, session_id, sentence, False, attempt_id=attempt_id
     )
     assert after_completion["duplicate"] is True
+
+
+def test_blank_and_partial_answer_orders_use_normal_wrong_rating_rules(
+    tmp_path, monkeypatch
+):
+    flask_app, db = load_app(tmp_path, monkeypatch)
+    client = flask_app.test_client()
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    response = client.post("/api/sentences", json={
+        "collectionId": collection_id,
+        "chinese": "未完成核对",
+        "japanese": "文を作る",
+        "chunks": [
+            {"id": "incomplete-first", "text": "文を"},
+            {"id": "incomplete-second", "text": "作る"},
+        ],
+        "correctOrder": ["incomplete-first", "incomplete-second"],
+    })
+    assert response.status_code == 201
+    sentence = response.get_json()["sentence"]
+
+    blank_session = start_session(client, sentence)
+    blank_attempt_id = str(uuid.uuid4())
+    blank = submit_answer_order(
+        client, blank_session, sentence, [], attempt_id=blank_attempt_id
+    )
+    duplicate = submit_answer_order(
+        client, blank_session, sentence, [], attempt_id=blank_attempt_id
+    )
+    assert blank["status"] == duplicate["status"] == "wrong"
+    assert duplicate["duplicate"] is True
+    assert complete_round(client, blank_session, sentence, []) == "again"
+
+    partial_session = start_session(client, sentence)
+    partial = submit_answer_order(
+        client, partial_session, sentence, [sentence["correctOrder"][0]]
+    )
+    corrected = submit_answer_order(
+        client, partial_session, sentence, sentence["correctOrder"]
+    )
+    assert partial["status"] == "wrong"
+    assert corrected["status"] == "correct"
+    assert complete_round(client, partial_session, sentence, []) == "hard"
+
+    with db.get_db() as connection:
+        blank_attempts = connection.execute(
+            "SELECT status FROM attempts WHERE session_id=? ORDER BY attempt_number",
+            (blank_session,),
+        ).fetchall()
+        partial_attempts = connection.execute(
+            "SELECT status FROM attempts WHERE session_id=? ORDER BY attempt_number",
+            (partial_session,),
+        ).fetchall()
+    assert [row["status"] for row in blank_attempts] == ["wrong"]
+    assert [row["status"] for row in partial_attempts] == ["wrong", "correct"]
 
 
 def test_attempt_numbers_are_backend_ordered_and_client_id_is_globally_unique(
@@ -545,3 +620,35 @@ def test_frontend_has_no_manual_easy_and_preserves_attempt_id_across_retry():
     )[0]
     assert "/attempts" not in navigation and "/complete" not in navigation
 
+
+def test_incomplete_answer_check_uses_modal_and_preserves_normal_attempt_flow():
+    source = (Path(__file__).parents[1] / "static" / "app.js").read_text()
+    complete_predicate = source.split(
+        "function practiceAnswerComplete", 1
+    )[1].split("function practiceReadyToCheck", 1)[0]
+    ready_predicate = source.split(
+        "function practiceReadyToCheck", 1
+    )[1].split("function moveSelectedTo", 1)[0]
+    record_flow = source.split(
+        "async function record(action", 1
+    )[1].split("function navigatePractice", 1)[0]
+
+    assert "item.selected.length === item.candidates.length" in complete_predicate
+    assert "selected.length" not in ready_predicate
+    assert "!item.checked" in ready_predicate
+    assert "!item.submitting" in ready_predicate
+    assert "!practice.submittingRound" in ready_predicate
+    assert "!practice.exiting" in ready_predicate
+    assert "当前句子尚未排列完成。直接查看答案会将本次回答记录为错误，并参与本题的自动评分。" in source
+    assert 'data-action="continue-incomplete-answer"' in source
+    assert 'data-action="confirm-incomplete-answer"' in source
+    assert "if (!practiceAnswerComplete(item) && !confirmIncomplete)" in record_flow
+    assert "const answerOrder = [...item.selected];" in record_flow
+    assert "attemptId:item.pendingAttempt.id" in record_flow
+    assert "dialogButtons.forEach(item => { item.disabled = true; });" in record_flow
+    assert "dialogButtons.forEach(item => { item.disabled = false; });" in record_flow
+    assert "if (errorEl) errorEl.textContent = error.message;" in record_flow
+    assert "if (button) closeDialog();" in record_flow
+    assert "await record('check', {confirmIncomplete:true, button});" in source
+    assert "请先把所有词块摆放完整" not in source
+    assert "practiceDialogBusy()" in source
