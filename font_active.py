@@ -90,9 +90,9 @@ def db_charset(db=None) -> set[str]:
         close = True
     try:
         for row in db.execute(
-            "SELECT chinese, japanese, furigana_json FROM sentences"
+            "SELECT chinese, note, japanese, furigana_json FROM sentences"
         ):
-            for key in ("chinese", "japanese", "furigana_json"):
+            for key in ("chinese", "note", "japanese", "furigana_json"):
                 val = row[key]
                 if val:
                     chars.update(val)

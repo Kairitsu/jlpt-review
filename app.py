@@ -55,6 +55,8 @@ from tokenizer import (
     validate_practice_data,
 )
 
+MAX_SENTENCE_NOTE_LENGTH = 1000
+
 
 def truthy(name: str, default=False):
     return os.environ.get(name, str(default)).lower() in {"1", "true", "yes", "on"}
@@ -86,6 +88,8 @@ def _hard_delete_sentences(db, sentence_ids: list[int]) -> None:
 
 def sentence_dict(row):
     data = dict(row)
+    note = data.get("note", "")
+    data["note"] = note if isinstance(note, str) else ""
     data["chunks"] = json_load(data.pop("chunks_json"), [])
     data["correctOrder"] = json_load(data.pop("correct_order_json"), [])
     data["practiceStructure"] = json_load(data.pop("practice_structure_json", "[]"), [])
@@ -101,7 +105,7 @@ def sentence_snapshot(row):
     snapshot = {
         key: item[key]
         for key in (
-            "id", "chinese", "japanese", "chunks", "correctOrder",
+            "id", "chinese", "note", "japanese", "chunks", "correctOrder",
             "practiceStructure", "chunkSource", "chunkSchemaVersion",
             "chunksManuallyEdited", "furigana",
         )
@@ -109,6 +113,16 @@ def sentence_snapshot(row):
     # Keep the report tied to the collection that produced it even if the
     # sentence is moved later. Older snapshots are resolved from live rows.
     snapshot["collectionId"] = item["collection_id"]
+    return snapshot
+
+
+def snapshot_dict(value):
+    """Read current and legacy sentence snapshots through one safe contract."""
+    snapshot = json_load(value, {})
+    if not isinstance(snapshot, dict) or not snapshot:
+        return {}
+    note = snapshot.get("note", "")
+    snapshot["note"] = note if isinstance(note, str) else ""
     return snapshot
 
 
@@ -152,7 +166,7 @@ def _report_collection(db, item_rows):
     """
     snapshot_ids = []
     for row in item_rows:
-        snapshot = json_load(row["sentence_snapshot_json"], {})
+        snapshot = snapshot_dict(row["sentence_snapshot_json"])
         try:
             collection_id = int(snapshot.get("collectionId"))
         except (TypeError, ValueError):
@@ -714,7 +728,7 @@ def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
         return "临时排列格式无效"
 
     rows = db.execute(
-        """SELECT pi.sentence_id,pi.sentence_snapshot_json,s.chunks_json,s.chinese,
+        """SELECT pi.sentence_id,pi.sentence_snapshot_json,s.chunks_json,s.chinese,s.note,
                   s.japanese,s.correct_order_json,s.practice_structure_json,
                   s.chunk_source,s.chunk_schema_version,s.chunks_manually_edited,
                   s.furigana_json,s.collection_id
@@ -738,11 +752,12 @@ def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
             return "临时排列格式无效"
         seen.add(sentence_id)
         row = by_id[sentence_id]
-        snapshot = json_load(row["sentence_snapshot_json"], {})
+        snapshot = snapshot_dict(row["sentence_snapshot_json"])
         if not snapshot and row["chunks_json"] is not None:
             snapshot = {
                 "id": sentence_id,
                 "chinese": row["chinese"],
+                "note": row["note"] or "",
                 "japanese": row["japanese"],
                 "chunks": json_load(row["chunks_json"], []),
                 "correctOrder": json_load(row["correct_order_json"], []),
@@ -1050,6 +1065,12 @@ def create_app(test_config=None):
     def validate_sentence_payload(body):
         if not isinstance(body.get("chinese"), str) or not isinstance(body.get("japanese"), str):
             return None, "中文翻译和日语原句必须是字符串"
+        note_value = body.get("note", "")
+        if not isinstance(note_value, str):
+            return None, "备注必须是字符串"
+        note = note_value.strip()
+        if len(note) > MAX_SENTENCE_NOTE_LENGTH:
+            return None, f"备注不能超过 {MAX_SENTENCE_NOTE_LENGTH} 个字符"
         chinese, japanese = body["chinese"].strip(), body["japanese"]
         chunks = body.get("chunks")
         structure = body.get("practiceStructure")
@@ -1087,7 +1108,8 @@ def create_app(test_config=None):
         except (ValueError, TypeError):
             return None, "请选择所属句集"
         return {
-            "collection_id": collection_id, "chinese": chinese, "japanese": japanese,
+            "collection_id": collection_id, "chinese": chinese, "note": note,
+            "japanese": japanese,
             "chunks": chunks, "order": order, "structure": structure,
             "source": source, "manually_edited": manually_edited,
         }, ""
@@ -1103,13 +1125,13 @@ def create_app(test_config=None):
             with get_db() as db:
                 card = card_fields(new_card(0, datetime.now(timezone.utc)))
                 cursor = db.execute("""INSERT INTO sentences(
-                    collection_id,chinese,japanese,chunks_json,correct_order_json,
+                    collection_id,chinese,note,japanese,chunks_json,correct_order_json,
                     practice_structure_json,chunk_source,chunk_schema_version,
                     chunks_manually_edited,furigana_json,
                     fsrs_state,fsrs_step,stability,difficulty,last_review_at,next_review_at,
                     fsrs_version,created_at,updated_at
-                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-                    item["collection_id"], item["chinese"], item["japanese"],
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    item["collection_id"], item["chinese"], item["note"], item["japanese"],
                     json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]),
                     json.dumps(item["structure"], ensure_ascii=False), item["source"],
                     CHUNK_SCHEMA_VERSION, int(item["manually_edited"]),
@@ -1154,12 +1176,12 @@ def create_app(test_config=None):
         furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
         with get_db() as db:
             changed = db.execute(
-                """UPDATE sentences SET collection_id=?,chinese=?,japanese=?,
+                """UPDATE sentences SET collection_id=?,chinese=?,note=?,japanese=?,
                    chunks_json=?,correct_order_json=?,practice_structure_json=?,
                    chunk_source=?,chunk_schema_version=?,chunks_manually_edited=?,
                    furigana_json=?,updated_at=? WHERE id=?""",
                 (
-                    item["collection_id"], item["chinese"], item["japanese"],
+                    item["collection_id"], item["chinese"], item["note"], item["japanese"],
                     json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]),
                     json.dumps(item["structure"], ensure_ascii=False), item["source"],
                     CHUNK_SCHEMA_VERSION, int(item["manually_edited"]), furigana_json,
@@ -1425,7 +1447,7 @@ def create_app(test_config=None):
                     or duplicate["sentence_id"] != sentence_id
                 ):
                     return jsonify(error="attemptId 已用于其他核对请求"), 409
-                snapshot = json_load(duplicate["sentence_snapshot_json"], {})
+                snapshot = snapshot_dict(duplicate["sentence_snapshot_json"])
                 status = duplicate["status"]
                 return jsonify(
                     attemptId=duplicate["id"],
@@ -1450,7 +1472,7 @@ def create_app(test_config=None):
                 return jsonify(error="本轮练习已经提交"), 409
             if item_row["finalized_at"] or item_row["unanswered_at"]:
                 return jsonify(error="当前题已经结束"), 409
-            snapshot = json_load(item_row["sentence_snapshot_json"], {})
+            snapshot = snapshot_dict(item_row["sentence_snapshot_json"])
             item = snapshot if snapshot.get("chunks") and snapshot.get("correctOrder") else sentence_snapshot(row)
             status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"], item["chunks"]) else "wrong")
             attempt_number = db.execute(
@@ -1628,7 +1650,7 @@ def create_app(test_config=None):
             )
         items = []
         for attempt in items_rows:
-            snap = json_load(attempt["sentence_snapshot_json"], {})
+            snap = snapshot_dict(attempt["sentence_snapshot_json"])
             by_id = {chunk["id"]: chunk for chunk in snap.get("chunks", [])}
             answer = json_load(attempt["answer_order_json"], [])
             rating = Rating(attempt["fsrs_rating"]) if attempt["fsrs_rating"] else None

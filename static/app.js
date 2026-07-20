@@ -10,6 +10,7 @@ const state = {
 };
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
+function sentenceNote(sentence) { return typeof sentence?.note === 'string' ? sentence.note.trim() : ''; }
 function rubyHtml(segments) {
   if (!Array.isArray(segments) || !segments.length
     || !segments.every(seg => seg && typeof seg.text === 'string' && seg.text.length
@@ -524,7 +525,7 @@ async function renderStudyStatus(status, collectionId) {
   setChrome();
 }
 
-function addForm(data = {}) { return `<section class="page"><div class="page-head"><div><h1>${state.editing ? '编辑句子' : '添加句子'}</h1><p>输入中文和完整原句，再检查自动生成的词块。</p></div></div><div class="card form-card"><div class="form-grid"><label class="field full">所属句集<select id="collection">${collectionOptions(data.collection_id || state.activeCollection)}</select></label><label class="field">中文翻译<textarea id="chinese" placeholder="例如：即使下雨，我也想去散步。">${esc(data.chinese || '')}</textarea></label><label class="field">完整日语原句<textarea id="japanese" lang="ja" placeholder="例如：雨が降っても、散歩に行きたいです。">${esc(data.japanese || '')}</textarea></label></div><div class="form-actions"><button class="btn primary" data-action="organize">自动分块</button></div></div><div id="preview-slot"></div></section>`; }
+function addForm(data = {}) { return `<section class="page"><div class="page-head"><div><h1>${state.editing ? '编辑句子' : '添加句子'}</h1><p>输入中文和完整原句，再检查自动生成的词块。</p></div></div><div class="card form-card"><div class="form-grid"><label class="field full">所属句集<select id="collection">${collectionOptions(data.collection_id || state.activeCollection)}</select></label><div class="form-column"><label class="field">中文翻译<textarea id="chinese" placeholder="例如：即使下雨，我也想去散步。">${esc(data.chinese || '')}</textarea></label><label class="field">备注（可选）<textarea id="note" class="note-input" maxlength="1000" placeholder="例如：に限って：与平日不同、偏偏、特别相信">${esc(sentenceNote(data))}</textarea></label></div><div class="form-column"><label class="field">完整日语原句<textarea id="japanese" lang="ja" placeholder="例如：雨が降っても、散歩に行きたいです。">${esc(data.japanese || '')}</textarea></label></div></div><div class="form-actions"><button class="btn primary" data-action="organize">自动分块</button></div></div><div id="preview-slot"></div></section>`; }
 async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { state.draft = {chunks:state.editing.chunks.map(x => ({...x})), practiceStructure:(state.editing.practiceStructure || []).map(x => ({...x})), source:state.editing.chunkSource || 'legacy', schemaVersion:state.editing.chunkSchemaVersion || 1, manuallyEdited:Boolean(state.editing.chunksManuallyEdited), sentenceFurigana:state.editing.furigana}; renderPreview(); } setChrome(); }
 function fixedSlotPreview(structure, chunks, {interactive = false} = {}) {
   const map = Object.fromEntries((chunks || []).map(chunk => [chunk.id, chunk]));
@@ -550,8 +551,10 @@ function manualChunkId() {
 function renderPreview() {
   const slot = $('#preview-slot'); if (!slot || !state.draft) return;
   const previewJp = rubyHtml(state.draft.sentenceFurigana) || esc($('#japanese').value);
+  const note = sentenceNote({note:$('#note')?.value});
+  const noteRow = note ? `<div><span>备注</span><p class="preview-note">${esc(note)}</p></div>` : '';
   const sourceLabel = state.draft.source === 'fallback' ? '安全降级分块' : (state.draft.manuallyEdited ? '人工调整词块' : 'GiNZA 文节分块');
-  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>横线词块参与练习；标点和空白固定在原位。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div><div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="preview-structure" aria-label="固定标点与可练习词块结构">${fixedSlotPreview(state.draft.practiceStructure, state.draft.chunks, {interactive:true})}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button></div><p class="status-note">分块方式：${sourceLabel}；固定标点不会进入候选区。</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
+  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>横线词块参与练习；标点和空白固定在原位。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div>${noteRow}<div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="preview-structure" aria-label="固定标点与可练习词块结构">${fixedSlotPreview(state.draft.practiceStructure, state.draft.chunks, {interactive:true})}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button></div><p class="status-note">分块方式：${sourceLabel}；固定标点不会进入候选区。</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
 }
 
 async function renderLibrary(collectionId = state.activeCollection) {
@@ -926,8 +929,10 @@ function renderPractice() {
   const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
   const ready = practiceReadyToCheck(item, p), busy = item.submitting || p.submittingRound || p.exiting;
   const last = p.index === p.sentences.length - 1;
+  const note = sentenceNote(s);
+  const noteCard = note ? `<aside class="card practice-note"><div class="practice-note-label">备注</div><div class="practice-note-body">${esc(note)}</div></aside>` : '';
   const candidatesHtml = item.candidates.map(id => `<button class="candidate ${item.slotAssignments.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.slotAssignments.includes(id) || item.checked || busy ? 'disabled' : ''}>${chunkRubyHtml(s, map[id])}</button>`).join('');
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer" aria-live="polite" aria-label="句子答案槽位">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${candidatesHtml}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="practice-prompt ${note ? 'has-note' : 'single'}" aria-label="中文提示">${noteCard}<div class="card practice-translation">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer" aria-live="polite" aria-label="句子答案槽位">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${candidatesHtml}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, item) {
@@ -1177,7 +1182,7 @@ document.addEventListener('click', async event => {
       markDraftManual(); state.selectedChunks = []; renderPreview();
     }
     else if (action === 'save-sentence') {
-      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id), practiceStructure:state.draft.practiceStructure, chunkSource:state.draft.source, chunksManuallyEdited:Boolean(state.draft.manuallyEdited)};
+      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, note:$('#note').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id), practiceStructure:state.draft.practiceStructure, chunkSource:state.draft.source, chunksManuallyEdited:Boolean(state.draft.manuallyEdited)};
       const wasEditing = Boolean(state.editing);
       if (wasEditing) await api(`/api/sentences/${state.editing.id}`, {method:'PUT', body:JSON.stringify(payload)});
       else await api('/api/sentences', {method:'POST', body:JSON.stringify(payload)});
@@ -1189,8 +1194,9 @@ document.addEventListener('click', async event => {
       else {
         const collectionId = Number($('#collection')?.value);
         if (collectionId) { state.activeCollection = collectionId; localStorage.setItem('activeCollection', collectionId); }
-        const chinese = $('#chinese'), japanese = $('#japanese'), slot = $('#preview-slot');
+        const chinese = $('#chinese'), note = $('#note'), japanese = $('#japanese'), slot = $('#preview-slot');
         if (chinese) chinese.value = '';
+        if (note) note.value = '';
         if (japanese) japanese.value = '';
         if (slot) slot.innerHTML = '';
         window.scrollTo(0, 0);

@@ -16,6 +16,7 @@ UNANSWERED_REPORT_MIGRATION = "practice_unanswered_v1"
 COMPLETION_MODE_MIGRATION = "practice_completion_mode_v1"
 AUTOMATIC_RATING_MIGRATION = "fsrs_automatic_rating_v2"
 GINZA_CHUNKS_MIGRATION = "ginza_bunsetu_chunks_v1"
+SENTENCE_NOTE_MIGRATION = "sentence_note_v1"
 
 
 def now_iso() -> str:
@@ -67,6 +68,7 @@ def _create_sentences_table(db) -> None:
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE RESTRICT,
         chinese TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
         japanese TEXT NOT NULL,
         chunks_json TEXT NOT NULL,
         correct_order_json TEXT NOT NULL,
@@ -256,6 +258,16 @@ def _migrate_chunk_schema(db) -> None:
             db.execute(f"ALTER TABLE sentences ADD COLUMN {column} {definition}")
 
 
+def _migrate_sentence_note(db, stamp: str) -> None:
+    """Add optional sentence notes without rebuilding or rewriting sentences."""
+    if "note" not in _columns(db, "sentences"):
+        db.execute("ALTER TABLE sentences ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+    db.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)",
+        (SENTENCE_NOTE_MIGRATION, stamp),
+    )
+
+
 def _migrate_automatic_rating(db, stamp: str) -> None:
     """Add v2 audit facts and idempotency keys without changing old ratings."""
     attempt_columns = _columns(db, "attempts")
@@ -418,6 +430,7 @@ def init_db(*, enable_fuzzing: bool = True) -> None:
         _migrate_completion_mode(db, stamp)
         _migrate_automatic_rating(db, stamp)
         _migrate_chunk_schema(db)
+        _migrate_sentence_note(db, stamp)
         _create_indexes(db)
 
         db.execute("DELETE FROM settings WHERE key IN ('scheduler_mode','base_url','model','custom_params','api_key_encrypted')")
