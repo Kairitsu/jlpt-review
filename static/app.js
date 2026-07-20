@@ -523,7 +523,7 @@ async function startPractice(payload) {
     sentences: result.sentences,
     index: 0,
     items: result.sentences.map(sentence => ({
-      selected: [], checked: false, result: null,
+      slotAssignments: Array(sentence.chunks.length).fill(null), checked: false, result: null,
       candidates: shuffle(sentence.chunks.map(chunk => chunk.id)),
       submitting: false, attemptStatuses: [], pendingAttempt: null,
       finalized: false, completion: null, questionStartedAt: Date.now(),
@@ -557,6 +557,13 @@ function practiceUnansweredIndexes(practice = state.practice) {
   if (!practice) return [];
   return practice.items.flatMap((item, index) => validCheckStatuses(item).length ? [] : [index]);
 }
+function practiceAnswerOrder(item = currentPracticeItem()) {
+  return (item?.slotAssignments || []).filter(id => id != null);
+}
+function resetPracticeSlotAssignments(item) {
+  if (!item) return;
+  item.slotAssignments = Array(item.candidates.length).fill(null);
+}
 function selectionHtml(s, item, map) {
   // Grade by chunk text so duplicate surfaces (e.g. two 「し」) match regardless of which id instance was used.
   const correctTexts = (s.correctOrder || []).map(id => map[id]?.text || '');
@@ -564,36 +571,51 @@ function selectionHtml(s, item, map) {
   const structure = (s.practiceStructure || []).map(element => {
     if (element.type === 'fixed') return `<span class="fixed-element" lang="ja">${esc(element.text)}</span>`;
     const index = slotIndex++;
-    const id = item.selected[index];
-    if (!id) return `<span class="answer-slot empty" data-slot-index="${index}" aria-label="第 ${index + 1} 个空词块槽位"></span>`;
+    const id = item.slotAssignments[index];
+    if (id == null) return `<span class="answer-slot empty" data-slot-index="${index}" aria-label="第 ${index + 1} 个空词块槽位"></span>`;
     const text = map[id]?.text || '';
     const cls = item.checked ? (text === correctTexts[index] ? 'good' : 'bad') : '';
     return `<button class="answer-slot chosen ${cls}" lang="ja" data-slot-index="${index}" data-action="unchoose" data-index="${index}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${chunkRubyHtml(s, map[id])}</button>`;
   }).join('');
   return `<div class="chosen-list answer-sequence">${structure}</div>`;
 }
-function practiceAnswerComplete(item = currentPracticeItem()) { return Boolean(item) && item.selected.length === item.candidates.length; }
+function practiceAnswerComplete(item = currentPracticeItem()) { return Boolean(item) && item.slotAssignments.length === item.candidates.length && item.slotAssignments.every(id => id != null); }
 function practiceReadyToCheck(item = currentPracticeItem(), practice = state.practice) { return Boolean(practice) && Boolean(item) && !item.checked && !item.submitting && !practice.submittingRound && !practice.exiting; }
 function moveSelectedTo(id, targetIndex) {
   const p = state.practice;
   const item = currentPracticeItem(p);
   if (!p || !item || item.checked || item.submitting || p.submittingRound) return;
-  const from = item.selected.indexOf(id);
-  if (from === targetIndex || (from !== -1 && from + 1 === targetIndex)) return;
-  if (from !== -1) item.selected.splice(from, 1);
-  let insertAt = targetIndex;
-  if (from !== -1 && from < targetIndex) insertAt -= 1;
-  insertAt = Math.max(0, Math.min(insertAt, item.selected.length));
-  item.selected.splice(insertAt, 0, id);
+  const assignments = item.slotAssignments;
+  if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= assignments.length) return;
+  const from = assignments.indexOf(id);
+  if (from === targetIndex) return;
+  if (from !== -1) {
+    [assignments[from], assignments[targetIndex]] = [assignments[targetIndex], assignments[from]];
+  } else {
+    if (!item.candidates.includes(id)) return;
+    const displaced = assignments[targetIndex];
+    if (displaced != null) {
+      let emptyIndex = -1;
+      for (let offset = 1; offset < assignments.length; offset += 1) {
+        const index = (targetIndex + offset) % assignments.length;
+        if (assignments[index] == null) { emptyIndex = index; break; }
+      }
+      if (emptyIndex === -1) return;
+      assignments[emptyIndex] = displaced;
+    }
+    assignments[targetIndex] = id;
+  }
   updatePracticeSelection();
 }
-function removeSelectedId(id) {
+function removeSelectedId(id, slotIndex = null) {
   const p = state.practice;
   const item = currentPracticeItem(p);
   if (!p || !item || item.checked || item.submitting || p.submittingRound) return;
-  const from = item.selected.indexOf(id);
+  const from = Number.isInteger(slotIndex) && item.slotAssignments[slotIndex] === id
+    ? slotIndex
+    : item.slotAssignments.indexOf(id);
   if (from === -1) return;
-  item.selected.splice(from, 1);
+  item.slotAssignments[from] = null;
   updatePracticeSelection();
 }
 function updatePracticeSelection() {
@@ -602,7 +624,7 @@ function updatePracticeSelection() {
   const map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
   const composer = $('#practice-composer'); if (!composer) return;
   composer.innerHTML = selectionHtml(s, item, map);
-  $$('.candidate', view).forEach(button => { const used = item.selected.includes(button.dataset.id); button.disabled = used || item.checked || item.submitting || p.submittingRound || p.exiting; button.classList.toggle('used', used); });
+  $$('.candidate', view).forEach(button => { const used = item.slotAssignments.includes(button.dataset.id); button.disabled = used || item.checked || item.submitting || p.submittingRound || p.exiting; button.classList.toggle('used', used); });
   const checkButton = $('[data-action="check"]', view);
   if (checkButton) checkButton.disabled = !practiceReadyToCheck(item, p);
 }
@@ -618,8 +640,8 @@ function pointInRect(x, y, el) {
   return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
 }
 
-function clearPracticeDropSlots() {
-  $$('.drop-slot').forEach(el => el.remove());
+function clearPracticeDropPreview() {
+  $$('.practice-drop-preview').forEach(el => el.remove());
 }
 
 function setCandidateDropRemove(on) {
@@ -636,7 +658,7 @@ function cleanupPracticeDrag({ keepSuppress = false } = {}) {
     session.originEl.classList.remove('dragging');
     try { if (session.pointerId != null) session.originEl.releasePointerCapture(session.pointerId); } catch {}
   }
-  clearPracticeDropSlots();
+  clearPracticeDropPreview();
   setCandidateDropRemove(false);
   if (session.didDrag && keepSuppress) {
     suppressPracticeClick = true;
@@ -658,14 +680,14 @@ function computePracticeDropIndex(clientX, clientY) {
   const list = $('#practice-composer .chosen-list');
   if (!list) return null;
   const slots = $$('.answer-slot', list);
-  if (!slots.length) return 0;
+  if (!slots.length) return null;
   const items = slots.map(el => {
     const r = el.getBoundingClientRect();
-    return { i:Number(el.dataset.slotIndex), r, midX: r.left + r.width / 2 };
+    return { i:Number(el.dataset.slotIndex), r };
   });
   const rows = [];
   for (const item of items) {
-    let row = rows.find(row => Math.abs(row[0].r.top - item.r.top) < 16);
+    let row = rows.find(row => Math.abs(row[0].r.top - item.r.top) < Math.min(row[0].r.height, item.r.height) / 2);
     if (!row) { row = []; rows.push(row); }
     row.push(item);
   }
@@ -678,10 +700,18 @@ function computePracticeDropIndex(clientX, clientY) {
     const dist = clientY < top ? top - clientY : clientY - bottom;
     if (dist < bestDist) { bestDist = dist; bestRow = row; }
   }
+  let bestItem = bestRow[0];
+  let bestHorizontalDistance = Infinity;
   for (const item of bestRow) {
-    if (clientX < item.midX) return item.i;
+    const distance = clientX < item.r.left ? item.r.left - clientX : (clientX > item.r.right ? clientX - item.r.right : 0);
+    const centerDistance = Math.abs(clientX - (item.r.left + item.r.width / 2));
+    const bestCenterDistance = Math.abs(clientX - (bestItem.r.left + bestItem.r.width / 2));
+    if (distance < bestHorizontalDistance || (distance === bestHorizontalDistance && centerDistance < bestCenterDistance)) {
+      bestItem = item;
+      bestHorizontalDistance = distance;
+    }
   }
-  return bestRow[bestRow.length - 1].i + 1;
+  return bestItem.i;
 }
 
 function updatePracticeDropIndicator(session, clientX, clientY) {
@@ -695,30 +725,25 @@ function updatePracticeDropIndicator(session, clientX, clientY) {
 
   if (overCandidate || !overComposer) {
     session.dropIndex = null;
-    clearPracticeDropSlots();
+    clearPracticeDropPreview();
     return;
   }
 
   const dropIndex = computePracticeDropIndex(clientX, clientY);
   session.dropIndex = dropIndex;
   const list = $('#practice-composer .chosen-list');
-  if (!list || dropIndex == null) { clearPracticeDropSlots(); return; }
-
-  let slot = list.querySelector('.drop-slot');
-  if (!slot) {
-    slot = document.createElement('span');
-    slot.className = 'drop-slot';
-    slot.setAttribute('aria-hidden', 'true');
-  } else {
-    slot.remove();
-  }
+  if (!list || dropIndex == null) { clearPracticeDropPreview(); return; }
   const slots = $$('.answer-slot', list);
   const target = slots.find(element => Number(element.dataset.slotIndex) === dropIndex);
-  if (target) list.insertBefore(slot, target);
-  else {
-    const last = slots[slots.length - 1];
-    list.insertBefore(slot, last?.nextSibling || null);
-  }
+  if (!target) { clearPracticeDropPreview(); return; }
+  const currentPreview = $('.practice-drop-preview', target);
+  if (currentPreview) return;
+  clearPracticeDropPreview();
+  const preview = document.createElement('span');
+  preview.className = 'practice-drop-preview';
+  preview.setAttribute('aria-hidden', 'true');
+  preview.innerHTML = session.previewHtml;
+  target.appendChild(preview);
 }
 
 function beginPracticeDrag(session, event) {
@@ -754,8 +779,8 @@ function onPracticePointerDown(event) {
   const id = chip.dataset.id;
   if (!id) return;
   const source = chip.classList.contains('chosen') ? 'chosen' : 'candidate';
-  if (source === 'candidate' && (!item.candidates.includes(id) || item.selected.includes(id))) return;
-  if (source === 'chosen' && !item.selected.includes(id)) return;
+  if (source === 'candidate' && (!item.candidates.includes(id) || item.slotAssignments.includes(id))) return;
+  if (source === 'chosen' && !item.slotAssignments.includes(id)) return;
   practiceDrag = {
     pointerId: event.pointerId,
     id,
@@ -763,6 +788,7 @@ function onPracticePointerDown(event) {
     startX: event.clientX,
     startY: event.clientY,
     originEl: chip,
+    previewHtml: chip.innerHTML,
     dragging: false,
     didDrag: false,
     ghost: null,
@@ -797,6 +823,7 @@ function onPracticePointerUp(event) {
     return;
   }
   event.preventDefault();
+  updatePracticeDropIndicator(session, event.clientX, event.clientY);
   const { id, source, dropIndex, overCandidate, overComposer } = session;
   cleanupPracticeDrag({ keepSuppress: true });
   if (overCandidate && source === 'chosen') {
@@ -842,12 +869,12 @@ function renderPractice() {
   const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
   const ready = practiceReadyToCheck(item, p), busy = item.submitting || p.submittingRound || p.exiting;
   const last = p.index === p.sentences.length - 1;
-  const candidatesHtml = item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${chunkRubyHtml(s, map[id])}</button>`).join('');
+  const candidatesHtml = item.candidates.map(id => `<button class="candidate ${item.slotAssignments.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.slotAssignments.includes(id) || item.checked || busy ? 'disabled' : ''}>${chunkRubyHtml(s, map[id])}</button>`).join('');
   view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer" aria-live="polite" aria-label="句子答案槽位">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${candidatesHtml}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, item) {
-  const user = item.selected.map(id => map[id]?.text || '').join('');
+  const user = practiceAnswerOrder(item).map(id => map[id]?.text || '').join('');
   const correctJp = rubyHtml(s.furigana) || esc(s.japanese);
   return `<div class="card answer-card"><h3>${item.result?.correct ? '回答正确' : '正确答案'}</h3>${!item.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${correctJp}</div><p>${esc(s.chinese)}</p></div>`;
 }
@@ -868,7 +895,7 @@ async function record(action, { confirmIncomplete = false, button = null } = {})
   if (!practiceReadyToCheck(item, p)) return;
   if (!practiceAnswerComplete(item) && !confirmIncomplete) { openIncompleteAnswerDialog(); return; }
   const s = p.sentences[p.index];
-  const answerOrder = [...item.selected];
+  const answerOrder = practiceAnswerOrder(item);
   const answerKey = JSON.stringify(answerOrder);
   if (!item.pendingAttempt || item.pendingAttempt.answerKey !== answerKey) {
     item.pendingAttempt = { id: createClientAttemptId(), answerKey };
@@ -922,7 +949,7 @@ function roundSubmissionPayload(practice, confirmUnanswered) {
     clientUnansweredCount: practiceUnansweredIndexes(practice).length,
     draftAnswers: practice.sentences.map((sentence, index) => ({
       sentenceId: sentence.id,
-      answerOrder: [...practice.items[index].selected],
+      answerOrder: practiceAnswerOrder(practice.items[index]),
     })),
   };
 }
@@ -1125,13 +1152,13 @@ document.addEventListener('click', async event => {
     else if (action === 'delete-collection-confirm') { const id = state.activeCollection; await api(`/api/collections/${id}?cascade=1`, {method:'DELETE'}); state.dashboard = null; if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); closeDialog(); toast('句集已删除'); await renderLibrary(); }
     else if (action === 'move-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await ensureDashboard(); openMoveSentencesDialog(ids); }
     else if (action === 'confirm-move-sentences') { const ids = ($('#dialog').dataset.moveIds || '').split(',').filter(Boolean).map(Number); const targetCollectionId = Number($('#move-target-collection')?.value); if (!ids.length) throw new Error('请至少勾选一条句子'); if (!targetCollectionId) throw new Error('请选择目标句集'); const result = await api('/api/sentences/move', {method:'POST', body:JSON.stringify({sentenceIds:ids, targetCollectionId})}); state.dashboard = null; closeDialog(); toast(`已转移 ${result.moved} 句`); await renderLibrary(state.activeCollection); }
-    else if (action === 'choose') { const p = state.practice, item = currentPracticeItem(p), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !item.candidates.includes(id) || item.selected.includes(id) || item.selected.length >= item.candidates.length) return; item.selected.push(id); updatePracticeSelection(); }
-    else if (action === 'unchoose') { const p = state.practice, item = currentPracticeItem(p), index = Number(button.dataset.index); if (!p || !item || item.checked || item.submitting || p.submittingRound || !Number.isInteger(index) || index < 0 || index >= item.selected.length) return; item.selected.splice(index, 1); updatePracticeSelection(); }
-    else if (action === 'reset') { const p = state.practice, item = currentPracticeItem(p); if (!p || !item || item.checked || item.submitting || p.submittingRound) return; item.selected = []; updatePracticeSelection(); }
+    else if (action === 'choose') { const p = state.practice, item = currentPracticeItem(p), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !item.candidates.includes(id) || item.slotAssignments.includes(id)) return; const targetIndex = item.slotAssignments.findIndex(assignedId => assignedId == null); if (targetIndex === -1) return; moveSelectedTo(id, targetIndex); }
+    else if (action === 'unchoose') { const p = state.practice, item = currentPracticeItem(p), index = Number(button.dataset.index), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !Number.isInteger(index) || index < 0 || index >= item.slotAssignments.length || item.slotAssignments[index] !== id) return; removeSelectedId(id, index); }
+    else if (action === 'reset') { const p = state.practice, item = currentPracticeItem(p); if (!p || !item || item.checked || item.submitting || p.submittingRound) return; resetPracticeSlotAssignments(item); updatePracticeSelection(); }
     else if (action === 'check') await record('check');
     else if (action === 'continue-incomplete-answer') { if (!practiceDialogBusy()) closeDialog(); }
     else if (action === 'confirm-incomplete-answer') await record('check', {confirmIncomplete:true, button});
-    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; item.selected = []; item.checked = false; item.result = null; item.submitting = false; item.pendingAttempt = null; item.questionStartedAt = Date.now(); renderPractice(); }
+    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; resetPracticeSlotAssignments(item); item.checked = false; item.result = null; item.submitting = false; item.pendingAttempt = null; item.questionStartedAt = Date.now(); renderPractice(); }
     else if (action === 'previous-question') navigatePractice(-1);
     else if (action === 'next-question') navigatePractice(1);
     else if (action === 'submit-round') await submitPracticeRound();

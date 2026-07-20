@@ -633,7 +633,8 @@ def test_incomplete_answer_check_uses_modal_and_preserves_normal_attempt_flow():
         "async function record(action", 1
     )[1].split("function navigatePractice", 1)[0]
 
-    assert "item.selected.length === item.candidates.length" in complete_predicate
+    assert "item.slotAssignments.length === item.candidates.length" in complete_predicate
+    assert "item.slotAssignments.every(id => id != null)" in complete_predicate
     assert "selected.length" not in ready_predicate
     assert "!item.checked" in ready_predicate
     assert "!item.submitting" in ready_predicate
@@ -643,7 +644,7 @@ def test_incomplete_answer_check_uses_modal_and_preserves_normal_attempt_flow():
     assert 'data-action="continue-incomplete-answer"' in source
     assert 'data-action="confirm-incomplete-answer"' in source
     assert "if (!practiceAnswerComplete(item) && !confirmIncomplete)" in record_flow
-    assert "const answerOrder = [...item.selected];" in record_flow
+    assert "const answerOrder = practiceAnswerOrder(item);" in record_flow
     assert "attemptId:item.pendingAttempt.id" in record_flow
     assert "dialogButtons.forEach(item => { item.disabled = true; });" in record_flow
     assert "dialogButtons.forEach(item => { item.disabled = false; });" in record_flow
