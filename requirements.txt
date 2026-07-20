@@ -1,8 +1,9 @@
 Flask==3.1.1
 fsrs==6.3.1
 gunicorn==23.0.0
-SudachiPy==0.6.11
-SudachiDict-full==20260428
+spacy==3.7.5
+ginza==5.2.0
+ja_ginza==5.2.0
 fonttools==4.58.5
 brotli==1.1.0
 tzdata==2026.3

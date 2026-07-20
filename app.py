@@ -46,7 +46,14 @@ from memory import (
     parse_iso,
 )
 from security import hash_password, verify_password
-from tokenizer import furigana_segments, local_tokenize, validate_chunks
+from tokenizer import (
+    CHUNK_SCHEMA_VERSION,
+    TOKENIZER_NAME,
+    analyze_sentence,
+    furigana_segments,
+    structure_from_manual_chunks,
+    validate_practice_data,
+)
 
 
 def truthy(name: str, default=False):
@@ -81,13 +88,24 @@ def sentence_dict(row):
     data = dict(row)
     data["chunks"] = json_load(data.pop("chunks_json"), [])
     data["correctOrder"] = json_load(data.pop("correct_order_json"), [])
+    data["practiceStructure"] = json_load(data.pop("practice_structure_json", "[]"), [])
+    data["chunkSource"] = data.pop("chunk_source", "legacy")
+    data["chunkSchemaVersion"] = int(data.pop("chunk_schema_version", 1) or 1)
+    data["chunksManuallyEdited"] = bool(data.pop("chunks_manually_edited", 0))
     data["furigana"] = json_load(data.pop("furigana_json", "[]"), [])
     return data
 
 
 def sentence_snapshot(row):
     item = sentence_dict(row)
-    snapshot = {key: item[key] for key in ("id", "chinese", "japanese", "chunks", "correctOrder", "furigana")}
+    snapshot = {
+        key: item[key]
+        for key in (
+            "id", "chinese", "japanese", "chunks", "correctOrder",
+            "practiceStructure", "chunkSource", "chunkSchemaVersion",
+            "chunksManuallyEdited", "furigana",
+        )
+    }
     # Keep the report tied to the collection that produced it even if the
     # sentence is moved later. Older snapshots are resolved from live rows.
     snapshot["collectionId"] = item["collection_id"]
@@ -183,10 +201,11 @@ def _report_collection(db, item_rows):
 
 
 def answers_match(answer, correct, chunks):
-    """Compare answer order to correct order by chunk text, not by chunk id.
+    """Compare only learner-sortable chunk order by text, never fixed elements.
 
     Duplicate texts (e.g. two 「し」 with different ids) match when placed in the
-    right positions even if the specific id instances are swapped.
+    right positions even if the specific id instances are swapped. Punctuation
+    and whitespace are absent from ``chunks`` by schema and cannot be submitted.
     """
     if not isinstance(answer, list) or not isinstance(correct, list):
         return False
@@ -673,7 +692,9 @@ def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
 
     rows = db.execute(
         """SELECT pi.sentence_id,pi.sentence_snapshot_json,s.chunks_json,s.chinese,
-                  s.japanese,s.correct_order_json,s.furigana_json,s.collection_id
+                  s.japanese,s.correct_order_json,s.practice_structure_json,
+                  s.chunk_source,s.chunk_schema_version,s.chunks_manually_edited,
+                  s.furigana_json,s.collection_id
            FROM practice_items pi
            LEFT JOIN sentences s ON s.id=pi.sentence_id
            WHERE pi.session_id=?""",
@@ -702,6 +723,10 @@ def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
                 "japanese": row["japanese"],
                 "chunks": json_load(row["chunks_json"], []),
                 "correctOrder": json_load(row["correct_order_json"], []),
+                "practiceStructure": json_load(row["practice_structure_json"], []),
+                "chunkSource": row["chunk_source"],
+                "chunkSchemaVersion": row["chunk_schema_version"],
+                "chunksManuallyEdited": bool(row["chunks_manually_edited"]),
                 "furigana": json_load(row["furigana_json"], []),
                 "collectionId": row["collection_id"],
             }
@@ -867,7 +892,7 @@ def create_app(test_config=None):
 
     @app.get("/api/health")
     def health():
-        return jsonify(ok=True, time=int(time.time()), tokenizer="sudachipy-full-abc")
+        return jsonify(ok=True, time=int(time.time()), tokenizer=TOKENIZER_NAME)
 
     @app.get("/api/auth/status")
     def auth_status():
@@ -989,10 +1014,14 @@ def create_app(test_config=None):
         japanese, chinese = body["japanese"], body["chinese"].strip()
         if not japanese.strip() or not chinese:
             return jsonify(error="中文翻译和日语原句都不能为空"), 400
+        analysis = analyze_sentence(japanese)
         return jsonify(
-            chunks=local_tokenize(japanese),
-            source="sudachi",
-            sentenceFurigana=furigana_segments(japanese),
+            chunks=analysis["chunks"],
+            correctOrder=analysis["correctOrder"],
+            practiceStructure=analysis["structure"],
+            source=analysis["source"],
+            schemaVersion=analysis["schemaVersion"],
+            sentenceFurigana=analysis["furigana"],
         )
 
     def validate_sentence_payload(body):
@@ -1000,21 +1029,45 @@ def create_app(test_config=None):
             return None, "中文翻译和日语原句必须是字符串"
         chinese, japanese = body["chinese"].strip(), body["japanese"]
         chunks = body.get("chunks")
+        structure = body.get("practiceStructure")
         if not chinese or not japanese.strip():
             return None, "中文翻译和日语原句都不能为空"
-        valid, message = validate_chunks(japanese, chunks)
+        order = body.get("correctOrder")
+        legacy_payload = structure is None
+        if legacy_payload:
+            try:
+                chunks, structure = structure_from_manual_chunks(japanese, chunks)
+                order = [item["id"] for item in chunks]
+            except (TypeError, ValueError) as exc:
+                return None, str(exc)
+        valid, message = validate_practice_data(japanese, chunks, structure, order)
         if not valid:
             return None, message
-        chunks = [{"id": item["id"], "text": item["text"]} for item in chunks]
-        order = body.get("correctOrder") or [item["id"] for item in chunks]
+        chunks = [
+            {
+                "id": item["id"], "text": item["text"],
+                "start": item["start"], "end": item["end"],
+            }
+            for item in chunks
+        ]
+        structure = [dict(element) for element in structure]
+        order = order or [item["id"] for item in chunks]
         ids = [item["id"] for item in chunks]
         if order != ids:
             return None, "正确词块顺序必须与原句中的词块顺序一致"
+        source = "manual" if legacy_payload else body.get("chunkSource")
+        if source not in {"ginza", "fallback", "manual", "manual_migrated"}:
+            source = "manual" if body.get("chunksManuallyEdited") is True else "ginza"
+        manually_edited = legacy_payload or body.get("chunksManuallyEdited") is True or source.startswith("manual")
         try:
             collection_id = int(body.get("collectionId"))
         except (ValueError, TypeError):
             return None, "请选择所属句集"
-        return {"collection_id": collection_id, "chinese": chinese, "japanese": japanese, "chunks": chunks, "order": order}, ""
+        return {
+            "collection_id": collection_id, "chinese": chinese, "japanese": japanese,
+            "chunks": chunks, "order": order, "structure": structure,
+            "source": source, "manually_edited": manually_edited,
+        }, ""
 
     @app.post("/api/sentences")
     def create_sentence():
@@ -1027,12 +1080,16 @@ def create_app(test_config=None):
             with get_db() as db:
                 card = card_fields(new_card(0, datetime.now(timezone.utc)))
                 cursor = db.execute("""INSERT INTO sentences(
-                    collection_id,chinese,japanese,chunks_json,correct_order_json,furigana_json,
+                    collection_id,chinese,japanese,chunks_json,correct_order_json,
+                    practice_structure_json,chunk_source,chunk_schema_version,
+                    chunks_manually_edited,furigana_json,
                     fsrs_state,fsrs_step,stability,difficulty,last_review_at,next_review_at,
                     fsrs_version,created_at,updated_at
-                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     item["collection_id"], item["chinese"], item["japanese"],
                     json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]),
+                    json.dumps(item["structure"], ensure_ascii=False), item["source"],
+                    CHUNK_SCHEMA_VERSION, int(item["manually_edited"]),
                     furigana_json, card["fsrs_state"], card["fsrs_step"], card["stability"],
                     card["difficulty"], card["last_review_at"], card["next_review_at"],
                     FSRS_VERSION, stamp, stamp,
@@ -1073,7 +1130,19 @@ def create_app(test_config=None):
             return jsonify(error=error), 400
         furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
         with get_db() as db:
-            changed = db.execute("""UPDATE sentences SET collection_id=?,chinese=?,japanese=?,chunks_json=?,correct_order_json=?,furigana_json=?,updated_at=? WHERE id=?""", (item["collection_id"], item["chinese"], item["japanese"], json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]), furigana_json, now_iso(), sentence_id)).rowcount
+            changed = db.execute(
+                """UPDATE sentences SET collection_id=?,chinese=?,japanese=?,
+                   chunks_json=?,correct_order_json=?,practice_structure_json=?,
+                   chunk_source=?,chunk_schema_version=?,chunks_manually_edited=?,
+                   furigana_json=?,updated_at=? WHERE id=?""",
+                (
+                    item["collection_id"], item["chinese"], item["japanese"],
+                    json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]),
+                    json.dumps(item["structure"], ensure_ascii=False), item["source"],
+                    CHUNK_SCHEMA_VERSION, int(item["manually_edited"]), furigana_json,
+                    now_iso(), sentence_id,
+                ),
+            ).rowcount
         if changed:
             rebuild_fonts()
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
@@ -1258,7 +1327,8 @@ def create_app(test_config=None):
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
             row = db.execute("SELECT * FROM sentences WHERE id=?", (sentence_id,)).fetchone()
             item_row = db.execute(
-                """SELECT finalized_at,unanswered_at FROM practice_items
+                """SELECT finalized_at,unanswered_at,sentence_snapshot_json
+                   FROM practice_items
                    WHERE session_id=? AND sentence_id=?""",
                 (session_id, sentence_id),
             ).fetchone()
@@ -1268,7 +1338,8 @@ def create_app(test_config=None):
                 return jsonify(error="本轮练习已经提交"), 409
             if item_row["finalized_at"] or item_row["unanswered_at"]:
                 return jsonify(error="当前题已经结束"), 409
-            item = sentence_dict(row)
+            snapshot = json_load(item_row["sentence_snapshot_json"], {})
+            item = snapshot if snapshot.get("chunks") and snapshot.get("correctOrder") else sentence_snapshot(row)
             status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"], item["chunks"]) else "wrong")
             attempt_number = db.execute(
                 """SELECT COALESCE(MAX(attempt_number),0)+1 next_number
@@ -1283,7 +1354,7 @@ def create_app(test_config=None):
                 (
                     session_id, sentence_id, client_attempt_id, attempt_number,
                     status, json.dumps(answer),
-                    json.dumps(sentence_snapshot(row), ensure_ascii=False), duration_ms, stamp,
+                    json.dumps(item, ensure_ascii=False), duration_ms, stamp,
                 ),
             )
         return jsonify(

@@ -430,12 +430,34 @@ async function renderStudyStatus(status, collectionId) {
 }
 
 function addForm(data = {}) { return `<section class="page"><div class="page-head"><div><h1>${state.editing ? '编辑句子' : '添加句子'}</h1><p>输入中文和完整原句，再检查自动生成的词块。</p></div></div><div class="card form-card"><div class="form-grid"><label class="field full">所属句集<select id="collection">${collectionOptions(data.collection_id || state.activeCollection)}</select></label><label class="field">中文翻译<textarea id="chinese" placeholder="例如：即使下雨，我也想去散步。">${esc(data.chinese || '')}</textarea></label><label class="field">完整日语原句<textarea id="japanese" lang="ja" placeholder="例如：雨が降っても、散歩に行きたいです。">${esc(data.japanese || '')}</textarea></label></div><div class="form-actions"><button class="btn primary" data-action="organize">自动分块</button></div></div><div id="preview-slot"></div></section>`; }
-async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { state.draft = {chunks:state.editing.chunks.map(x => ({...x})), source:'saved', sentenceFurigana:state.editing.furigana}; renderPreview(); } setChrome(); }
+async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { state.draft = {chunks:state.editing.chunks.map(x => ({...x})), practiceStructure:(state.editing.practiceStructure || []).map(x => ({...x})), source:state.editing.chunkSource || 'legacy', schemaVersion:state.editing.chunkSchemaVersion || 1, manuallyEdited:Boolean(state.editing.chunksManuallyEdited), sentenceFurigana:state.editing.furigana}; renderPreview(); } setChrome(); }
+function fixedSlotPreview(structure, chunks, {interactive = false} = {}) {
+  const map = Object.fromEntries((chunks || []).map(chunk => [chunk.id, chunk]));
+  return (structure || []).map(element => {
+    if (element.type === 'fixed') return `<span class="fixed-element" lang="ja">${esc(element.text)}</span>`;
+    const chunk = map[element.chunkId];
+    if (!chunk) return '';
+    const index = chunks.indexOf(chunk);
+    return interactive
+      ? `<button class="chunk answer-preview-slot ${state.selectedChunks.includes(index) ? 'selected' : ''}" lang="ja" data-action="select-chunk" data-index="${index}">${esc(chunk.text)}</button>`
+      : `<span class="answer-preview-slot" lang="ja">${esc(chunk.text)}</span>`;
+  }).join('');
+}
+function markDraftManual() {
+  if (!state.draft) return;
+  state.draft.source = 'manual';
+  state.draft.manuallyEdited = true;
+  state.draft.correctOrder = state.draft.chunks.map(chunk => chunk.id);
+}
+function manualChunkId() {
+  return globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID().slice(0, 16) : `manual-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
 function renderPreview() {
   const slot = $('#preview-slot'); if (!slot || !state.draft) return;
   const previewJp = (Array.isArray(state.draft.sentenceFurigana) && state.draft.sentenceFurigana.length)
     ? rubyHtml(state.draft.sentenceFurigana) : esc($('#japanese').value);
-  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>确认原句与词块顺序后保存。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div><div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="chunk-list preview-chunks" aria-label="按原顺序排列的词块">${state.draft.chunks.map((c, i) => `<button class="chunk ${state.selectedChunks.includes(i) ? 'selected' : ''}" lang="ja" data-action="select-chunk" data-index="${i}">${esc(c.text)}</button>`).join('')}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button><button class="btn outline" data-action="edit-chunk">修改词块</button></div><p class="status-note">分块方式：SudachiPy + SudachiDict-full 多粒度分析</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
+  const sourceLabel = state.draft.source === 'fallback' ? '安全降级分块' : (state.draft.manuallyEdited ? '人工调整词块' : 'GiNZA 文节分块');
+  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>横线词块参与练习；标点和空白固定在原位。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div><div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="preview-structure" aria-label="固定标点与可练习词块结构">${fixedSlotPreview(state.draft.practiceStructure, state.draft.chunks, {interactive:true})}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button></div><p class="status-note">分块方式：${sourceLabel}；固定标点不会进入候选区。</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
 }
 
 async function renderLibrary(collectionId = state.activeCollection) {
@@ -501,14 +523,17 @@ function practiceUnansweredIndexes(practice = state.practice) {
 function selectionHtml(s, item, map) {
   // Grade by chunk text so duplicate surfaces (e.g. two 「し」) match regardless of which id instance was used.
   const correctTexts = (s.correctOrder || []).map(id => map[id]?.text || '');
-  if (!item.selected.length) {
-    return `<div class="chosen-list"><div class="placeholder">看中文翻译，点击或拖拽下方词块，组成句子</div></div>`;
-  }
-  return `<div class="chosen-list">${item.selected.map((id, i) => {
+  let slotIndex = 0;
+  const structure = (s.practiceStructure || []).map(element => {
+    if (element.type === 'fixed') return `<span class="fixed-element" lang="ja">${esc(element.text)}</span>`;
+    const index = slotIndex++;
+    const id = item.selected[index];
+    if (!id) return `<span class="answer-slot empty" data-slot-index="${index}" aria-label="第 ${index + 1} 个空词块槽位"></span>`;
     const text = map[id]?.text || '';
-    const cls = item.checked ? (text === correctTexts[i] ? 'good' : 'bad') : '';
-    return `<button class="chosen ${cls}" lang="ja" data-action="unchoose" data-index="${i}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${esc(text)}</button>`;
-  }).join('')}</div>`;
+    const cls = item.checked ? (text === correctTexts[index] ? 'good' : 'bad') : '';
+    return `<button class="answer-slot chosen ${cls}" lang="ja" data-slot-index="${index}" data-action="unchoose" data-index="${index}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${esc(text)}</button>`;
+  }).join('');
+  return `<div class="chosen-list answer-sequence">${structure}</div>`;
 }
 function practiceAnswerComplete(item = currentPracticeItem()) { return Boolean(item) && item.selected.length === item.candidates.length; }
 function practiceReadyToCheck(item = currentPracticeItem(), practice = state.practice) { return Boolean(practice) && Boolean(item) && !item.checked && !item.submitting && !practice.submittingRound && !practice.exiting; }
@@ -595,11 +620,11 @@ function positionPracticeGhost(session, clientX, clientY) {
 function computePracticeDropIndex(clientX, clientY) {
   const list = $('#practice-composer .chosen-list');
   if (!list) return null;
-  const chips = $$('.chosen', list);
-  if (!chips.length) return 0;
-  const items = chips.map((el, i) => {
+  const slots = $$('.answer-slot', list);
+  if (!slots.length) return 0;
+  const items = slots.map(el => {
     const r = el.getBoundingClientRect();
-    return { i, r, midX: r.left + r.width / 2 };
+    return { i:Number(el.dataset.slotIndex), r, midX: r.left + r.width / 2 };
   });
   const rows = [];
   for (const item of items) {
@@ -650,9 +675,13 @@ function updatePracticeDropIndicator(session, clientX, clientY) {
   } else {
     slot.remove();
   }
-  const chips = $$('.chosen', list);
-  if (dropIndex >= chips.length) list.appendChild(slot);
-  else list.insertBefore(slot, chips[dropIndex]);
+  const slots = $$('.answer-slot', list);
+  const target = slots.find(element => Number(element.dataset.slotIndex) === dropIndex);
+  if (target) list.insertBefore(slot, target);
+  else {
+    const last = slots[slots.length - 1];
+    list.insertBefore(slot, last?.nextSibling || null);
+  }
 }
 
 function beginPracticeDrag(session, event) {
@@ -776,7 +805,7 @@ function renderPractice() {
   const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
   const ready = practiceReadyToCheck(item, p), busy = item.submitting || p.submittingRound || p.exiting;
   const last = p.index === p.sentences.length - 1;
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer" aria-live="polite" aria-label="句子答案槽位">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, item) {
@@ -927,7 +956,7 @@ function reportItems(items) { return items.length ? items.map(item => { const un
 async function renderSettings() {
   const [authCfg, tzCfg, fsrsCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone'), api('/api/settings/fsrs')]);
   const timezoneCard = `<form id="timezone-form" class="card"><div class="settings-title"><div><h2>时区</h2><p>"今日学习"和「统计」页的分桶都按自然日归类，这里设置的时区决定自然日的分界点；不设置时默认按服务器所在时区计算。</p></div><span class="config-status ${tzCfg.timezone ? 'ok' : 'warn'}">${tzCfg.timezone ? '已设置' : '未设置'}</span></div><label class="field">时区<select name="timezone" id="timezone-select">${timezoneOptionsHtml(tzCfg.timezone)}</select></label>${tzCfg.timezone ? '' : `<p class="status-note">当前按服务器时区（UTC${tzCfg.serverUtcOffset}）计算，如果你实际所在地区和服务器不同，建议在上方选择你自己的时区。</p>`}<div class="form-actions"><button class="btn primary" type="submit">保存时区设置</button></div></form>`;
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答，正式提交时由后端自动评分：第一次核对即答对为“认识”，连续第二轮起仍首次答对为“轻松掌握”；第一次答错、第二次答对为“模糊”；第一次答错后未再次核对，或第二次仍然答错，为“忘记”。从未核对的题目不计入 FSRS。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用 SudachiPy + SudachiDict-full 完成，不会把句子发送到外部服务。</p><p>可在「学习概览」查看近期学习、未来复习安排和当前记忆状态。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答，正式提交时由后端自动评分：第一次核对即答对为“认识”，连续第二轮起仍首次答对为“轻松掌握”；第一次答错、第二次答对为“模糊”；第一次答错后未再次核对，或第二次仍然答错，为“忘记”。从未核对的题目不计入 FSRS。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用标准 GiNZA ja_ginza 文节模型完成；标点与空白固定显示，不会进入候选词块，也不会把句子发送到外部服务。</p><p>可在「学习概览」查看近期学习、未来复习安排和当前记忆状态。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
 
@@ -996,13 +1025,37 @@ document.addEventListener('click', async event => {
         if (hint) { hint.textContent = error.message; hint.classList.add('error-text'); }
       }
     }
-    else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分块…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
+    else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分块…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.draft.manuallyEdited = false; state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
     else if (action === 'select-chunk') { const i = Number(button.dataset.index), at = state.selectedChunks.indexOf(i); if (at >= 0) state.selectedChunks.splice(at, 1); else { if (state.selectedChunks.length >= 2) state.selectedChunks.shift(); state.selectedChunks.push(i); } state.selectedChunks.sort((a,b) => a-b); renderPreview(); }
-    else if (action === 'split-chunk') { if (state.selectedChunks.length !== 1) throw new Error('请先选中一个要拆分的词块'); const i = state.selectedChunks[0], item = state.draft.chunks[i], pos = Number(prompt(`“${item.text}” 在第几个字符后拆分？`, Math.max(1, Math.floor(item.text.length / 2)))); if (!Number.isInteger(pos) || pos <= 0 || pos >= item.text.length) throw new Error('拆分位置必须位于词块内部'); state.draft.chunks.splice(i, 1, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(0,pos)}, {id:crypto.randomUUID().slice(0,12), text:item.text.slice(pos)}); state.selectedChunks = []; renderPreview(); }
-    else if (action === 'merge-chunks') { const [a,b] = state.selectedChunks; if (state.selectedChunks.length !== 2 || b !== a + 1) throw new Error('请按顺序选中两个相邻词块'); const x = state.draft.chunks[a], y = state.draft.chunks[b]; state.draft.chunks.splice(a, 2, {id:crypto.randomUUID().slice(0,12), text:x.text + y.text}); state.selectedChunks = []; renderPreview(); }
-    else if (action === 'edit-chunk') { if (state.selectedChunks.length !== 1) throw new Error('请先选中一个词块'); const i = state.selectedChunks[0], item = state.draft.chunks[i], text = prompt('词块文字（修改后仍须无损还原原句）：', item.text); if (text === null) return; if (!text) throw new Error('词块文字不能为空'); state.draft.chunks[i] = {id:item.id, text}; renderPreview(); }
+    else if (action === 'split-chunk') {
+      if (state.selectedChunks.length !== 1) throw new Error('请先选中一个要拆分的词块');
+      const i = state.selectedChunks[0], item = state.draft.chunks[i];
+      const pos = Number(prompt(`“${item.text}” 在第几个字符后拆分？`, Math.max(1, Math.floor(item.text.length / 2))));
+      if (!Number.isInteger(pos) || pos <= 0 || pos >= item.text.length) throw new Error('拆分位置必须位于词块内部');
+      const left = {id:manualChunkId(), text:item.text.slice(0,pos), start:item.start, end:item.start + pos};
+      const right = {id:manualChunkId(), text:item.text.slice(pos), start:item.start + pos, end:item.end};
+      const structureIndex = state.draft.practiceStructure.findIndex(element => element.type === 'slot' && element.chunkId === item.id);
+      if (structureIndex < 0) throw new Error('当前词块结构无效，请重新自动分块');
+      state.draft.chunks.splice(i, 1, left, right);
+      state.draft.practiceStructure.splice(structureIndex, 1,
+        {type:'slot', chunkId:left.id, start:left.start, end:left.end},
+        {type:'slot', chunkId:right.id, start:right.start, end:right.end});
+      markDraftManual(); state.selectedChunks = []; renderPreview();
+    }
+    else if (action === 'merge-chunks') {
+      const [a,b] = state.selectedChunks;
+      if (state.selectedChunks.length !== 2 || b !== a + 1) throw new Error('请按顺序选中两个相邻词块');
+      const x = state.draft.chunks[a], y = state.draft.chunks[b];
+      const xIndex = state.draft.practiceStructure.findIndex(element => element.type === 'slot' && element.chunkId === x.id);
+      const yIndex = state.draft.practiceStructure.findIndex(element => element.type === 'slot' && element.chunkId === y.id);
+      if (xIndex < 0 || yIndex !== xIndex + 1 || x.end !== y.start) throw new Error('固定标点两侧的词块不能合并');
+      const merged = {id:manualChunkId(), text:x.text + y.text, start:x.start, end:y.end};
+      state.draft.chunks.splice(a, 2, merged);
+      state.draft.practiceStructure.splice(xIndex, 2, {type:'slot', chunkId:merged.id, start:merged.start, end:merged.end});
+      markDraftManual(); state.selectedChunks = []; renderPreview();
+    }
     else if (action === 'save-sentence') {
-      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id)};
+      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id), practiceStructure:state.draft.practiceStructure, chunkSource:state.draft.source, chunksManuallyEdited:Boolean(state.draft.manuallyEdited)};
       const wasEditing = Boolean(state.editing);
       if (wasEditing) await api(`/api/sentences/${state.editing.id}`, {method:'PUT', body:JSON.stringify(payload)});
       else await api('/api/sentences', {method:'POST', body:JSON.stringify(payload)});

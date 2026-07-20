@@ -15,6 +15,7 @@ NO_SHORT_STEPS_MIGRATION = "fsrs_no_short_steps_v1"
 UNANSWERED_REPORT_MIGRATION = "practice_unanswered_v1"
 COMPLETION_MODE_MIGRATION = "practice_completion_mode_v1"
 AUTOMATIC_RATING_MIGRATION = "fsrs_automatic_rating_v2"
+GINZA_CHUNKS_MIGRATION = "ginza_bunsetu_chunks_v1"
 
 
 def now_iso() -> str:
@@ -69,6 +70,11 @@ def _create_sentences_table(db) -> None:
         japanese TEXT NOT NULL,
         chunks_json TEXT NOT NULL,
         correct_order_json TEXT NOT NULL,
+        practice_structure_json TEXT NOT NULL DEFAULT '[]',
+        chunk_source TEXT NOT NULL DEFAULT 'legacy',
+        chunk_schema_version INTEGER NOT NULL DEFAULT 1,
+        chunks_manually_edited INTEGER NOT NULL DEFAULT 0
+            CHECK(chunks_manually_edited IN (0,1)),
         furigana_json TEXT NOT NULL DEFAULT '[]',
         fsrs_state INTEGER NOT NULL DEFAULT 1 CHECK(fsrs_state IN (1,2,3)),
         fsrs_step INTEGER,
@@ -233,6 +239,23 @@ def _migrate_completion_mode(db, stamp: str) -> None:
     )
 
 
+def _migrate_chunk_schema(db) -> None:
+    """Add derived GiNZA practice fields without rewriting sentence data."""
+    sentence_columns = _columns(db, "sentences")
+    additions = (
+        ("practice_structure_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("chunk_source", "TEXT NOT NULL DEFAULT 'legacy'"),
+        ("chunk_schema_version", "INTEGER NOT NULL DEFAULT 1"),
+        (
+            "chunks_manually_edited",
+            "INTEGER NOT NULL DEFAULT 0 CHECK(chunks_manually_edited IN (0,1))",
+        ),
+    )
+    for column, definition in additions:
+        if column not in sentence_columns:
+            db.execute(f"ALTER TABLE sentences ADD COLUMN {column} {definition}")
+
+
 def _migrate_automatic_rating(db, stamp: str) -> None:
     """Add v2 audit facts and idempotency keys without changing old ratings."""
     attempt_columns = _columns(db, "attempts")
@@ -394,20 +417,10 @@ def init_db(*, enable_fuzzing: bool = True) -> None:
         _migrate_unanswered_reports(db, stamp)
         _migrate_completion_mode(db, stamp)
         _migrate_automatic_rating(db, stamp)
+        _migrate_chunk_schema(db)
         _create_indexes(db)
 
         db.execute("DELETE FROM settings WHERE key IN ('scheduler_mode','base_url','model','custom_params','api_key_encrypted')")
-        for row in db.execute("SELECT id,chunks_json FROM sentences").fetchall():
-            chunks = json_load(row["chunks_json"], [])
-            compact = [
-                {"id": item.get("id"), "text": item.get("text")}
-                for item in chunks if isinstance(item, dict)
-            ]
-            if compact != chunks:
-                db.execute(
-                    "UPDATE sentences SET chunks_json=? WHERE id=?",
-                    (json.dumps(compact, ensure_ascii=False), row["id"]),
-                )
         db.execute(
             "INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)",
             (stamp, stamp),

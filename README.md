@@ -29,7 +29,8 @@ JLPT Review 会展示中文提示，将日语原句拆分为词块。你需要�
 ### 句子重组练习
 
 - 根据中文提示还原日语原句
-- 点选和调整词块顺序
+- 每个 GiNZA 文节对应一个横线槽位
+- 只点选和调整非标点词块，标点与空白固定在原句位置
 - 查看正确句子与假名注音
 - 支持上一题、下一题自由切换
 - 未回答题目不会被强制判错
@@ -44,13 +45,13 @@ JLPT Review 会展示中文提示，将日语原句拆分为词块。你需要�
 
 ### 本地日语解析
 
-系统使用 SudachiPy 与 SudachiDict-full 在本地完成：
+系统使用标准 GiNZA `ja_ginza` 模型在本地完成：
 
-- 日语分词
-- 多粒度词块分析
+- 文节级学习词块分析
+- 固定标点与可排序槽位分离
 - 汉字假名注音生成
 
-句子不会发送到外部模型或第三方 API。
+模型在进程内复用；分析异常时会安全降级为无损字符区间。句子不会发送到外部模型或第三方 API。
 
 ### FSRS 间隔复习
 
@@ -113,8 +114,8 @@ docker compose up -d --build
 - Python / Flask
 - SQLite
 - Py-FSRS
-- SudachiPy
-- SudachiDict-full
+- GiNZA / ja_ginza
+- spaCy
 - 原生 HTML、CSS、JavaScript
 - Chart.js
 - Docker Compose

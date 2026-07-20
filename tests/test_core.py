@@ -17,24 +17,26 @@ def load_app(tmp_path, monkeypatch):
 
 
 def test_tokenizer_exact_duplicate_and_punctuation():
-    from tokenizer import local_tokenize, validate_chunks
+    from tokenizer import analyze_sentence, reconstruct_sentence, validate_practice_data
     sentence = "私は庭にいて、猫に水をあげた。"
-    chunks = local_tokenize(sentence)
-    assert "".join(x["text"] for x in chunks) == sentence
+    analysis = analyze_sentence(sentence)
+    chunks = analysis["chunks"]
+    assert reconstruct_sentence(chunks, analysis["structure"]) == sentence
     assert len({x["id"] for x in chunks}) == len(chunks)
-    assert any(x["text"] == "、" for x in chunks)
-    assert any(x["text"] == "。" for x in chunks)
-    assert validate_chunks(sentence, chunks)[0]
+    assert not any(x["text"] in {"、", "。"} for x in chunks)
+    assert [item["text"] for item in analysis["structure"] if item["type"] == "fixed"] == ["、", "。"]
+    assert validate_practice_data(sentence, chunks, analysis["structure"], analysis["correctOrder"])[0]
 
 
-def test_organize_is_local_sudachi_only(tmp_path, monkeypatch):
+def test_organize_is_local_ginza_with_fixed_structure(tmp_path, monkeypatch):
     client = load_app(tmp_path, monkeypatch)
     response = client.post("/api/sentences/organize", json={"chinese":"你好", "japanese":"こんにちは。"})
     data = response.get_json()
     assert response.status_code == 200
-    assert data["source"] == "sudachi"
-    assert set(data) == {"chunks", "source", "sentenceFurigana"}
-    assert "".join(x["text"] for x in data["chunks"]) == "こんにちは。"
+    assert data["source"] == "ginza"
+    assert set(data) == {"chunks", "correctOrder", "practiceStructure", "schemaVersion", "source", "sentenceFurigana"}
+    assert [x["text"] for x in data["chunks"]] == ["こんにちは"]
+    assert data["practiceStructure"][-1]["text"] == "。"
     assert "".join(x["text"] for x in data["sentenceFurigana"]) == "こんにちは。"
     assert client.get("/api/settings").status_code == 404
     assert client.post("/api/settings/test", json={}).status_code == 404
@@ -76,8 +78,8 @@ def test_furigana_segments_mixed_names_numbers_punctuation():
 def test_crud_practice_srs_report(tmp_path, monkeypatch):
     client = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    chunks = client.post("/api/sentences/organize", json={"chinese":"我也去。", "japanese":"私も行きます。"}).get_json()["chunks"]
-    created = client.post("/api/sentences", json={"collectionId":collection,"chinese":"我也去。","japanese":"私も行きます。","chunks":chunks,"correctOrder":[x["id"] for x in chunks]})
+    organized = client.post("/api/sentences/organize", json={"chinese":"我也去。", "japanese":"私も行きます。"}).get_json()
+    created = client.post("/api/sentences", json={"collectionId":collection,"chinese":"我也去。","japanese":"私も行きます。","chunks":organized["chunks"],"correctOrder":organized["correctOrder"],"practiceStructure":organized["practiceStructure"],"chunkSource":organized["source"]})
     assert created.status_code == 201
     sentence = created.get_json()["sentence"]
     practice = client.post("/api/practice/sessions", json={"sentenceIds":[sentence["id"]]}).get_json()
@@ -90,17 +92,59 @@ def test_crud_practice_srs_report(tmp_path, monkeypatch):
     assert refreshed["stability"] is not None and refreshed["difficulty"] is not None
 
 
+def test_answer_order_contains_only_slots_and_fixed_punctuation_never_affects_grading(tmp_path, monkeypatch):
+    client = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    japanese = "私は、家で日本語を勉強しています。"
+    organized = client.post(
+        "/api/sentences/organize", json={"chinese": "我在家学习日语。", "japanese": japanese}
+    ).get_json()
+    assert [item["text"] for item in organized["practiceStructure"] if item["type"] == "fixed"] == ["、", "。"]
+    assert all(chunk["text"] not in {"、", "。"} for chunk in organized["chunks"])
+    assert len(organized["correctOrder"]) == len(organized["chunks"]) == 4
+
+    created = client.post("/api/sentences", json={
+        "collectionId": collection, "chinese": "我在家学习日语。", "japanese": japanese,
+        "chunks": organized["chunks"], "correctOrder": organized["correctOrder"],
+        "practiceStructure": organized["practiceStructure"], "chunkSource": organized["source"],
+    }).get_json()["sentence"]
+    practice = client.post("/api/practice/sessions", json={"sentenceIds": [created["id"]]}).get_json()
+    snapshot = practice["sentences"][0]
+    assert snapshot["correctOrder"] == organized["correctOrder"]
+    assert snapshot["practiceStructure"] == organized["practiceStructure"]
+    correct = client.post(
+        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
+        json={
+            "attemptId": str(uuid.uuid4()), "sentenceId": created["id"],
+            "action": "check", "answerOrder": snapshot["correctOrder"],
+        },
+    )
+    assert correct.get_json()["status"] == "correct"
+    with_fake_punctuation = client.post(
+        f'/api/practice/sessions/{practice["sessionId"]}/attempts',
+        json={
+            "attemptId": str(uuid.uuid4()), "sentenceId": created["id"],
+            "action": "check", "answerOrder": [*snapshot["correctOrder"], "、"],
+        },
+    )
+    assert with_fake_punctuation.get_json()["status"] == "wrong"
+
+
 def test_split_merge_validation_and_duplicate_ids():
-    from tokenizer import validate_chunks
+    from tokenizer import structure_from_manual_chunks, validate_practice_data
     original = "ここに猫がいて、そこに犬がいる。"
     chunks = [{"id":"a","text":"ここに"},{"id":"b","text":"猫がいて"},{"id":"c","text":"、"},{"id":"d","text":"そこに"},{"id":"e","text":"犬がいる"},{"id":"f","text":"。"}]
-    assert validate_chunks(original, chunks)[0]
+    normalized, structure = structure_from_manual_chunks(original, chunks)
+    assert validate_practice_data(original, normalized, structure, [x["id"] for x in normalized])[0]
     split = chunks[:1]+[{"id":"b1","text":"猫が"},{"id":"b2","text":"いて"}]+chunks[2:]
-    assert validate_chunks(original, split)[0]
+    normalized, structure = structure_from_manual_chunks(original, split)
+    assert validate_practice_data(original, normalized, structure, [x["id"] for x in normalized])[0]
     merged = split[:1]+[{"id":"m","text":"猫がいて"}]+split[3:]
-    assert validate_chunks(original, merged)[0]
+    normalized, structure = structure_from_manual_chunks(original, merged)
+    assert validate_practice_data(original, normalized, structure, [x["id"] for x in normalized])[0]
     merged[1]["id"] = "a"
-    assert not validate_chunks(original, merged)[0]
+    normalized, structure = structure_from_manual_chunks(original, merged)
+    assert len({x["id"] for x in normalized}) == len(normalized)
 
 
 def test_login_rate_limit_is_sqlite_backed(tmp_path, monkeypatch):
@@ -267,7 +311,7 @@ def test_due_session_count_limits_and_default_uses_all_due_sentences(tmp_path, m
     assert [sentence["id"] for sentence in all_due.get_json()["sentences"]] == sentence_ids
 
 
-def test_migration_removes_only_legacy_remote_settings_and_keeps_saved_chunks(tmp_path, monkeypatch):
+def test_init_removes_only_legacy_remote_settings_and_keeps_new_chunk_schema(tmp_path, monkeypatch):
     client = load_app(tmp_path, monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
     saved_chunks = [{"id": "old-a", "text": "昔の"}, {"id": "old-b", "text": "分け方。"}]
@@ -288,17 +332,19 @@ def test_migration_removes_only_legacy_remote_settings_and_keeps_saved_chunks(tm
     with sqlite3.connect(tmp_path / "japanese_sentence_review.sqlite3") as connection:
         assert connection.execute("SELECT key FROM settings WHERE key IN ('base_url','model','custom_params','api_key_encrypted')").fetchall() == []
         stored = json.loads(connection.execute("SELECT chunks_json FROM sentences WHERE id=?", (sentence_id,)).fetchone()[0])
-    assert stored == saved_chunks
+    assert [chunk["text"] for chunk in stored] == ["昔の", "分け方"]
 
 
 def _make_sentence(client, collection, chinese, japanese):
-    chunks = client.post("/api/sentences/organize", json={"chinese": chinese, "japanese": japanese}).get_json()["chunks"]
+    organized = client.post("/api/sentences/organize", json={"chinese": chinese, "japanese": japanese}).get_json()
     created = client.post("/api/sentences", json={
         "collectionId": collection,
         "chinese": chinese,
         "japanese": japanese,
-        "chunks": chunks,
-        "correctOrder": [x["id"] for x in chunks],
+        "chunks": organized["chunks"],
+        "correctOrder": organized["correctOrder"],
+        "practiceStructure": organized["practiceStructure"],
+        "chunkSource": organized["source"],
     })
     assert created.status_code == 201
     return created.get_json()["sentence"]
