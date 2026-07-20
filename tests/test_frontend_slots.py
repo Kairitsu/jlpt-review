@@ -24,3 +24,31 @@ def test_slot_css_wraps_without_horizontal_overflow_and_fixed_text_is_not_intera
     assert "pointer-events:none" in fixed_rule
     assert ".answer-slot.empty" in styles
     assert ".candidate-area{padding:" in styles
+
+
+def test_practice_chunks_slice_existing_furigana_by_exact_ranges_with_safe_fallbacks():
+    source = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    helper = source.split("function chunkRubyHtml(sentence, chunk) {", 1)[1].split(
+        "function formatDate", 1
+    )[0]
+
+    assert "Number.isInteger(start)" in helper
+    assert "Number.isInteger(end)" in helper
+    assert "Array.from(japanese)" in helper
+    assert "sentenceChars.slice(start, end).join('') !== text" in helper
+    assert "segments.map(seg => seg.text).join('') !== japanese" in helper
+    assert "wholeSegment && segment.ruby" in helper
+    assert "rubyHtml(sliced)" in helper
+    assert "indexOf(" not in helper
+    assert "${chunkRubyHtml(s, map[id])}" in source
+    assert "const correctJp = rubyHtml(s.furigana) || esc(s.japanese);" in source
+
+
+def test_practice_chunk_ruby_css_reserves_annotation_space_on_desktop_and_mobile():
+    styles = (ROOT / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert ".practice-page .candidate{max-width:100%;min-height:62px" in styles
+    assert ".answer-slot{display:inline-flex" in styles
+    assert "min-height:64px;padding:14px 10px 8px" in styles
+    assert ".practice-page rt{font-size:.55em;line-height:1;white-space:nowrap}" in styles
+    assert ".practice-page .candidate{min-height:58px" in styles

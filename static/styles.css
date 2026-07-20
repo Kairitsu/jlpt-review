@@ -149,12 +149,17 @@
 .answer-preview-slot{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:6px 12px;border:0;border-bottom:2px solid #78aa9d;border-radius:8px 8px 2px 2px;background:var(--mint);color:var(--primary);font-weight:750}
 button.answer-preview-slot{border:1px solid #b9d9d5;border-bottom:3px solid #78aa9d}
 .fixed-element{display:inline-flex;align-items:flex-end;align-self:stretch;justify-content:center;min-width:0;margin-inline:-5px;padding-bottom:7px;color:var(--ink);font-size:22px;font-weight:700;line-height:1;white-space:pre;user-select:none;pointer-events:none}
-.answer-slot{display:inline-flex;align-items:center;justify-content:center;min-width:clamp(76px,11vw,132px);max-width:100%;min-height:52px;padding:7px 10px;border:0;border-bottom:3px solid #78aa9d;border-radius:8px 8px 2px 2px;background:#eaf5f1;color:var(--ink);font-size:20px;font-weight:700;line-height:1.55;overflow-wrap:anywhere}
+.answer-slot{display:inline-flex;align-items:center;justify-content:center;min-width:clamp(76px,11vw,132px);max-width:100%;min-height:64px;padding:14px 10px 8px;border:0;border-bottom:3px solid #78aa9d;border-radius:8px 8px 2px 2px;background:#eaf5f1;color:var(--ink);font-size:20px;font-weight:700;line-height:1.35;overflow-wrap:anywhere}
 .answer-slot.empty{background:transparent;border-bottom-color:#78aa9d}
 .answer-slot.good{background:var(--good-bg);border-color:var(--good)}
 .answer-slot.bad{background:var(--danger-bg);border-color:var(--danger)}
 .composer{overflow:hidden}
-.composer .chosen-list{min-height:60px}
+.composer .chosen-list{min-height:72px}
+.practice-page .candidate{max-width:100%;min-height:62px;padding:14px 17px 9px;line-height:1.35;overflow-wrap:anywhere;white-space:normal}
+.practice-page .candidate-area .chunk-list{align-items:flex-start;row-gap:16px}
+.practice-page .answer-sequence{row-gap:20px}
+.practice-page ruby{ruby-align:center}
+.practice-page rt{font-size:.55em;line-height:1;white-space:nowrap}
 .practice-page .answer-slot.chosen:not(:disabled){cursor:grab;touch-action:none}
 .practice-nav .back,.practice-nav .exit{min-height:44px}
 
@@ -169,10 +174,13 @@ button.answer-preview-slot{border:1px solid #b9d9d5;border-bottom:3px solid #78a
 }
 
 @media(max-width:480px){
-  .preview-structure,.answer-sequence{column-gap:8px;row-gap:14px}
+  .preview-structure,.answer-sequence{column-gap:8px;row-gap:16px}
   .preview-structure{padding:14px 12px}
-  .answer-slot{min-width:68px;min-height:48px;padding-inline:8px;font-size:18px}
-  .fixed-element{margin-inline:-4px;padding-bottom:6px;font-size:20px}
+  .answer-slot{min-width:68px;min-height:60px;padding:13px 8px 8px;font-size:18px}
+  .fixed-element{margin-inline:-4px;padding-bottom:8px;font-size:20px}
+  .practice-page .candidate{min-height:58px;padding:13px 14px 8px}
+  .practice-page .candidate-area .chunk-list{row-gap:14px}
+  .practice-page .answer-sequence{row-gap:18px}
   .unanswered-practice-modal,.incomplete-answer-modal{padding:22px 18px}
   .unanswered-practice-modal .form-actions,.incomplete-answer-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
   .unanswered-practice-modal .form-actions .btn,.incomplete-answer-modal .form-actions .btn{width:100%;min-height:48px;padding-inline:10px}

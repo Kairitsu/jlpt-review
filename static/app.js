@@ -11,10 +11,48 @@ const state = {
 
 function esc(value = '') { return String(value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c])); }
 function rubyHtml(segments) {
-  if (!Array.isArray(segments) || !segments.length) return '';
+  if (!Array.isArray(segments) || !segments.length
+    || !segments.every(seg => seg && typeof seg.text === 'string' && seg.text.length
+      && (seg.ruby === undefined || typeof seg.ruby === 'string'))) return '';
   return segments.map(seg => seg.ruby
     ? `<ruby>${esc(seg.text)}<rt>${esc(seg.ruby)}</rt></ruby>`
     : esc(seg.text)).join('');
+}
+function chunkRubyHtml(sentence, chunk) {
+  const text = typeof chunk?.text === 'string' ? chunk.text : '';
+  const fallback = esc(text);
+  try {
+    const japanese = sentence?.japanese;
+    const segments = sentence?.furigana;
+    const start = chunk?.start, end = chunk?.end;
+    if (typeof japanese !== 'string' || !Array.isArray(segments) || !segments.length
+      || !Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start >= end) return fallback;
+
+    const sentenceChars = Array.from(japanese);
+    if (end > sentenceChars.length || sentenceChars.slice(start, end).join('') !== text) return fallback;
+    if (!segments.every(seg => seg && typeof seg.text === 'string' && seg.text.length
+      && (seg.ruby === undefined || typeof seg.ruby === 'string'))) return fallback;
+    if (segments.map(seg => seg.text).join('') !== japanese) return fallback;
+
+    const sliced = [];
+    let cursor = 0;
+    for (const segment of segments) {
+      const segmentChars = Array.from(segment.text);
+      const segmentStart = cursor, segmentEnd = cursor + segmentChars.length;
+      cursor = segmentEnd;
+      if (segmentEnd <= start || segmentStart >= end) continue;
+      const localStart = Math.max(start, segmentStart) - segmentStart;
+      const localEnd = Math.min(end, segmentEnd) - segmentStart;
+      const part = segmentChars.slice(localStart, localEnd).join('');
+      if (!part) continue;
+      const wholeSegment = localStart === 0 && localEnd === segmentChars.length;
+      sliced.push(wholeSegment && segment.ruby ? {text:part, ruby:segment.ruby} : {text:part});
+    }
+    if (sliced.map(seg => seg.text).join('') !== text) return fallback;
+    return rubyHtml(sliced) || fallback;
+  } catch {
+    return fallback;
+  }
 }
 function formatDate(value) {
   if (!value) return '从未';
@@ -454,8 +492,7 @@ function manualChunkId() {
 }
 function renderPreview() {
   const slot = $('#preview-slot'); if (!slot || !state.draft) return;
-  const previewJp = (Array.isArray(state.draft.sentenceFurigana) && state.draft.sentenceFurigana.length)
-    ? rubyHtml(state.draft.sentenceFurigana) : esc($('#japanese').value);
+  const previewJp = rubyHtml(state.draft.sentenceFurigana) || esc($('#japanese').value);
   const sourceLabel = state.draft.source === 'fallback' ? '安全降级分块' : (state.draft.manuallyEdited ? '人工调整词块' : 'GiNZA 文节分块');
   slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>横线词块参与练习；标点和空白固定在原位。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div><div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="preview-structure" aria-label="固定标点与可练习词块结构">${fixedSlotPreview(state.draft.practiceStructure, state.draft.chunks, {interactive:true})}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button></div><p class="status-note">分块方式：${sourceLabel}；固定标点不会进入候选区。</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
 }
@@ -531,7 +568,7 @@ function selectionHtml(s, item, map) {
     if (!id) return `<span class="answer-slot empty" data-slot-index="${index}" aria-label="第 ${index + 1} 个空词块槽位"></span>`;
     const text = map[id]?.text || '';
     const cls = item.checked ? (text === correctTexts[index] ? 'good' : 'bad') : '';
-    return `<button class="answer-slot chosen ${cls}" lang="ja" data-slot-index="${index}" data-action="unchoose" data-index="${index}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${esc(text)}</button>`;
+    return `<button class="answer-slot chosen ${cls}" lang="ja" data-slot-index="${index}" data-action="unchoose" data-index="${index}" data-id="${id}" ${item.checked ? 'disabled' : ''}>${chunkRubyHtml(s, map[id])}</button>`;
   }).join('');
   return `<div class="chosen-list answer-sequence">${structure}</div>`;
 }
@@ -805,12 +842,13 @@ function renderPractice() {
   const pct = Math.round((p.index + 1) * 100 / p.sentences.length);
   const ready = practiceReadyToCheck(item, p), busy = item.submitting || p.submittingRound || p.exiting;
   const last = p.index === p.sentences.length - 1;
-  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer" aria-live="polite" aria-label="句子答案槽位">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${esc(map[id].text)}</button>`).join('')}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
+  const candidatesHtml = item.candidates.map(id => `<button class="candidate ${item.selected.includes(id) ? 'used' : ''}" lang="ja" data-action="choose" data-id="${id}" ${item.selected.includes(id) || item.checked || busy ? 'disabled' : ''}>${chunkRubyHtml(s, map[id])}</button>`).join('');
+  view.innerHTML = `<section class="page practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　句子重组</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.sentences.length}　退出</button></div><h1 class="practice-title">句子重组</h1><div class="prompt-scene"><div class="learner-art" aria-label="日语学习人物插图"><i class="body"></i><i class="head"></i><i class="hair"></i></div><div class="card speech">${esc(s.chinese)}</div></div><div id="practice-composer" class="card composer" aria-live="polite" aria-label="句子答案槽位">${selectionHtml(s, item, map)}</div><div class="candidate-area"><div class="chunk-list">${candidatesHtml}</div></div>${item.checked ? answerDetails(s, map, item) : ''}<div class="practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button><button class="btn ghost practice-reset" data-action="reset" ${item.checked || busy ? 'disabled' : ''}>重置</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!ready ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
   setChrome(true);
 }
 function answerDetails(s, map, item) {
   const user = item.selected.map(id => map[id]?.text || '').join('');
-  const correctJp = (Array.isArray(s.furigana) && s.furigana.length) ? rubyHtml(s.furigana) : esc(s.japanese);
+  const correctJp = rubyHtml(s.furigana) || esc(s.japanese);
   return `<div class="card answer-card"><h3>${item.result?.correct ? '回答正确' : '正确答案'}</h3>${!item.result?.correct ? `<div class="report-line"><span>你的排列</span><strong lang="ja">${esc(user || '（未作答）')}</strong></div>` : ''}<div class="correct-display" lang="ja">${correctJp}</div><p>${esc(s.chinese)}</p></div>`;
 }
 function openIncompleteAnswerDialog() {
