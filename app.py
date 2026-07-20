@@ -1170,6 +1170,95 @@ def create_app(test_config=None):
             rebuild_fonts()
         return jsonify(ok=True, moved=moved)
 
+    @app.post("/api/sentences/rechunk")
+    def rechunk_sentences():
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify(error="请求内容必须是 JSON 对象"), 400
+        raw_ids = body.get("sentenceIds")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return jsonify(error="请选择要重新分块的句子"), 400
+        if any(type(value) is not int or value <= 0 for value in raw_ids):
+            return jsonify(error="sentenceIds 必须是非空正整数数组"), 400
+        sentence_ids = list(dict.fromkeys(raw_ids))
+        placeholders = ",".join("?" for _ in sentence_ids)
+
+        db = get_db()
+        try:
+            rows = db.execute(
+                f"SELECT id,japanese FROM sentences WHERE id IN ({placeholders})",
+                sentence_ids,
+            ).fetchall()
+        finally:
+            db.close()
+        rows_by_id = {row["id"]: row for row in rows}
+        missing_ids = [sentence_id for sentence_id in sentence_ids if sentence_id not in rows_by_id]
+        if missing_ids:
+            missing_text = "、".join(str(sentence_id) for sentence_id in missing_ids)
+            return jsonify(error=f"句子不存在：{missing_text}；整批未作修改"), 404
+
+        prepared = []
+        for sentence_id in sentence_ids:
+            japanese = rows_by_id[sentence_id]["japanese"]
+            try:
+                analysis = analyze_sentence(japanese)
+                chunks = analysis["chunks"]
+                order = analysis["correctOrder"]
+                structure = analysis["structure"]
+                valid, message = validate_practice_data(japanese, chunks, structure, order)
+                if not valid:
+                    raise ValueError(message)
+                source = analysis["source"]
+                schema_version = analysis["schemaVersion"]
+                furigana = analysis["furigana"]
+                if source not in {"ginza", "fallback"}:
+                    raise ValueError("自动分块来源无效")
+                if type(schema_version) is not int or schema_version <= 0:
+                    raise ValueError("分块结构版本无效")
+                prepared.append((
+                    json.dumps(chunks, ensure_ascii=False),
+                    json.dumps(order, ensure_ascii=False),
+                    json.dumps(structure, ensure_ascii=False),
+                    source,
+                    schema_version,
+                    json.dumps(furigana, ensure_ascii=False),
+                    sentence_id,
+                    japanese,
+                ))
+            except Exception as exc:
+                return jsonify(
+                    error=f"句子 {sentence_id} 重新分块失败：{exc}；整批未作修改"
+                ), 422
+
+        stamp = now_iso()
+        db = get_db()
+        try:
+            with db:
+                for (
+                    chunks_json, order_json, structure_json, source,
+                    schema_version, furigana_json, sentence_id, japanese,
+                ) in prepared:
+                    changed = db.execute(
+                        """UPDATE sentences SET
+                           chunks_json=?,correct_order_json=?,practice_structure_json=?,
+                           chunk_source=?,chunk_schema_version=?,chunks_manually_edited=0,
+                           furigana_json=?,updated_at=?
+                           WHERE id=? AND japanese=?""",
+                        (
+                            chunks_json, order_json, structure_json, source,
+                            schema_version, furigana_json, stamp, sentence_id, japanese,
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise RuntimeError(f"句子 {sentence_id} 在处理期间发生变化")
+        except Exception as exc:
+            return jsonify(error=f"批量重新分块失败：{exc}；整批已回滚"), 409
+        finally:
+            db.close()
+
+        rebuild_fonts()
+        return jsonify(ok=True, updated=len(prepared))
+
     @app.delete("/api/sentences/<int:sentence_id>")
     def delete_sentence(sentence_id):
         # Hard-delete related stats/history first (before FK SET NULL would orphan them).

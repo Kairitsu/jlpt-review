@@ -131,7 +131,38 @@ function showLogin() { $('#login-modal').classList.remove('hidden'); }
 function hideLogin() { $('#login-modal').classList.add('hidden'); }
 function openDialog(html, { className = '', label = '对话框' } = {}) { const el = $('#dialog'); el.innerHTML = `<div class="modal ${className}" role="dialog" aria-modal="true" aria-label="${esc(label)}">${html}</div>`; el.classList.remove('hidden'); requestAnimationFrame(() => $('input, select, button', el)?.focus()); }
 function closeDialog() { const el = $('#dialog'); el.classList.add('hidden'); el.innerHTML = ''; }
-function updateMoveSelectedBtn() { const btn = $('#move-selected-btn'); if (btn) btn.disabled = !$$('.sentence-check:checked').length; }
+function librarySelectionState(checkedStates) {
+  const states = Array.isArray(checkedStates) ? checkedStates.map(Boolean) : [];
+  const selected = states.filter(Boolean).length;
+  return {
+    total: states.length,
+    selected,
+    allSelected: Boolean(states.length) && selected === states.length,
+    selectLabel: states.length && selected === states.length ? '取消全选' : '全选',
+    selectDisabled: !states.length,
+    selectionActionsDisabled: !selected,
+  };
+}
+function nextLibrarySelection(checkedStates) {
+  const selection = librarySelectionState(checkedStates);
+  return (checkedStates || []).map(() => !selection.allSelected);
+}
+function selectedSentenceIds() { return $$('.sentence-check:checked').map(input => Number(input.value)); }
+function updateLibrarySelectionButtons() {
+  const checks = $$('.sentence-check');
+  const selection = librarySelectionState(checks.map(input => input.checked));
+  const selectBtn = $('#select-all-btn');
+  if (selectBtn) { selectBtn.textContent = selection.selectLabel; selectBtn.disabled = selection.selectDisabled; }
+  for (const selector of ['#rechunk-selected-btn', '#move-selected-btn']) {
+    const button = $(selector); if (button) button.disabled = selection.selectionActionsDisabled;
+  }
+}
+function toggleVisibleSentenceSelection() {
+  const checks = $$('.sentence-check');
+  const nextStates = nextLibrarySelection(checks.map(input => input.checked));
+  checks.forEach((input, index) => { input.checked = nextStates[index]; });
+  updateLibrarySelectionButtons();
+}
 function openManageCollectionDialog() {
   const current = state.dashboard.collections.find(c => c.id === state.activeCollection);
   if (!current) return;
@@ -155,6 +186,32 @@ function openMoveSentencesDialog(ids) {
   if (!options) { toast('没有可转移的目标句集', true); return; }
   openDialog(`<h1>转移句子</h1><p>将选中的 ${ids.length} 句转移到目标句集。</p><label>目标句集<select id="move-target-collection">${options}</select></label><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-move-sentences">确认转移</button></div>`);
   $('#dialog').dataset.moveIds = ids.join(',');
+}
+function openRechunkSentencesDialog(ids) {
+  openDialog(`<div class="rechunk-sentences-dialog"><h1>重新分块</h1><p class="rechunk-sentences-copy">将使用当前 GiNZA 分块规则重新生成所选 ${ids.length} 句的词块。已有的人工拆分或合并结果会被覆盖；日语原句、中文翻译、所属句集、FSRS 记忆进度和练习历史不会改变。</p><p id="rechunk-sentences-error" class="form-error rechunk-sentences-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-rechunk-sentences">确认重新分块</button></div></div>`, { className: 'rechunk-sentences-modal', label: '确认重新分块' });
+  $('#dialog').dataset.rechunkIds = ids.join(',');
+}
+async function confirmRechunkSentences(button) {
+  const ids = ($('#dialog').dataset.rechunkIds || '').split(',').filter(Boolean).map(Number);
+  if (!ids.length) throw new Error('请至少勾选一条句子');
+  const oldLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = '正在重新分块…';
+  const errorEl = $('#rechunk-sentences-error');
+  if (errorEl) errorEl.textContent = '';
+  let result;
+  try {
+    result = await api('/api/sentences/rechunk', {method:'POST', body:JSON.stringify({sentenceIds:ids})});
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = oldLabel;
+    if (errorEl) errorEl.textContent = error.message;
+    return;
+  }
+  closeDialog();
+  toast(`已重新分块 ${result.updated} 句`);
+  try { await reloadLibrary(); }
+  catch (error) { toast(`重新加载列表失败：${error.message}`, true); }
 }
 
 async function openRetryRoundDialog() {
@@ -509,10 +566,10 @@ async function renderLibrary(collectionId = state.activeCollection) {
     groupAriaLabel: '本轮题目数量',
     initialHint: `本句集共 ${total} 句。`,
   });
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>句集详情</h1><p>筛选、查找，或勾选句子开始专项练习。</p></div><button class="btn primary" data-route="add">＋ 添加句子</button></div><div class="card practice-picker"><div><h2>开始练习</h2><p>从本句集中随机抽取题目。</p></div>${countPicker}</div><div class="toolbar"><select id="library-collection">${collectionOptions(state.activeCollection)}</select><input id="library-search" type="search" placeholder="搜索中文或日语"><select id="library-sort"><option value="created">按创建时间</option><option value="error">按错误率</option><option value="recent">按最近练习</option></select></div><div class="section-title"><h2>共 <span id="library-count">${total}</span> 条</h2><div><button class="btn outline" data-action="manage-collection">管理句集</button> <button class="btn outline" data-action="move-selected" id="move-selected-btn" disabled>转移选中句子</button> <button class="btn primary" data-action="practice-selected">专项练习</button></div></div><div id="library-list" class="card library-list"></div></section>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>句集详情</h1><p>筛选、查找，或勾选句子开始专项练习。</p></div><button class="btn primary" data-route="add">＋ 添加句子</button></div><div class="card practice-picker"><div><h2>开始练习</h2><p>从本句集中随机抽取题目。</p></div>${countPicker}</div><div class="toolbar"><select id="library-collection">${collectionOptions(state.activeCollection)}</select><input id="library-search" type="search" placeholder="搜索中文或日语"><select id="library-sort"><option value="created">按创建时间</option><option value="error">按错误率</option><option value="recent">按最近练习</option></select></div><div class="section-title library-section-title"><h2>共 <span id="library-count">${total}</span> 条</h2><div class="library-bulk-actions"><button class="btn outline" data-action="manage-collection">管理句集</button><button class="btn outline" data-action="toggle-select-all" id="select-all-btn">全选</button><button class="btn outline" data-action="rechunk-selected" id="rechunk-selected-btn" disabled>重新分块</button><button class="btn outline" data-action="move-selected" id="move-selected-btn" disabled>转移选中句子</button><button class="btn primary" data-action="practice-selected">专项练习</button></div></div><div id="library-list" class="card library-list"></div></section>`;
   renderLibraryRows(data.sentences); setChrome();
 }
-function renderLibraryRows(items) { const list = $('#library-list'); $('#library-count').textContent = items.length; list.innerHTML = items.length ? items.map(s => `<div class="library-row"><input type="checkbox" class="sentence-check" value="${s.id}" aria-label="选择句子"><div><div class="library-jp" lang="ja">${esc(s.japanese)}</div><div>${esc(s.chinese)}</div><div class="row-stats"><span>FSRS ${s.last_review_at ? '已学习' : '新卡'}</span>${s.stability == null ? '' : `<span>稳定度 ${Number(s.stability).toFixed(2)}</span>`}${s.difficulty == null ? '' : `<span>难度 ${Number(s.difficulty).toFixed(2)}</span>`}<span>下次 ${formatDate(s.next_review_at)}</span></div></div><div class="row-actions"><button class="small-btn" data-action="edit-sentence" data-id="${s.id}">编辑</button><button class="small-btn" data-action="delete-sentence" data-id="${s.id}">删除</button></div></div>`).join('') : `<div class="empty">这个句集还没有句子，先添加第一句吧。</div>`; updateMoveSelectedBtn(); }
+function renderLibraryRows(items) { const list = $('#library-list'); $('#library-count').textContent = items.length; list.innerHTML = items.length ? items.map(s => `<div class="library-row"><input type="checkbox" class="sentence-check" value="${s.id}" aria-label="选择句子"><div><div class="library-jp" lang="ja">${esc(s.japanese)}</div><div>${esc(s.chinese)}</div><div class="row-stats"><span>FSRS ${s.last_review_at ? '已学习' : '新卡'}</span>${s.stability == null ? '' : `<span>稳定度 ${Number(s.stability).toFixed(2)}</span>`}${s.difficulty == null ? '' : `<span>难度 ${Number(s.difficulty).toFixed(2)}</span>`}<span>下次 ${formatDate(s.next_review_at)}</span></div></div><div class="row-actions"><button class="small-btn" data-action="edit-sentence" data-id="${s.id}">编辑</button><button class="small-btn" data-action="delete-sentence" data-id="${s.id}">删除</button></div></div>`).join('') : `<div class="empty">这个句集还没有句子，先添加第一句吧。</div>`; updateLibrarySelectionButtons(); }
 async function reloadLibrary() { const query = new URLSearchParams({collectionId:$('#library-collection').value, search:$('#library-search').value, sort:$('#library-sort').value}); renderLibraryRows((await api('/api/sentences?' + query)).sentences); }
 
 async function startPractice(payload) {
@@ -1140,7 +1197,7 @@ document.addEventListener('click', async event => {
         chinese?.focus();
       }
     }
-    else if (action === 'practice-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await startPractice({sentenceIds:ids}); }
+    else if (action === 'practice-selected') { const ids = selectedSentenceIds(); if (!ids.length) throw new Error('请至少勾选一条句子'); await startPractice({sentenceIds:ids}); }
     else if (action === 'edit-sentence') { state.editing = (await api(`/api/sentences/${button.dataset.id}`)).sentence; route('add', {editingId:state.editing.id}); }
     else if (action === 'delete-sentence') { if (confirm('确定删除这条句子吗？')) { await api(`/api/sentences/${button.dataset.id}`, {method:'DELETE'}); if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); reloadLibrary(); } }
     else if (action === 'close-dialog') {
@@ -1150,7 +1207,10 @@ document.addEventListener('click', async event => {
     else if (action === 'rename-collection') { const name = $('#rename-collection-name')?.value.trim(); if (!name) throw new Error('句集名称不能为空'); const id = state.activeCollection; await api(`/api/collections/${id}`, {method:'PATCH', body:JSON.stringify({name})}); state.dashboard = null; closeDialog(); toast('句集已重命名'); await renderLibrary(id); }
     else if (action === 'delete-collection-ask') openDeleteCollectionConfirm();
     else if (action === 'delete-collection-confirm') { const id = state.activeCollection; await api(`/api/collections/${id}?cascade=1`, {method:'DELETE'}); state.dashboard = null; if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); closeDialog(); toast('句集已删除'); await renderLibrary(); }
-    else if (action === 'move-selected') { const ids = $$('.sentence-check:checked').map(x => Number(x.value)); if (!ids.length) throw new Error('请至少勾选一条句子'); await ensureDashboard(); openMoveSentencesDialog(ids); }
+    else if (action === 'toggle-select-all') toggleVisibleSentenceSelection();
+    else if (action === 'rechunk-selected') { const ids = selectedSentenceIds(); if (!ids.length) throw new Error('请至少勾选一条句子'); openRechunkSentencesDialog(ids); }
+    else if (action === 'confirm-rechunk-sentences') await confirmRechunkSentences(button);
+    else if (action === 'move-selected') { const ids = selectedSentenceIds(); if (!ids.length) throw new Error('请至少勾选一条句子'); await ensureDashboard(); openMoveSentencesDialog(ids); }
     else if (action === 'confirm-move-sentences') { const ids = ($('#dialog').dataset.moveIds || '').split(',').filter(Boolean).map(Number); const targetCollectionId = Number($('#move-target-collection')?.value); if (!ids.length) throw new Error('请至少勾选一条句子'); if (!targetCollectionId) throw new Error('请选择目标句集'); const result = await api('/api/sentences/move', {method:'POST', body:JSON.stringify({sentenceIds:ids, targetCollectionId})}); state.dashboard = null; closeDialog(); toast(`已转移 ${result.moved} 句`); await renderLibrary(state.activeCollection); }
     else if (action === 'choose') { const p = state.practice, item = currentPracticeItem(p), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !item.candidates.includes(id) || item.slotAssignments.includes(id)) return; const targetIndex = item.slotAssignments.findIndex(assignedId => assignedId == null); if (targetIndex === -1) return; moveSelectedTo(id, targetIndex); }
     else if (action === 'unchoose') { const p = state.practice, item = currentPracticeItem(p), index = Number(button.dataset.index), id = button.dataset.id; if (!p || !item || item.checked || item.submitting || p.submittingRound || !Number.isInteger(index) || index < 0 || index >= item.slotAssignments.length || item.slotAssignments[index] !== id) return; removeSelectedId(id, index); }
@@ -1185,7 +1245,7 @@ document.addEventListener('click', async event => {
 });
 
 document.addEventListener('change', event => {
-  if (event.target.classList.contains('sentence-check')) { updateMoveSelectedBtn(); return; }
+  if (event.target.classList.contains('sentence-check')) { updateLibrarySelectionButtons(); return; }
   if (event.target.id === 'home-collection' || event.target.id === 'due-collection') { setActiveCollection(event.target.value); if (event.target.id === 'due-collection') state.homeDuePicker = true; renderHome().catch(error => toast(error.message, true)); return; }
   if (event.target.id === 'library-collection') { state.activeCollection = Number(event.target.value); localStorage.setItem('activeCollection', state.activeCollection); route('library', {collectionId:state.activeCollection, replace:true}); }
   if (event.target.id === 'library-sort') reloadLibrary();
