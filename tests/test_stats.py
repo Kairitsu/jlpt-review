@@ -309,7 +309,9 @@ def test_learning_overview_replaces_old_stats_fields_and_keeps_fsrs_settings(
         group for group in today["actual"]["ratings"]["groups"]
         if group["label"] == "模糊"
     )["count"] == 1
-    assert set(data) == {"generatedAt", "timezone", "timeline", "memoryMastery"}
+    assert set(data) == {
+        "generatedAt", "timezone", "timeline", "upcomingDue", "memoryMastery",
+    }
     for removed in (
         "forecast", "retentionPct", "reviewedCards",
         "stabilityDistribution", "difficultyDistribution", "fsrs", "today",
@@ -321,19 +323,27 @@ def test_learning_overview_replaces_old_stats_fields_and_keeps_fsrs_settings(
     assert client.put("/api/settings/scheduler", json={"mode": "fixed"}).status_code == 404
 
 
-def test_five_day_timeline_uses_user_timezone_event_counts_and_natural_day_due_ranges(
+def test_history_and_upcoming_due_use_user_timezone_and_half_open_day_ranges(
     tmp_path, monkeypatch
 ):
     client, db = load_app(tmp_path, monkeypatch)
     freeze_stats_clock(monkeypatch)
     collection = client.get("/api/dashboard").get_json()["collections"][0]["id"]
-    sentences = [make_sentence(client, collection, f"timeline-{index}") for index in range(4)]
+    sentences = [make_sentence(client, collection, f"timeline-{index}") for index in range(8)]
     assert client.put(
         "/api/settings/timezone", json={"timezone": "Asia/Shanghai"}
     ).status_code == 200
 
-    # Frozen UTC time is 23:30 on Jan 2 in Shanghai. These events straddle UTC
-    # dates but must follow Shanghai's [00:00, 24:00) natural days.
+    # Frozen time is 23:30 on Jan 2 in Shanghai. Both learning events and due
+    # cards must follow Shanghai's [00:00, 24:00) natural days.
+    add_review_event(
+        db, sentences[0]["id"], reviewed_at="2025-12-28T15:59:59+00:00",
+        rating=Rating.Again, duration_ms=50, is_new=False,
+    )
+    add_review_event(
+        db, sentences[0]["id"], reviewed_at="2025-12-28T16:00:00+00:00",
+        rating=Rating.Again, duration_ms=100, is_new=False,
+    )
     add_review_event(
         db, sentences[0]["id"], reviewed_at="2026-01-01T15:59:59+00:00",
         rating=Rating.Again, duration_ms=500, is_new=True,
@@ -346,6 +356,10 @@ def test_five_day_timeline_uses_user_timezone_event_counts_and_natural_day_due_r
         db, sentences[0]["id"], reviewed_at="2026-01-02T15:59:59+00:00",
         rating=Rating.Good, duration_ms=60_000, is_new=False,
     )
+    add_review_event(
+        db, sentences[0]["id"], reviewed_at="2026-01-02T16:00:00+00:00",
+        rating=Rating.Easy, duration_ms=70_000, is_new=False,
+    )
     with db.get_db() as connection:
         connection.executemany(
             "UPDATE sentences SET next_review_at=? WHERE id=?",
@@ -353,7 +367,11 @@ def test_five_day_timeline_uses_user_timezone_event_counts_and_natural_day_due_r
                 ("2025-12-20T00:00:00+00:00", sentences[0]["id"]),
                 (FROZEN_NOW.isoformat(timespec="seconds"), sentences[1]["id"]),
                 ("2026-01-02T16:00:00+00:00", sentences[2]["id"]),
-                ("2026-01-03T16:00:00+00:00", sentences[3]["id"]),
+                ("2026-01-03T15:59:59+00:00", sentences[3]["id"]),
+                ("2026-01-03T16:00:00+00:00", sentences[4]["id"]),
+                ("2026-01-04T16:00:00+00:00", sentences[5]["id"]),
+                ("2026-01-05T15:59:59+00:00", sentences[6]["id"]),
+                ("2026-01-05T16:00:00+00:00", sentences[7]["id"]),
             ],
         )
 
@@ -362,20 +380,24 @@ def test_five_day_timeline_uses_user_timezone_event_counts_and_natural_day_due_r
     assert data["generatedAt"] == FROZEN_NOW.isoformat(timespec="seconds")
     assert data["timezone"] == {"name": "Asia/Shanghai", "source": "user"}
     assert [day["date"] for day in timeline] == [
-        "2025-12-31", "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04",
+        "2025-12-29", "2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02",
     ]
     assert [day["relativeLabel"] for day in timeline] == [
-        "前天", "昨天", "今天", "明天", "后天",
+        "4天前", "3天前", "前天", "昨天", "今天",
     ]
+    assert [day["isToday"] for day in timeline] == [False, False, False, False, True]
     assert all(
         datetime.fromisoformat(right["date"]).date()
         - datetime.fromisoformat(left["date"]).date() == timedelta(days=1)
         for left, right in zip(timeline, timeline[1:])
     )
-    assert timeline[0]["actual"]["completedCount"] == 0
-    yesterday = timeline[1]["actual"]
+    assert timeline[0]["actual"]["completedCount"] == 1
+    assert timeline[0]["actual"]["durationMs"] == 100
+    assert timeline[1]["actual"]["completedCount"] == 0
+    assert timeline[2]["actual"]["completedCount"] == 0
+    yesterday = timeline[3]["actual"]
     assert yesterday["completedCount"] == yesterday["newCount"] + yesterday["reviewCount"] == 1
-    today = timeline[2]["actual"]
+    today = timeline[4]["actual"]
     assert today["completedCount"] == today["newCount"] + today["reviewCount"] == 2
     assert today["durationMs"] == 90_500
     assert today["ratings"]["validCount"] == 2
@@ -383,20 +405,33 @@ def test_five_day_timeline_uses_user_timezone_event_counts_and_natural_day_due_r
     assert {group["label"]: group["percentage"] for group in today["ratings"]["groups"]} == {
         "忘记": 0.0, "模糊": 50.0, "认识": 50.0, "轻松掌握": 0.0,
     }
-    assert timeline[3]["actual"] is None and timeline[4]["actual"] is None
-    assert timeline[0]["due"] is None and timeline[1]["due"] is None
-    assert timeline[2]["due"] == {"kind": "current", "count": 2}
-    assert timeline[3]["due"] == {"kind": "scheduled", "count": 1}
-    assert timeline[4]["due"] == {"kind": "scheduled", "count": 1}
+    assert all("due" not in day for day in timeline)
+
+    assert data["upcomingDue"] == [
+        {
+            "date": "2026-01-03", "monthDay": "1月3日", "weekday": "星期六",
+            "relativeLabel": "明天", "count": 2,
+        },
+        {
+            "date": "2026-01-04", "monthDay": "1月4日", "weekday": "星期日",
+            "relativeLabel": "后天", "count": 1,
+        },
+        {
+            "date": "2026-01-05", "monthDay": "1月5日", "weekday": "星期一",
+            "relativeLabel": "3天后", "count": 2,
+        },
+    ]
+    assert sum(day["count"] for day in data["upcomingDue"]) == 5
 
 
-def test_empty_learning_days_and_ratings_distinguish_zero_from_future_no_data(
+def test_empty_stats_keep_five_history_days_and_three_upcoming_rows(
     tmp_path, monkeypatch
 ):
     client, _ = load_app(tmp_path, monkeypatch)
     freeze_stats_clock(monkeypatch)
     data = client.get("/api/stats/summary").get_json()
-    for day in data["timeline"][:3]:
+    assert len(data["timeline"]) == 5
+    for day in data["timeline"]:
         assert day["actual"]["completedCount"] == 0
         assert day["actual"]["durationMs"] == 0
         assert day["actual"]["ratings"]["validCount"] == 0
@@ -404,8 +439,11 @@ def test_empty_learning_days_and_ratings_distinguish_zero_from_future_no_data(
             group["percentage"] is None
             for group in day["actual"]["ratings"]["groups"]
         )
-    assert data["timeline"][3]["actual"] is None
-    assert data["timeline"][4]["actual"] is None
+    assert len(data["upcomingDue"]) == 3
+    assert [day["relativeLabel"] for day in data["upcomingDue"]] == [
+        "明天", "后天", "3天后",
+    ]
+    assert [day["count"] for day in data["upcomingDue"]] == [0, 0, 0]
     assert data["memoryMastery"]["effectiveSentenceCount"] == 0
     assert data["memoryMastery"]["untrackedSentenceCount"] == 0
 
@@ -509,15 +547,36 @@ def test_memory_mastery_uses_official_service_boundary_and_exclusive_ranges(
     assert untracked["id"] not in {sentence_id for sentence_id, _ in calls}
 
 
-def test_stats_frontend_keeps_chartjs_and_has_lifecycle_and_keyboard_controls():
+def test_stats_frontend_has_two_history_views_upcoming_table_and_dynamic_today():
     root = Path(__file__).parents[1]
     html = (root / "static" / "index.html").read_text()
     source = (root / "static" / "stats.js").read_text()
+    styles = (root / "static" / "styles.css").read_text()
     assert '/static/vendor/chart.umd.min.js' in html
     assert "destroyStatsCharts" in source
     assert ".destroy()" in source
+    assert "calendarView: 'performance'" in source
+    assert "学习表现" in source and "学习时长" in source
     assert "stats-view" in source
     assert "stats-series" in source
     assert "restore" in source
     assert "aria-pressed" in source
     assert "keydown" in source
+    assert "学习数量" not in source
+    assert "quantity" not in source
+    assert "新学句数" not in source and "复习句数" not in source and "到期句数" not in source
+    assert "stats-calendar-summary" not in source
+    assert "stats-day-summary" not in source and "stats-day-summary" not in styles
+    assert 'aria-describedby="stats-calendar-summary"' not in source
+    assert "stats-memory-series" not in source
+    assert "stats-restore-memory" not in source
+    assert "hiddenMasteryGroups" not in source
+    assert "masteryControlsHtml" not in source
+    assert "chartWrap.classList.toggle('hidden', !hasSentences)" in source
+    assert "<table" in source and "stats-upcoming-table" in source
+    assert "未来三天预计到期" in source
+    assert "findIndex(day => day.isToday)" in source
+    assert "getPixelForValue(todayIndex)" in source
+    assert "context.index === todayIndex" in source
+    assert "getPixelForValue(2)" not in source
+    assert "context.index === 2" not in source

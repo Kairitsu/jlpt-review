@@ -3,9 +3,6 @@
 
 const STATS_FONT_FAMILY = '"Noto Sans SC", system-ui, -apple-system, sans-serif';
 const STATS_COLORS = {
-  newCount: '#1b8f7b',
-  reviewCount: '#78b7a5',
-  dueCount: '#c77b32',
   forgotten: '#c65f59',
   uncertain: '#d39b3b',
   recognized: '#4f9b78',
@@ -18,20 +15,17 @@ const STATS_COLORS = {
   untracked: '#9aaca8',
 };
 const CALENDAR_VIEWS = {
-  quantity: '学习数量',
   performance: '学习表现',
   duration: '学习时长',
 };
 const statsCharts = {};
 const statsState = {
   data: null,
-  calendarView: 'quantity',
+  calendarView: 'performance',
   hiddenCalendarSeries: {
-    quantity: new Set(),
     performance: new Set(),
     duration: new Set(),
   },
-  hiddenMasteryGroups: new Set(),
 };
 
 function destroyChart(name) {
@@ -74,10 +68,6 @@ function ratingGroup(day, key) {
   return day.actual?.ratings?.groups?.find(group => group.key === key) || null;
 }
 
-function masteryGroup(key) {
-  return statsState.data?.memoryMastery?.groups?.find(group => group.key === key) || null;
-}
-
 function tooltipOptions(callbacks) {
   return {
     backgroundColor: 'rgba(22, 63, 55, .96)',
@@ -107,17 +97,24 @@ function baseChartOptions() {
 
 const todayBandPlugin = {
   id: 'statsTodayBand',
-  beforeDatasetsDraw(chart) {
+  beforeDatasetsDraw(chart, _args, pluginOptions) {
+    const todayIndex = pluginOptions?.todayIndex;
     const x = chart.scales.x;
-    if (!x || !chart.chartArea) return;
-    const center = x.getPixelForValue(2);
-    const previous = x.getPixelForValue(1);
-    const next = x.getPixelForValue(3);
-    const half = Math.min(Math.abs(center - previous), Math.abs(next - center)) / 2;
+    if (!x || !chart.chartArea || !Number.isInteger(todayIndex) || todayIndex < 0) return;
+    const center = x.getPixelForValue(todayIndex);
+    let spacing = chart.chartArea.right - chart.chartArea.left;
+    if (todayIndex > 0) {
+      spacing = Math.abs(center - x.getPixelForValue(todayIndex - 1));
+    } else if (todayIndex < chart.data.labels.length - 1) {
+      spacing = Math.abs(x.getPixelForValue(todayIndex + 1) - center);
+    }
+    const half = spacing / 2;
     const {ctx, chartArea} = chart;
+    const left = Math.max(chartArea.left, center - half);
+    const right = Math.min(chartArea.right, center + half);
     ctx.save();
     ctx.fillStyle = 'rgba(27, 143, 123, .075)';
-    ctx.fillRect(center - half, chartArea.top, half * 2, chartArea.bottom - chartArea.top);
+    ctx.fillRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
     ctx.restore();
   },
 };
@@ -127,13 +124,6 @@ function axisTitle(text) {
 }
 
 function calendarSeries(viewName) {
-  if (viewName === 'quantity') {
-    return [
-      {key: 'newCount', label: '新学句数'},
-      {key: 'reviewCount', label: '复习句数'},
-      {key: 'dueCount', label: '到期句数'},
-    ];
-  }
   if (viewName === 'performance') {
     return [
       {key: 'forgotten', label: '忘记'},
@@ -158,82 +148,15 @@ function viewControlsHtml() {
   return Object.entries(CALENDAR_VIEWS).map(([key, label]) => `<button class="stats-view-button ${statsState.calendarView === key ? 'active' : ''}" type="button" data-action="stats-view" data-view="${key}" aria-pressed="${statsState.calendarView === key}">${label}</button>`).join('');
 }
 
-function quantitySummary(day) {
-  const due = day.due;
-  if (!day.actual) {
-    return `${day.relativeLabel}，实际学习尚未发生；预计到期 ${due?.count ?? 0} 句`;
-  }
-  const actual = day.actual;
-  const parts = [
-    `完成 ${actual.completedCount} 句`,
-    `新学 ${actual.newCount} 句`,
-    `复习 ${actual.reviewCount} 句`,
-  ];
-  if (due?.kind === 'current') parts.push(`当前待复习 ${due.count} 句`);
-  return `${day.relativeLabel}，${parts.join('；')}`;
-}
-
-function performanceSummary(day) {
-  if (!day.actual) return `${day.relativeLabel}，日期尚未发生，没有实际学习表现数据`;
-  const ratings = day.actual.ratings;
-  if (!ratings.validCount) return `${day.relativeLabel}，没有正式生成的学习结果`;
-  const groups = ratings.groups.map(group => `${group.label} ${group.count} 句（${formatPercent(group.percentage)}）`);
-  return `${day.relativeLabel}，${groups.join('；')}；有效评分共 ${ratings.validCount} 条`;
-}
-
-function durationSummary(day) {
-  if (!day.actual) return `${day.relativeLabel}，日期尚未发生，没有实际学习时长`;
-  return `${day.relativeLabel}，学习时长 ${formatDurationMs(day.actual.durationMs)}`;
-}
-
-function calendarSummaryText(day) {
-  if (statsState.calendarView === 'quantity') return quantitySummary(day);
-  if (statsState.calendarView === 'performance') return performanceSummary(day);
-  return durationSummary(day);
-}
-
-function calendarSummaryHtml() {
-  return statsState.data.timeline.map((day, index) => `<div class="stats-day-summary stats-data-point ${day.isToday ? 'today' : ''}" tabindex="0" data-chart="calendar" data-index="${index}" aria-label="${esc(calendarSummaryText(day))}"><strong>${esc(day.relativeLabel)}</strong><span>${esc(day.monthDay)} · ${esc(day.weekday)}</span><small>${esc(calendarSummaryText(day).replace(`${day.relativeLabel}，`, ''))}</small></div>`).join('');
-}
-
 function calendarHasData() {
-  const actualDays = statsState.data.timeline.filter(day => day.actual);
   if (statsState.calendarView === 'performance') {
-    return actualDays.some(day => day.actual.ratings.validCount > 0);
+    return statsState.data.timeline.some(day => day.actual.ratings.validCount > 0);
   }
-  if (statsState.calendarView === 'duration') {
-    return actualDays.some(day => day.actual.durationMs > 0);
-  }
-  return actualDays.some(day => day.actual.completedCount > 0)
-    || statsState.data.timeline.some(day => day.due?.count > 0);
+  return statsState.data.timeline.some(day => day.actual.durationMs > 0);
 }
 
 function calendarDatasets() {
   const timeline = statsState.data.timeline;
-  if (statsState.calendarView === 'quantity') {
-    return [
-      {
-        key: 'newCount', label: '新学句数', type: 'bar', stack: 'completed',
-        data: timeline.map(day => day.actual?.newCount ?? null),
-        backgroundColor: STATS_COLORS.newCount, borderRadius: 7, borderSkipped: false,
-        maxBarThickness: 42,
-      },
-      {
-        key: 'reviewCount', label: '复习句数', type: 'bar', stack: 'completed',
-        data: timeline.map(day => day.actual?.reviewCount ?? null),
-        backgroundColor: STATS_COLORS.reviewCount, borderRadius: 7, borderSkipped: false,
-        maxBarThickness: 42,
-      },
-      {
-        key: 'dueCount', label: '到期句数', type: 'line',
-        data: timeline.map(day => day.due?.count ?? null),
-        borderColor: STATS_COLORS.dueCount, backgroundColor: '#fff8e8',
-        pointBackgroundColor: STATS_COLORS.dueCount, pointBorderColor: '#fff',
-        pointBorderWidth: 2, pointRadius: 5, pointHoverRadius: 7,
-        borderWidth: 2.5, tension: 0.28, spanGaps: false,
-      },
-    ];
-  }
   if (statsState.calendarView === 'performance') {
     return calendarSeries('performance').map(item => ({
       key: item.key,
@@ -261,22 +184,6 @@ function calendarDatasets() {
 }
 
 function calendarTooltipCallbacks() {
-  if (statsState.calendarView === 'quantity') {
-    return {
-      label(context) {
-        const day = statsState.data.timeline[context.dataIndex];
-        if (context.dataset.key === 'dueCount') {
-          const label = day.due?.kind === 'current' ? '当前待复习' : '预计到期';
-          return `${label}：${day.due?.count ?? 0} 句`;
-        }
-        return `${context.dataset.label}：${context.raw} 句`;
-      },
-      footer(items) {
-        const actual = statsState.data.timeline[items[0]?.dataIndex]?.actual;
-        return actual ? `当天完成共 ${actual.completedCount} 句` : '';
-      },
-    };
-  }
   if (statsState.calendarView === 'performance') {
     return {
       label(context) {
@@ -304,16 +211,18 @@ function renderCalendarChart() {
   if (!canvas || typeof Chart === 'undefined') return;
   const viewName = statsState.calendarView;
   const hidden = statsState.hiddenCalendarSeries[viewName];
+  const todayIndex = statsState.data.timeline.findIndex(day => day.isToday);
   const options = baseChartOptions();
   options.plugins.tooltip = tooltipOptions(calendarTooltipCallbacks());
+  options.plugins.statsTodayBand = {todayIndex};
   options.scales = {
     x: {
       stacked: viewName !== 'duration',
       grid: {display: false},
       border: {display: false},
       ticks: {
-        color: context => context.index === 2 ? '#146b5a' : '#68827d',
-        font: context => ({size: window.innerWidth <= 480 ? 10 : 12, weight: context.index === 2 ? '700' : '500'}),
+        color: context => context.index === todayIndex ? '#146b5a' : '#68827d',
+        font: context => ({size: window.innerWidth <= 480 ? 10 : 12, weight: context.index === todayIndex ? '700' : '500'}),
         autoSkip: false,
         maxRotation: 0,
       },
@@ -348,29 +257,18 @@ function renderCalendarChart() {
 
 function renderCalendarView() {
   const controls = document.getElementById('stats-calendar-series');
-  const summary = document.getElementById('stats-calendar-summary');
   const empty = document.getElementById('stats-calendar-empty');
   const gradeHint = document.getElementById('stats-grade-hint');
   if (controls) controls.innerHTML = seriesControlsHtml(statsState.calendarView);
-  if (summary) summary.innerHTML = calendarSummaryHtml();
   if (empty) {
     const copy = statsState.calendarView === 'performance'
       ? '这五天内还没有正式生成的学习结果。'
-      : (statsState.calendarView === 'duration' ? '这五天内还没有学习时长记录。' : '目前没有学习记录或待复习安排。');
+      : '这五天内还没有学习时长记录。';
     empty.textContent = copy;
     empty.classList.toggle('hidden', calendarHasData());
   }
   if (gradeHint) gradeHint.classList.toggle('hidden', statsState.calendarView !== 'performance');
   renderCalendarChart();
-}
-
-function masteryControlsHtml() {
-  const groups = statsState.data.memoryMastery.groups;
-  const buttons = groups.map(group => {
-    const visible = !statsState.hiddenMasteryGroups.has(group.key);
-    return `<button class="stats-filter ${visible ? 'active' : ''}" type="button" data-action="stats-memory-series" data-series="${group.key}" aria-pressed="${visible}" aria-label="${visible ? '隐藏' : '显示'}${esc(group.label)}"><i style="--series-color:${STATS_COLORS[group.key]}" aria-hidden="true"></i>${esc(group.label)}</button>`;
-  }).join('');
-  return `${buttons}<button class="stats-restore" type="button" data-action="stats-restore-memory">全部显示</button>`;
 }
 
 function masterySummaryText(group) {
@@ -388,9 +286,11 @@ function renderMasteryChart() {
   destroyChart('mastery');
   const canvas = document.getElementById('chart-memory-mastery');
   const empty = document.getElementById('stats-memory-empty');
+  const chartWrap = canvas?.closest('.stats-chart-wrap');
   const mastery = statsState.data.memoryMastery;
   const hasSentences = mastery.totalSentenceCount > 0;
   if (empty) empty.classList.toggle('hidden', hasSentences);
+  if (chartWrap) chartWrap.classList.toggle('hidden', !hasSentences);
   if (canvas) canvas.classList.toggle('hidden', !hasSentences);
   if (!canvas || !hasSentences || typeof Chart === 'undefined') return;
   const groups = mastery.groups;
@@ -423,7 +323,7 @@ function renderMasteryChart() {
       labels: groups.map(group => group.label),
       datasets: [{
         label: '句子数',
-        data: groups.map(group => statsState.hiddenMasteryGroups.has(group.key) ? null : group.count),
+        data: groups.map(group => group.count),
         backgroundColor: groups.map(group => STATS_COLORS[group.key]),
         borderRadius: 8, borderSkipped: false, maxBarThickness: 34,
       }],
@@ -433,11 +333,14 @@ function renderMasteryChart() {
 }
 
 function renderMasteryView() {
-  const controls = document.getElementById('stats-memory-series');
   const list = document.getElementById('stats-memory-list');
-  if (controls) controls.innerHTML = masteryControlsHtml();
   if (list) list.innerHTML = masteryListHtml();
   renderMasteryChart();
+}
+
+function upcomingDueTableHtml(days) {
+  const rows = days.map(day => `<tr><th scope="row">${esc(day.monthDay)} · ${esc(day.relativeLabel)}</th><td>${esc(day.weekday)}</td><td>${day.count} 句</td></tr>`).join('');
+  return `<div class="stats-upcoming-table-wrap"><table class="stats-upcoming-table" aria-labelledby="stats-upcoming-title"><thead><tr><th scope="col">日期</th><th scope="col">星期</th><th scope="col">预计到期</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function statsPageHtml(data) {
@@ -446,23 +349,25 @@ function statsPageHtml(data) {
   return `<section class="page stats-page">
     <div class="page-head"><div><h1>学习概览</h1><p>查看近期学习情况、未来复习安排和当前记忆状态。</p></div></div>
     <article class="card stats-card stats-calendar-card">
-      <div class="stats-card-head"><div><h2>学习与复习日历</h2><p>过去两天、今天，以及未来两天的安排</p></div><span class="stats-timezone" title="统计生成时间：${esc(data.generatedAt)}">${esc(timezoneLabel)}</span></div>
+      <div class="stats-card-head"><div><h2>学习日历</h2><p>查看最近五天的学习表现与学习时长。</p></div><span class="stats-timezone" title="统计生成时间：${esc(data.generatedAt)}">${esc(timezoneLabel)}</span></div>
       <div class="stats-view-switch" role="group" aria-label="日历图表视图">${viewControlsHtml()}</div>
       <div id="stats-calendar-series" class="stats-series-controls" aria-label="日历图表显示项目"></div>
       <p id="stats-calendar-empty" class="stats-empty-inline hidden" role="status"></p>
-      <div class="stats-chart-wrap stats-calendar-chart"><canvas id="chart-learning-calendar" role="img" aria-label="学习与复习日历图表" aria-describedby="stats-calendar-summary"></canvas></div>
-      <div id="stats-calendar-summary" class="stats-day-summaries" aria-label="学习与复习日历数值摘要"></div>
+      <div class="stats-chart-wrap stats-calendar-chart"><canvas id="chart-learning-calendar" role="img" aria-label="学习日历图表"></canvas></div>
       <div id="stats-grade-hint" class="stats-grade-hint hidden">
         <p><strong>忘记：</strong>第一次核对错误，第二次仍未正确，或没有完成纠正；</p>
         <p><strong>模糊：</strong>第一次核对错误，第二次核对正确；</p>
         <p><strong>认识：</strong>本次第一次核对正确，但尚未形成连续稳定表现；</p>
         <p><strong>轻松掌握：</strong>本次第一次核对正确，并且上一次练习也是第一次核对正确。</p>
       </div>
+    </article>
+    <article class="card stats-card stats-upcoming-card">
+      <div class="stats-card-head"><div><h2 id="stats-upcoming-title">未来三天预计到期</h2></div></div>
+      ${upcomingDueTableHtml(data.upcomingDue)}
       <p class="stats-footnote">未来复习数量依据当前学习进度估算，完成新的练习后可能发生变化。</p>
     </article>
     <article class="card stats-card stats-memory-card">
       <div class="stats-card-head"><div><h2>当前记忆掌握度</h2><p>有效记录 ${mastery.effectiveSentenceCount} 句 · 尚无有效记录 ${mastery.untrackedSentenceCount} 句</p></div></div>
-      <div id="stats-memory-series" class="stats-series-controls stats-memory-controls" aria-label="记忆掌握度显示范围"></div>
       <p id="stats-memory-empty" class="stats-empty-inline hidden" role="status">还没有已学习的句子，完成学习后这里会显示记忆状态。</p>
       <div class="stats-chart-wrap stats-memory-chart"><canvas id="chart-memory-mastery" role="img" aria-label="当前记忆掌握度图表" aria-describedby="stats-memory-list"></canvas></div>
       <div id="stats-memory-list" class="stats-mastery-list" aria-label="当前记忆掌握度文字摘要"></div>
@@ -473,6 +378,8 @@ function statsPageHtml(data) {
 
 async function renderStats() {
   destroyStatsCharts();
+  statsState.calendarView = 'performance';
+  Object.values(statsState.hiddenCalendarSeries).forEach(hidden => hidden.clear());
   view.innerHTML = '<section class="page stats-page"><p class="status-note">正在整理学习概览…</p></section>';
   setChrome();
   try {
@@ -521,19 +428,6 @@ function handleStatsAction(action, button) {
     statsState.hiddenCalendarSeries[statsState.calendarView].clear();
     document.getElementById('stats-calendar-series').innerHTML = seriesControlsHtml(statsState.calendarView);
     updateCalendarSeriesVisibility();
-    return true;
-  }
-  if (action === 'stats-memory-series') {
-    const key = button.dataset.series;
-    statsState.hiddenMasteryGroups.has(key)
-      ? statsState.hiddenMasteryGroups.delete(key)
-      : statsState.hiddenMasteryGroups.add(key);
-    renderMasteryView();
-    return true;
-  }
-  if (action === 'stats-restore-memory') {
-    statsState.hiddenMasteryGroups.clear();
-    renderMasteryView();
     return true;
   }
   return false;

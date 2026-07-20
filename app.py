@@ -240,12 +240,17 @@ def user_timezone(db) -> str:
     return setting(db, "user_timezone", "")
 
 
-_STATS_RELATIVE_DAYS = (
+_STATS_TIMELINE_DAYS = (
+    (-4, "4天前"),
+    (-3, "3天前"),
     (-2, "前天"),
     (-1, "昨天"),
     (0, "今天"),
+)
+_STATS_UPCOMING_DAYS = (
     (1, "明天"),
     (2, "后天"),
+    (3, "3天后"),
 )
 _STATS_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 _STATS_RATINGS = (
@@ -289,19 +294,15 @@ def _daily_rating_summary(counts: dict[str, int]) -> dict:
     }
 
 
-def _stats_timeline(events, now_dt: datetime, tz_name: str) -> tuple[list[dict], list[tuple]]:
-    """Build five user-calendar days and aggregate persisted completion events."""
+def _stats_timeline(events, now_dt: datetime, tz_name: str) -> list[dict]:
+    """Aggregate persisted learning events across five user-calendar days."""
     today = local_date(now_dt, tz_name=tz_name)
     days = []
     actual_by_date = {}
-    bounds = []
-    for offset, relative_label in _STATS_RELATIVE_DAYS:
+    for offset, relative_label in _STATS_TIMELINE_DAYS:
         day = today + timedelta(days=offset)
-        start, end = local_date_utc_bounds(day, tz_name=tz_name)
-        bounds.append((start, end))
-        actual = _empty_daily_learning() if offset <= 0 else None
-        if actual is not None:
-            actual_by_date[day.isoformat()] = actual
+        actual = _empty_daily_learning()
+        actual_by_date[day.isoformat()] = actual
         days.append({
             "date": day.isoformat(),
             "monthDay": f"{day.month}月{day.day}日",
@@ -309,7 +310,6 @@ def _stats_timeline(events, now_dt: datetime, tz_name: str) -> tuple[list[dict],
             "relativeLabel": relative_label,
             "isToday": offset == 0,
             "actual": actual,
-            "due": None,
         })
 
     rating_key_by_value = {int(rating): key for rating, key, _ in _STATS_RATINGS}
@@ -332,11 +332,34 @@ def _stats_timeline(events, now_dt: datetime, tz_name: str) -> tuple[list[dict],
 
     for item in days:
         actual = item["actual"]
-        if actual is None:
-            continue
         counts = actual.pop("ratingCounts")
         actual["ratings"] = _daily_rating_summary(counts)
-    return days, bounds
+    return days
+
+
+def _stats_upcoming_due(db, now_dt: datetime, tz_name: str) -> list[dict]:
+    """Count cards due in the next three user-calendar days, excluding today."""
+    today = local_date(now_dt, tz_name=tz_name)
+    days = []
+    for offset, relative_label in _STATS_UPCOMING_DAYS:
+        day = today + timedelta(days=offset)
+        start, end = local_date_utc_bounds(day, tz_name=tz_name)
+        count = db.execute(
+            """SELECT COUNT(*) n FROM sentences
+               WHERE next_review_at>=? AND next_review_at<?""",
+            (
+                start.isoformat(timespec="seconds"),
+                end.isoformat(timespec="seconds"),
+            ),
+        ).fetchone()["n"]
+        days.append({
+            "date": day.isoformat(),
+            "monthDay": f"{day.month}月{day.day}日",
+            "weekday": _STATS_WEEKDAYS[day.weekday()],
+            "relativeLabel": relative_label,
+            "count": count,
+        })
+    return days
 
 
 def _memory_mastery_summary(sentences, now_dt: datetime) -> dict:
@@ -1701,7 +1724,7 @@ def create_app(test_config=None):
             tz = user_timezone(db)
             today = local_date(now_dt, tz_name=tz)
             event_start = local_date_utc_bounds(
-                today - timedelta(days=2), tz_name=tz
+                today - timedelta(days=4), tz_name=tz
             )[0].isoformat(timespec="seconds")
             event_end = local_date_utc_bounds(
                 today + timedelta(days=1), tz_name=tz
@@ -1712,33 +1735,9 @@ def create_app(test_config=None):
                 (event_start, event_end),
             )]
             sentences = [dict(row) for row in db.execute("SELECT * FROM sentences")]
-            timeline, bounds = _stats_timeline(events, now_dt, tz)
-            current_due = db.execute(
-                "SELECT COUNT(*) n FROM sentences WHERE next_review_at<=?", (now,)
-            ).fetchone()["n"]
-            tomorrow_due = db.execute(
-                """SELECT COUNT(*) n FROM sentences
-                   WHERE next_review_at>=? AND next_review_at<?""",
-                (
-                    bounds[3][0].isoformat(timespec="seconds"),
-                    bounds[3][1].isoformat(timespec="seconds"),
-                ),
-            ).fetchone()["n"]
-            day_after_tomorrow_due = db.execute(
-                """SELECT COUNT(*) n FROM sentences
-                   WHERE next_review_at>=? AND next_review_at<?""",
-                (
-                    bounds[4][0].isoformat(timespec="seconds"),
-                    bounds[4][1].isoformat(timespec="seconds"),
-                ),
-            ).fetchone()["n"]
+            timeline = _stats_timeline(events, now_dt, tz)
+            upcoming_due = _stats_upcoming_due(db, now_dt, tz)
 
-        timeline[2]["due"] = {"kind": "current", "count": current_due}
-        timeline[3]["due"] = {"kind": "scheduled", "count": tomorrow_due}
-        timeline[4]["due"] = {
-            "kind": "scheduled",
-            "count": day_after_tomorrow_due,
-        }
         return jsonify(
             generatedAt=now,
             timezone={
@@ -1746,6 +1745,7 @@ def create_app(test_config=None):
                 "source": "user" if tz else "server",
             },
             timeline=timeline,
+            upcomingDue=upcoming_due,
             memoryMastery=_memory_mastery_summary(sentences, now_dt),
         )
 
