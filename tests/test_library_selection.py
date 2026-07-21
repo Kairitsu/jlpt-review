@@ -180,11 +180,22 @@ def test_library_bulk_controls_dialog_sticky_and_mobile_contracts():
     assert "正在重新分块…" in source
     assert "await reloadLibrary()" in source
     assert "if (errorEl) errorEl.textContent = error.message" in source
-    assert "将为已选的 ${ids.length} 句添加同一条备注" in source
+    assert "批量覆盖备注" in source
+    assert "原有备注会被彻底替换" in source
+    assert "确认覆盖" in source
     assert 'maxlength="1000"' in source
-    assert "正在添加…" in source
+    assert "正在覆盖…" in source
     assert "await api('/api/sentences/batch-note'" in source
-    assert "toast(`已为 ${ids.length} 句添加备注`)" in source
+    assert "result.updated" in source
+    assert "已覆盖" in source
+    assert "备注已经是相同内容" in source
+    batch_dialog = source.split(
+        "function openBatchNoteDialog", 1
+    )[1].split(
+        "async function confirmBatchNote", 1
+    )[0]
+    assert "已有备注会保留" not in batch_dialog
+    assert "追加在原备注之后" not in batch_dialog
     assert "window.scrollTo({top:scrollPosition" in source
     assert ".library-bulk-actions" in styles
     assert ".library-sticky-toolbar{position:sticky" in styles

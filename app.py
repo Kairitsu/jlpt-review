@@ -1215,7 +1215,7 @@ def create_app(test_config=None):
             return jsonify(error=f"备注不能超过 {MAX_SENTENCE_NOTE_LENGTH} 个字符"), 400
 
         placeholders = ",".join("?" for _ in sentence_ids)
-        prepared = []
+        changed_ids = []
         db = get_db()
         try:
             with db:
@@ -1235,30 +1235,22 @@ def create_app(test_config=None):
 
                 for sentence_id in sentence_ids:
                     existing = rows_by_id[sentence_id]["note"] or ""
-                    if existing == note or existing.endswith(f"\n{note}"):
-                        continue
-                    appended = note if not existing else f"{existing}\n{note}"
-                    if len(appended) > MAX_SENTENCE_NOTE_LENGTH:
-                        return jsonify(
-                            error=(
-                                f"句子 {sentence_id} 追加备注后将超过 "
-                                f"{MAX_SENTENCE_NOTE_LENGTH} 个字符；整批未作修改"
-                            )
-                        ), 400
-                    prepared.append((appended, sentence_id))
+                    if existing != note:
+                        changed_ids.append(sentence_id)
 
-                stamp = now_iso()
-                for appended, sentence_id in prepared:
-                    db.execute(
-                        "UPDATE sentences SET note=?,updated_at=? WHERE id=?",
-                        (appended, stamp, sentence_id),
-                    )
+                if changed_ids:
+                    stamp = now_iso()
+                    for sentence_id in changed_ids:
+                        db.execute(
+                            "UPDATE sentences SET note=?,updated_at=? WHERE id=?",
+                            (note, stamp, sentence_id),
+                        )
         finally:
             db.close()
 
-        if prepared:
+        if changed_ids:
             rebuild_fonts()
-        return jsonify(ok=True, updated=len(prepared))
+        return jsonify(ok=True, updated=len(changed_ids))
 
     @app.post("/api/sentences/move")
     def move_sentences():

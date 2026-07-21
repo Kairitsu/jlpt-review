@@ -206,7 +206,7 @@ function openRechunkSentencesDialog(ids) {
   $('#dialog').dataset.rechunkIds = ids.join(',');
 }
 function openBatchNoteDialog(ids) {
-  openDialog(`<div class="batch-note-dialog"><h1>批量添加备注</h1><p class="batch-note-copy">将为已选的 ${ids.length} 句添加同一条备注。已有备注会保留，新内容将追加在原备注之后。</p><label>备注内容<textarea id="batch-note-input" class="note-input" maxlength="1000" placeholder="例如：に限って：与平日不同、偏偏、特别相信"></textarea></label><p id="batch-note-error" class="form-error batch-note-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-batch-note" id="confirm-batch-note-btn">确认添加</button></div></div>`, { className: 'batch-note-modal', label: '批量添加备注' });
+  openDialog(`<div class="batch-note-dialog"><h1>批量覆盖备注</h1><p class="batch-note-copy">将用同一条新备注覆盖已选的 ${ids.length} 句。原有备注会被彻底替换，无法通过本操作恢复。</p><label>备注内容<textarea id="batch-note-input" class="note-input" maxlength="1000" placeholder="例如：に限って：与平日不同、偏偏、特别相信"></textarea></label><p id="batch-note-error" class="form-error batch-note-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-batch-note" id="confirm-batch-note-btn">确认覆盖</button></div></div>`, { className: 'batch-note-modal', label: '批量覆盖备注' });
   $('#dialog').dataset.batchNoteIds = ids.join(',');
   requestAnimationFrame(() => $('#batch-note-input')?.focus());
 }
@@ -227,16 +227,17 @@ async function confirmBatchNote(button) {
 
   const actionButtons = $$('.batch-note-dialog .form-actions button');
   actionButtons.forEach(item => { item.disabled = true; });
-  button.textContent = '正在添加…';
+  button.textContent = '正在覆盖…';
   if (errorEl) errorEl.textContent = '';
+  let result;
   try {
-    await api('/api/sentences/batch-note', {
+    result = await api('/api/sentences/batch-note', {
       method:'POST',
       body:JSON.stringify({sentenceIds:ids, note}),
     });
   } catch (error) {
     actionButtons.forEach(item => { item.disabled = false; });
-    button.textContent = '确认添加';
+    button.textContent = '确认覆盖';
     if (errorEl) errorEl.textContent = error.message;
     return;
   }
@@ -245,7 +246,7 @@ async function confirmBatchNote(button) {
   $$('.sentence-check').forEach(item => { item.checked = false; });
   updateLibrarySelectionButtons();
   closeDialog();
-  toast(`已为 ${ids.length} 句添加备注`);
+  toast(result.updated > 0 ? `已覆盖 ${result.updated} 句备注` : '所选句子的备注已经是相同内容');
   setTimeout(() => { const link = document.querySelector('link[href*="faces.css"]'); if (link) link.href = `/api/fonts/faces.css?t=${Date.now()}`; }, 2800);
   try {
     await reloadLibrary();
