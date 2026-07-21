@@ -576,13 +576,18 @@ def _server_utc_offset_label() -> str:
     return f"{sign}{total_minutes // 60:02d}:{total_minutes % 60:02d}"
 
 
-def _previous_first_attempt_correct(db, session_id: int, sentence_id: int) -> bool | None:
-    """Return the preceding session's latest reliable first-check fact.
+def _prior_consecutive_first_correct_count(
+    db, session_id: int, sentence_id: int
+) -> int:
+    """Count consecutive first-check successes before the current session.
 
-    SQLite ``BEGIN IMMEDIATE`` serializes this read with the FSRS write, so two
-    finalizers cannot both consume the same stale sentence state.
+    Walks finalized independent practice cycles (one review_event per session)
+    in stable reverse order.  A first_attempt_correct of 0 or NULL breaks the
+    chain; unanswered/skipped cycles leave no review_event and neither count
+    nor reset.  SQLite ``BEGIN IMMEDIATE`` serializes this read with the FSRS
+    write so concurrent finalizers cannot both consume the same stale history.
     """
-    row = db.execute(
+    rows = db.execute(
         """SELECT re.first_attempt_correct
            FROM review_events re
            JOIN practice_sessions previous_session ON previous_session.id=re.session_id
@@ -591,7 +596,6 @@ def _previous_first_attempt_correct(db, session_id: int, sentence_id: int) -> bo
              ON pi.session_id=re.session_id AND pi.sentence_id=re.sentence_id
            WHERE re.sentence_id=?
              AND re.session_id<>?
-             AND re.first_attempt_correct IS NOT NULL
              AND pi.finalized_at IS NOT NULL
              AND (
                previous_session.created_at<current_session.created_at
@@ -600,11 +604,17 @@ def _previous_first_attempt_correct(db, session_id: int, sentence_id: int) -> bo
                  AND previous_session.id<current_session.id
                )
              )
-           ORDER BY previous_session.created_at DESC,previous_session.id DESC,re.id DESC
-           LIMIT 1""",
+           ORDER BY previous_session.created_at DESC,previous_session.id DESC,re.id DESC""",
         (session_id, sentence_id, session_id),
-    ).fetchone()
-    return None if row is None else bool(row["first_attempt_correct"])
+    ).fetchall()
+    count = 0
+    for row in rows:
+        value = row["first_attempt_correct"]
+        if value == 1:
+            count += 1
+            continue
+        break
+    return count
 
 
 def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing: bool):
@@ -642,14 +652,14 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing:
     if not attempts:
         return None, "当前题还没有作答记录"
     facts = attempt_facts(attempts)
-    previous_first_correct = (
-        _previous_first_attempt_correct(db, session_id, sentence_id)
+    prior_consecutive = (
+        _prior_consecutive_first_correct_count(db, session_id, sentence_id)
         if facts.first_attempt_correct is True
-        else None
+        else 0
     )
     rating = determine_fsrs_rating(
         attempts,
-        previous_first_attempt_correct=previous_first_correct,
+        prior_consecutive_first_correct=prior_consecutive,
     )
     stamp = now_iso()
     final_status = "skipped" if rating is None else (

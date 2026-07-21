@@ -12,6 +12,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DB_PATH = DATA_DIR / "japanese_sentence_review.sqlite3"
 FSRS_MIGRATION = "fsrs_v1_reset"
 NO_SHORT_STEPS_MIGRATION = "fsrs_no_short_steps_v1"
+FSRS_RETENTION_098_MIGRATION = "fsrs_retention_098_v1"
 UNANSWERED_REPORT_MIGRATION = "practice_unanswered_v1"
 COMPLETION_MODE_MIGRATION = "practice_completion_mode_v1"
 AUTOMATIC_RATING_MIGRATION = "fsrs_automatic_rating_v2"
@@ -409,6 +410,69 @@ def _migrate_no_short_steps(*, enable_fuzzing: bool) -> Path | None:
         return backup_path
 
 
+def _migrate_fsrs_retention_098(*, enable_fuzzing: bool) -> Path | None:
+    """Replay FSRS history at desired_retention=0.98, exactly once.
+
+    Runs after the no-short-steps migration so cards are already free of
+    learning/relearning minute steps.  Only sentence scheduling fields change;
+    review_events ratings and all practice history stay immutable.
+    """
+    with get_db() as db:
+        migrated = db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (FSRS_RETENTION_098_MIGRATION,),
+        ).fetchone()
+        if migrated:
+            return None
+
+        backup_path = _backup_database_for_migration(db, FSRS_RETENTION_098_MIGRATION)
+        db.execute("BEGIN IMMEDIATE")
+        migrated = db.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?",
+            (FSRS_RETENTION_098_MIGRATION,),
+        ).fetchone()
+        if migrated:
+            return backup_path
+
+        stamp = now_iso()
+        sentences = db.execute(
+            """SELECT s.* FROM sentences s
+               WHERE EXISTS(
+                 SELECT 1 FROM review_events re WHERE re.sentence_id=s.id
+               )
+               ORDER BY s.id"""
+        ).fetchall()
+        for sentence in sentences:
+            events = db.execute(
+                """SELECT rating,reviewed_at,duration_ms
+                   FROM review_events
+                   WHERE sentence_id=?
+                   ORDER BY reviewed_at,id""",
+                (sentence["id"],),
+            ).fetchall()
+            after = reschedule_from_review_events(
+                dict(sentence),
+                events,
+                enable_fuzzing=enable_fuzzing,
+            )
+            db.execute(
+                """UPDATE sentences
+                   SET fsrs_state=?,fsrs_step=?,stability=?,difficulty=?,
+                       last_review_at=?,next_review_at=?,fsrs_version=?
+                   WHERE id=?""",
+                (
+                    after["fsrs_state"], after["fsrs_step"], after["stability"],
+                    after["difficulty"], after["last_review_at"],
+                    after["next_review_at"], after["fsrs_version"], sentence["id"],
+                ),
+            )
+        db.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(?,?)",
+            (FSRS_RETENTION_098_MIGRATION, stamp),
+        )
+        return backup_path
+
+
 def init_db(*, enable_fuzzing: bool = True) -> None:
     with get_db() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -439,6 +503,7 @@ def init_db(*, enable_fuzzing: bool = True) -> None:
             (stamp, stamp),
         )
     _migrate_no_short_steps(enable_fuzzing=enable_fuzzing)
+    _migrate_fsrs_retention_098(enable_fuzzing=enable_fuzzing)
 
 
 def setting(db, key, default=""):

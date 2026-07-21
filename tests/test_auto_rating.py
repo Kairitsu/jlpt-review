@@ -147,19 +147,31 @@ def test_consecutive_first_check_chain_upgrades_breaks_and_restarts(tmp_path, mo
     collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
     sentence = make_sentence(client, collection_id, "chain")
 
+    sequence = (
+        [[True]] * 5
+        + [[False, True]]
+        + [[True]] * 4
+    )
+    expected_ratings = (
+        ["good", "good", "good", "easy", "easy"]
+        + ["hard"]
+        + ["good", "good", "good", "easy"]
+    )
     sessions = []
     ratings = []
-    for checks in ([True], [True], [True], [False, True], [True], [True]):
+    for checks in sequence:
         session_id = start_session(client, sentence)
         sessions.append(session_id)
         ratings.append(complete_round(client, session_id, sentence, checks))
 
-    assert ratings == ["good", "easy", "easy", "hard", "good", "easy"]
+    assert ratings == expected_ratings
     events = [event_for(db, session_id) for session_id in sessions]
-    assert [event["first_attempt_correct"] for event in events] == [1, 1, 1, 0, 1, 1]
-    assert [event["rating_policy_version"] for event in events] == [2] * 6
-    assert events[3]["attempt_count"] == 2
-    assert events[3]["second_attempt_correct"] == 1
+    assert [event["first_attempt_correct"] for event in events] == (
+        [1, 1, 1, 1, 1, 0, 1, 1, 1, 1]
+    )
+    assert [event["rating_policy_version"] for event in events] == [3] * 10
+    assert events[5]["attempt_count"] == 2
+    assert events[5]["second_attempt_correct"] == 1
 
 
 @pytest.mark.parametrize(
@@ -247,7 +259,61 @@ def test_unanswered_does_not_write_fsrs_or_break_first_check_continuity(tmp_path
     assert all(after[field] == before[field] for field in FSRS_FIELDS)
 
     following_session = start_session(client, sentence)
-    assert complete_round(client, following_session, sentence, [True]) == "easy"
+    # Two first-check successes with an unanswered gap still count as only
+    # two consecutive cycles — not yet Easy (needs four).
+    assert complete_round(client, following_session, sentence, [True]) == "good"
+
+
+def test_skip_does_not_write_fsrs_or_break_first_check_continuity(tmp_path, monkeypatch):
+    flask_app, db = load_app(tmp_path, monkeypatch)
+    client = flask_app.test_client()
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = make_sentence(client, collection_id, "skip-continuity")
+
+    first_session = start_session(client, sentence)
+    assert complete_round(client, first_session, sentence, [True]) == "good"
+    with db.get_db() as connection:
+        before = dict(connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (sentence["id"],)
+        ).fetchone())
+
+    skip_session = start_session(client, sentence)
+    skip = client.post(
+        f"/api/practice/sessions/{skip_session}/attempts",
+        json={
+            "attemptId": str(uuid.uuid4()),
+            "sentenceId": sentence["id"],
+            "action": "skip",
+            "answerOrder": [],
+        },
+    )
+    assert skip.status_code == 200
+    finalized = client.post(
+        f"/api/practice/sessions/{skip_session}/sentences/{sentence['id']}/complete",
+        json={},
+    )
+    assert finalized.status_code == 200
+    assert finalized.get_json()["rating"] is None
+    assert client.post(
+        f"/api/practice/sessions/{skip_session}/complete", json={}
+    ).status_code == 200
+    report = client.get(f"/api/reports/{skip_session}").get_json()["report"]
+    assert report["items"][0]["status"] == "skipped"
+    assert report["items"][0]["rating"] is None
+    assert event_for(db, skip_session) is None
+    with db.get_db() as connection:
+        after = dict(connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (sentence["id"],)
+        ).fetchone())
+    assert all(after[field] == before[field] for field in FSRS_FIELDS)
+
+    # Skip neither increments nor resets the consecutive first-check chain.
+    following_session = start_session(client, sentence)
+    assert complete_round(client, following_session, sentence, [True]) == "good"
+    third = start_session(client, sentence)
+    assert complete_round(client, third, sentence, [True]) == "good"
+    fourth = start_session(client, sentence)
+    assert complete_round(client, fourth, sentence, [True]) == "easy"
 
 
 def test_duplicate_attempt_request_returns_original_and_cannot_invent_second_wrong(
@@ -498,7 +564,8 @@ def test_v2_migration_preserves_cards_reports_and_old_ratings(tmp_path, monkeypa
     first_session = start_session(client, sentence)
     second_session = start_session(client, sentence)
     assert complete_round(client, first_session, sentence, [True]) == "good"
-    assert complete_round(client, second_session, sentence, [True]) == "easy"
+    # Under policy v3 the second consecutive first-check success is still Good.
+    assert complete_round(client, second_session, sentence, [True]) == "good"
     reports_before = {
         session_id: client.get(f"/api/reports/{session_id}").get_json()["report"]
         for session_id in (first_session, second_session)
@@ -546,7 +613,8 @@ def test_v2_migration_preserves_cards_reports_and_old_ratings(tmp_path, monkeypa
         ).fetchall()
         assert counts_after == counts_before
         assert all(card_after[field] == card_before[field] for field in FSRS_FIELDS)
-        assert [row["rating"] for row in events] == [3, 4]
+        # Historical ratings stay immutable even after facts are backfilled.
+        assert [row["rating"] for row in events] == [3, 3]
         assert [row["rating_policy_version"] for row in events] == [1, 1]
         assert [row["first_attempt_correct"] for row in events] == [1, 1]
         assert connection.execute(
@@ -561,11 +629,18 @@ def test_v2_migration_preserves_cards_reports_and_old_ratings(tmp_path, monkeypa
         assert after["items"][0]["rating"] == before["items"][0]["rating"]
         assert after["ratingCounts"] == before["ratingCounts"]
 
-    # Reliably backfilled old first-check facts may continue the chain.
+    # Backfilled first-check facts continue the consecutive chain under v3:
+    # two prior successes + this one => still Good (Easy only at four).
     following_session = start_session(migrated_client, sentence)
     assert complete_round(
         migrated_client, following_session, sentence, [True]
+    ) == "good"
+    assert event_for(migrated_db, following_session)["rating_policy_version"] == 3
+    easy_session = start_session(migrated_client, sentence)
+    assert complete_round(
+        migrated_client, easy_session, sentence, [True]
     ) == "easy"
+    assert event_for(migrated_db, easy_session)["rating_policy_version"] == 3
 
 
 def test_concurrent_item_settlement_writes_one_review_and_one_state_update(
@@ -612,7 +687,7 @@ def test_frontend_has_no_manual_easy_and_preserves_attempt_id_across_retry():
     assert "attemptId:item.pendingAttempt.id" in source
     assert "item.pendingAttempt = null;" in source
     assert "答题耗时" not in source
-    assert "连续第二轮起仍首次答对为“轻松掌握”" in source
+    assert "连续四个独立练习周期均首次答对（含本轮）为“轻松掌握”" in source
     assert "从未核对的题目不计入 FSRS" in source
 
     navigation = source.split("function navigatePractice(delta) {", 1)[1].split(

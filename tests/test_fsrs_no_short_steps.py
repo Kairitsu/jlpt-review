@@ -111,7 +111,7 @@ def test_scheduler_has_no_short_steps_and_keeps_default_model_parameters():
     package_defaults = Scheduler()
     assert LEARNING_STEPS == () and configured.learning_steps == ()
     assert RELEARNING_STEPS == () and configured.relearning_steps == ()
-    assert configured.desired_retention == 0.90
+    assert configured.desired_retention == 0.98
     assert configured.maximum_interval == 36500
     assert configured.enable_fuzzing is True
     assert len(configured.parameters) == 21
@@ -139,7 +139,10 @@ def test_consecutive_good_reviews_extend_the_overall_interval():
     current = row_for(new_card(1, NOW))
     reviewed_at = NOW
     intervals = []
-    for _ in range(4):
+    stabilities = []
+    # At desired_retention=0.98 the first two Good intervals can both floor to
+    # one day, so require non-decreasing schedule and strict longer-term growth.
+    for _ in range(6):
         outcome = review(
             current,
             Rating.Good,
@@ -148,18 +151,33 @@ def test_consecutive_good_reviews_extend_the_overall_interval():
         )
         due = parse_utc(outcome.after["next_review_at"])
         intervals.append(due - reviewed_at)
+        stabilities.append(outcome.after["stability"])
         current = {"id": 1, **outcome.after}
         reviewed_at = due
 
-    assert all(later > earlier for earlier, later in zip(intervals, intervals[1:]))
+    assert all(later >= earlier for earlier, later in zip(intervals, intervals[1:]))
+    assert intervals[-1] > intervals[0]
+    assert all(
+        later > earlier for earlier, later in zip(stabilities, stabilities[1:])
+    )
 
 
 def test_same_review_card_and_time_schedule_hard_before_good():
+    # After the first Good at 0.98, Hard and Good may both floor to a one-day
+    # due date; advance one more Good so the schedules diverge in calendar time.
     current, first = reviewed_row(Rating.Good)
-    reviewed_at = parse_utc(first.after["next_review_at"])
+    second = review(
+        current,
+        Rating.Good,
+        reviewed_at=parse_utc(first.after["next_review_at"]),
+        enable_fuzzing=False,
+    )
+    current = {"id": 1, **second.after}
+    reviewed_at = parse_utc(second.after["next_review_at"])
     hard = review(current, Rating.Hard, reviewed_at=reviewed_at, enable_fuzzing=False)
     good = review(current, Rating.Good, reviewed_at=reviewed_at, enable_fuzzing=False)
     assert parse_utc(hard.after["next_review_at"]) < parse_utc(good.after["next_review_at"])
+    assert hard.after["stability"] < good.after["stability"]
 
 
 def test_review_card_again_does_not_enter_relearning():
@@ -324,6 +342,184 @@ def test_no_short_steps_migration_rolls_back_all_card_updates_on_failure(tmp_pat
         assert connection.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version=?",
             (db.NO_SHORT_STEPS_MIGRATION,),
+        ).fetchone()[0] == 0
+
+
+def test_retention_098_migration_preserves_data_and_reschedules_learned_cards(
+    tmp_path, monkeypatch
+):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection = client.get("/api/dashboard").get_json()["collections"][0]
+    learned = make_sentence(client, collection["id"], "retention-learned")
+    unlearned = make_sentence(client, collection["id"], "retention-new")
+    complete_good(client, learned)
+
+    with db.get_db() as connection:
+        events = connection.execute(
+            """SELECT rating,reviewed_at,duration_ms FROM review_events
+               WHERE sentence_id=? ORDER BY reviewed_at,id""",
+            (learned["id"],),
+        ).fetchall()
+        sentence_row = dict(connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (learned["id"],)
+        ).fetchone())
+        expected_after = db.reschedule_from_review_events(
+            sentence_row, events, enable_fuzzing=False
+        )
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version=?",
+            (db.FSRS_RETENTION_098_MIGRATION,),
+        )
+        # Force a clearly wrong schedule so migration must rewrite FSRS fields.
+        connection.execute(
+            """UPDATE sentences
+               SET stability=0.01,difficulty=9.9,next_review_at=?
+               WHERE id=?""",
+            ("2099-01-01T00:00:00+00:00", learned["id"]),
+        )
+        counts_before = preserved_counts(connection)
+        immutable_before = {
+            table: table_rows(connection, table)
+            for table in (
+                "collections",
+                "review_events",
+                "attempts",
+                "practice_sessions",
+                "practice_items",
+            )
+        }
+        content_before = connection.execute(
+            """SELECT id,collection_id,chinese,japanese,chunks_json,correct_order_json,
+                      furigana_json,created_at,updated_at
+               FROM sentences ORDER BY id"""
+        ).fetchall()
+        unlearned_before = tuple(connection.execute(
+            """SELECT fsrs_state,fsrs_step,stability,difficulty,last_review_at,
+                      next_review_at,fsrs_version
+               FROM sentences WHERE id=?""",
+            (unlearned["id"],),
+        ).fetchone())
+
+    dashboard_before = client.get("/api/dashboard").get_json()
+    actual_days_before = [
+        day["actual"]
+        for day in client.get("/api/stats/summary").get_json()["timeline"]
+    ]
+    backups_before = set((tmp_path / "backups").glob("*.sqlite3"))
+
+    db.init_db(enable_fuzzing=False)
+
+    dashboard_after = client.get("/api/dashboard").get_json()
+    actual_days_after = [
+        day["actual"]
+        for day in client.get("/api/stats/summary").get_json()["timeline"]
+    ]
+    with db.get_db() as connection:
+        assert preserved_counts(connection) == counts_before
+        for table, rows in immutable_before.items():
+            assert table_rows(connection, table) == rows
+        assert connection.execute(
+            """SELECT id,collection_id,chinese,japanese,chunks_json,correct_order_json,
+                      furigana_json,created_at,updated_at
+               FROM sentences ORDER BY id"""
+        ).fetchall() == content_before
+        migrated = connection.execute(
+            "SELECT * FROM sentences WHERE id=?", (learned["id"],)
+        ).fetchone()
+        for field in (
+            "fsrs_state", "fsrs_step", "stability", "difficulty",
+            "last_review_at", "next_review_at", "fsrs_version",
+        ):
+            assert migrated[field] == expected_after[field]
+        assert migrated["next_review_at"] != "2099-01-01T00:00:00+00:00"
+        assert tuple(connection.execute(
+            """SELECT fsrs_state,fsrs_step,stability,difficulty,last_review_at,
+                      next_review_at,fsrs_version
+               FROM sentences WHERE id=?""",
+            (unlearned["id"],),
+        ).fetchone()) == unlearned_before
+        assert connection.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=?",
+            (db.FSRS_RETENTION_098_MIGRATION,),
+        ).fetchone()[0] == 1
+
+    assert dashboard_after["collections"][0]["learned"] == dashboard_before["collections"][0]["learned"] == 1
+    assert actual_days_after == actual_days_before
+
+    new_backups = set((tmp_path / "backups").glob("*.sqlite3")) - backups_before
+    assert len(new_backups) == 1
+    with sqlite3.connect(new_backups.pop()) as backup:
+        assert preserved_counts(backup) == counts_before
+
+    with db.get_db() as connection:
+        card_before_second_run = tuple(connection.execute(
+            """SELECT fsrs_state,fsrs_step,stability,difficulty,last_review_at,
+                      next_review_at,fsrs_version
+               FROM sentences WHERE id=?""",
+            (learned["id"],),
+        ).fetchone())
+    backup_count = len(list((tmp_path / "backups").glob("*.sqlite3")))
+    db.init_db(enable_fuzzing=False)
+    with db.get_db() as connection:
+        assert tuple(connection.execute(
+            """SELECT fsrs_state,fsrs_step,stability,difficulty,last_review_at,
+                      next_review_at,fsrs_version
+               FROM sentences WHERE id=?""",
+            (learned["id"],),
+        ).fetchone()) == card_before_second_run
+    assert len(list((tmp_path / "backups").glob("*.sqlite3"))) == backup_count
+
+
+def test_retention_098_migration_rolls_back_all_card_updates_on_failure(
+    tmp_path, monkeypatch
+):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentences = [
+        make_sentence(client, collection_id, suffix)
+        for suffix in ("retention-one", "retention-two")
+    ]
+    for sentence in sentences:
+        complete_good(client, sentence)
+
+    with db.get_db() as connection:
+        connection.execute(
+            "DELETE FROM schema_migrations WHERE version=?",
+            (db.FSRS_RETENTION_098_MIGRATION,),
+        )
+        connection.execute(
+            "UPDATE sentences SET stability=0.01,difficulty=9.9,next_review_at=?",
+            ("2099-01-01T00:00:00+00:00",),
+        )
+        cards_before = [tuple(row) for row in connection.execute(
+            """SELECT id,fsrs_state,fsrs_step,stability,difficulty,last_review_at,
+                      next_review_at,fsrs_version FROM sentences ORDER BY id"""
+        )]
+        events_before = table_rows(connection, "review_events")
+
+    real_reschedule = db.reschedule_from_review_events
+    calls = 0
+
+    def fail_on_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated retention reschedule failure")
+        return real_reschedule(*args, **kwargs)
+
+    monkeypatch.setattr(db, "reschedule_from_review_events", fail_on_second)
+    with pytest.raises(RuntimeError, match="simulated retention reschedule failure"):
+        db.init_db(enable_fuzzing=False)
+
+    with db.get_db() as connection:
+        assert [tuple(row) for row in connection.execute(
+            """SELECT id,fsrs_state,fsrs_step,stability,difficulty,last_review_at,
+                      next_review_at,fsrs_version FROM sentences ORDER BY id"""
+        )] == cards_before
+        assert table_rows(connection, "review_events") == events_before
+        assert connection.execute(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=?",
+            (db.FSRS_RETENTION_098_MIGRATION,),
         ).fetchone()[0] == 0
 
 

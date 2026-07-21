@@ -37,23 +37,26 @@ def test_new_card_is_due_fsrs_learning_card():
 
 
 @pytest.mark.parametrize(
-    "attempts,previous_first_correct,expected",
+    "attempts,prior_consecutive,expected",
     [
-        ([], None, None),
-        ([{"status": "skipped"}], None, None),
-        ([{"status": "wrong"}], None, Rating.Again),
-        ([{"status": "wrong"}, {"status": "correct"}], None, Rating.Hard),
-        ([{"status": "wrong"}, {"status": "wrong"}, {"status": "correct"}], None, Rating.Again),
-        ([{"status": "correct"}], None, Rating.Good),
-        ([{"status": "correct"}], False, Rating.Good),
-        ([{"status": "correct"}], True, Rating.Easy),
-        ([{"status": "correct"}, {"status": "wrong"}], True, Rating.Easy),
+        ([], 0, None),
+        ([{"status": "skipped"}], 0, None),
+        ([{"status": "wrong"}], 0, Rating.Again),
+        ([{"status": "wrong"}, {"status": "correct"}], 0, Rating.Hard),
+        ([{"status": "wrong"}, {"status": "wrong"}, {"status": "correct"}], 0, Rating.Again),
+        ([{"status": "correct"}], 0, Rating.Good),
+        ([{"status": "correct"}], 1, Rating.Good),
+        ([{"status": "correct"}], 2, Rating.Good),
+        ([{"status": "correct"}], 3, Rating.Easy),
+        ([{"status": "correct"}], 4, Rating.Easy),
+        ([{"status": "correct"}, {"status": "wrong"}], 3, Rating.Easy),
+        ([{"status": "wrong"}, {"status": "correct"}], 5, Rating.Hard),
     ],
 )
-def test_rating_mapping(attempts, previous_first_correct, expected):
+def test_rating_mapping(attempts, prior_consecutive, expected):
     assert determine_fsrs_rating(
         attempts,
-        previous_first_attempt_correct=previous_first_correct,
+        prior_consecutive_first_correct=prior_consecutive,
     ) == expected
 
 

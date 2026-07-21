@@ -318,7 +318,7 @@ def test_learning_overview_replaces_old_stats_fields_and_keeps_fsrs_settings(
     ):
         assert removed not in data
     settings = client.get("/api/settings/fsrs").get_json()
-    assert settings == {"system": "FSRS", "desiredRetention": 0.9, "maximumIntervalDays": 36500, "version": "6.3.1"}
+    assert settings == {"system": "FSRS", "desiredRetention": 0.98, "maximumIntervalDays": 36500, "version": "6.3.1"}
     assert client.get("/api/settings/scheduler").status_code == 404
     assert client.put("/api/settings/scheduler", json={"mode": "fixed"}).status_code == 404
 

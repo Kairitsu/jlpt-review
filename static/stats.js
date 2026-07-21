@@ -357,8 +357,8 @@ function statsPageHtml(data) {
       <div id="stats-grade-hint" class="stats-grade-hint hidden">
         <p><strong>忘记：</strong>第一次核对错误，第二次仍未正确，或没有完成纠正；</p>
         <p><strong>模糊：</strong>第一次核对错误，第二次核对正确；</p>
-        <p><strong>认识：</strong>本次第一次核对正确，但尚未形成连续稳定表现；</p>
-        <p><strong>轻松掌握：</strong>本次第一次核对正确，并且上一次练习也是第一次核对正确。</p>
+        <p><strong>认识：</strong>本次第一次核对正确，但尚未达到连续四个独立练习周期均首次答对；</p>
+        <p><strong>轻松掌握：</strong>本次第一次核对正确，并且此前最近三个有效独立练习周期也均首次答对（含本轮共连续四次）。</p>
       </div>
     </article>
     <article class="card stats-card stats-upcoming-card">

@@ -12,8 +12,8 @@ from typing import Iterable, Mapping, Sequence
 from fsrs import Card, Rating, ReviewLog, Scheduler, State
 
 FSRS_VERSION = "6.3.1"
-RATING_POLICY_VERSION = 2
-DESIRED_RETENTION = 0.90
+RATING_POLICY_VERSION = 3
+DESIRED_RETENTION = 0.98
 MAXIMUM_INTERVAL_DAYS = 36500
 LEARNING_STEPS = ()
 RELEARNING_STEPS = ()
@@ -119,13 +119,15 @@ def attempt_facts(attempts: Iterable[Mapping]) -> AttemptFacts:
 def determine_fsrs_rating(
     attempts: Iterable[Mapping],
     *,
-    previous_first_attempt_correct: bool | None,
+    prior_consecutive_first_correct: int = 0,
 ) -> Rating | None:
     """Return the sole automatic rating for one finalized practice item.
 
-    Only real check order and the previous reliable first-check fact matter.
-    Duration, client-provided ratings, and checks after the second one cannot
-    change the result.
+    Only real check order and how many prior independent practice cycles had a
+    reliable first-check success matter.  Easy requires four consecutive
+    first-check successes including the current cycle
+    (``prior_consecutive_first_correct >= 3``).  Duration, client-provided
+    ratings, and checks after the second one cannot change the result.
     """
     facts = attempt_facts(attempts)
     if facts.attempt_count == 0:
@@ -133,7 +135,7 @@ def determine_fsrs_rating(
     if facts.first_attempt_correct:
         return (
             Rating.Easy
-            if previous_first_attempt_correct is True
+            if prior_consecutive_first_correct >= 3
             else Rating.Good
         )
     if facts.second_attempt_correct is True:
