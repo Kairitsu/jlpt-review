@@ -210,6 +210,162 @@ def test_sentence_note_validation_rejects_non_string_and_over_limit(tmp_path, mo
         assert "备注" in response.get_json()["error"]
 
 
+def test_batch_note_writes_multiple_empty_notes_and_cleans_outer_whitespace(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    first = create_sentence(client, collection_id)
+    second = create_sentence(client, collection_id)
+
+    response = client.post(
+        "/api/sentences/batch-note",
+        json={
+            "sentenceIds": [first["id"], second["id"], first["id"]],
+            "note": "  に限って：与平日不同\n偏偏、特别相信  ",
+        },
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "updated": 2}
+    expected = "に限って：与平日不同\n偏偏、特别相信"
+    assert client.get(f'/api/sentences/{first["id"]}').get_json()["sentence"]["note"] == expected
+    assert client.get(f'/api/sentences/{second["id"]}').get_json()["sentence"]["note"] == expected
+
+
+def test_batch_note_appends_without_overwrite_and_is_idempotent(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    empty = create_sentence(client, collection_id)
+    existing = create_sentence(client, collection_id, note="原备注")
+    equal = create_sentence(client, collection_id, note="追加内容")
+    suffixed = create_sentence(client, collection_id, note="原备注\n追加内容")
+    ids = [empty["id"], existing["id"], equal["id"], suffixed["id"]]
+    import app as app_module
+    font_rebuilds = []
+    monkeypatch.setattr(app_module, "schedule_font_rebuild", lambda: font_rebuilds.append(True))
+    client.application.config["TESTING"] = False
+
+    first = client.post(
+        "/api/sentences/batch-note",
+        json={"sentenceIds": ids, "note": "追加内容"},
+    )
+    assert first.status_code == 200
+    assert first.get_json() == {"ok": True, "updated": 2}
+    assert font_rebuilds == [True]
+    assert client.get(f'/api/sentences/{empty["id"]}').get_json()["sentence"]["note"] == "追加内容"
+    assert client.get(f'/api/sentences/{existing["id"]}').get_json()["sentence"]["note"] == "原备注\n追加内容"
+    assert client.get(f'/api/sentences/{equal["id"]}').get_json()["sentence"]["note"] == "追加内容"
+    assert client.get(f'/api/sentences/{suffixed["id"]}').get_json()["sentence"]["note"] == "原备注\n追加内容"
+
+    repeated = client.post(
+        "/api/sentences/batch-note",
+        json={"sentenceIds": ids, "note": "追加内容"},
+    )
+    assert repeated.status_code == 200
+    assert repeated.get_json() == {"ok": True, "updated": 0}
+    assert font_rebuilds == [True]
+
+
+def test_batch_note_rejects_invalid_body_ids_and_notes(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = create_sentence(client, collection_id)
+
+    for invalid_body in (None, [], "备注"):
+        response = client.post("/api/sentences/batch-note", json=invalid_body)
+        assert response.status_code == 400
+        assert "JSON 对象" in response.get_json()["error"]
+
+    for invalid_ids in (None, [], [0], [-1], ["1"], [True], [1.0], {"id": 1}):
+        response = client.post(
+            "/api/sentences/batch-note",
+            json={"sentenceIds": invalid_ids, "note": "有效备注"},
+        )
+        assert response.status_code == 400
+        assert "sentenceIds" in response.get_json()["error"]
+
+    for invalid_note in (None, 123, [], {}, "", " \n ", "注" * 1001):
+        response = client.post(
+            "/api/sentences/batch-note",
+            json={"sentenceIds": [sentence["id"]], "note": invalid_note},
+        )
+        assert response.status_code == 400
+        assert "备注" in response.get_json()["error"]
+
+
+def test_batch_note_missing_or_overflow_rolls_back_entire_batch(tmp_path, monkeypatch):
+    client, _ = load_app(tmp_path, monkeypatch)
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    existing = create_sentence(client, collection_id, note="原备注")
+    empty = create_sentence(client, collection_id)
+
+    missing = client.post(
+        "/api/sentences/batch-note",
+        json={"sentenceIds": [empty["id"], existing["id"], 999999], "note": "不应写入"},
+    )
+    assert missing.status_code == 404
+    assert "整批未作修改" in missing.get_json()["error"]
+    assert client.get(f'/api/sentences/{existing["id"]}').get_json()["sentence"]["note"] == "原备注"
+    assert client.get(f'/api/sentences/{empty["id"]}').get_json()["sentence"]["note"] == ""
+
+    full = create_sentence(client, collection_id, note="旧" * 999)
+    overflow = client.post(
+        "/api/sentences/batch-note",
+        json={"sentenceIds": [empty["id"], full["id"]], "note": "新"},
+    )
+    assert overflow.status_code == 400
+    assert "超过 1000 个字符" in overflow.get_json()["error"]
+    assert "整批未作修改" in overflow.get_json()["error"]
+    assert client.get(f'/api/sentences/{empty["id"]}').get_json()["sentence"]["note"] == ""
+    assert client.get(f'/api/sentences/{full["id"]}').get_json()["sentence"]["note"] == "旧" * 999
+
+
+def test_batch_note_only_changes_note_timestamp_and_preserves_history_snapshots(tmp_path, monkeypatch):
+    client, db = load_app(tmp_path, monkeypatch)
+    collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
+    sentence = create_sentence(client, collection_id, note="练习开始时的备注")
+    session_id = practice_once(client, sentence)
+
+    with db.get_db() as connection:
+        before = dict(
+            connection.execute("SELECT * FROM sentences WHERE id=?", (sentence["id"],)).fetchone()
+        )
+        item_snapshot_before = connection.execute(
+            "SELECT sentence_snapshot_json FROM practice_items WHERE session_id=? AND sentence_id=?",
+            (session_id, sentence["id"]),
+        ).fetchone()[0]
+    history_before = history_snapshot(db)
+
+    import app as app_module
+    monkeypatch.setattr(app_module, "now_iso", lambda: "2099-01-01T00:00:00+00:00")
+    response = client.post(
+        "/api/sentences/batch-note",
+        json={"sentenceIds": [sentence["id"]], "note": "批量追加"},
+    )
+    assert response.status_code == 200
+    assert response.get_json() == {"ok": True, "updated": 1}
+
+    with db.get_db() as connection:
+        after = dict(
+            connection.execute("SELECT * FROM sentences WHERE id=?", (sentence["id"],)).fetchone()
+        )
+        assert after["note"] == "练习开始时的备注\n批量追加"
+        assert after["updated_at"] == "2099-01-01T00:00:00+00:00"
+        assert {
+            field for field in before if before[field] != after[field]
+        } == {"note", "updated_at"}
+        assert all(after[field] == before[field] for field in (*CHUNK_FIELDS, *FSRS_FIELDS))
+        assert connection.execute(
+            "SELECT sentence_snapshot_json FROM practice_items WHERE session_id=? AND sentence_id=?",
+            (session_id, sentence["id"]),
+        ).fetchone()[0] == item_snapshot_before
+        assert json.loads(item_snapshot_before)["note"] == "练习开始时的备注"
+    assert history_snapshot(db) == history_before
+
+    new_session = client.post(
+        "/api/practice/sessions", json={"sentenceIds": [sentence["id"]]}
+    ).get_json()
+    assert new_session["sentences"][0]["note"] == "练习开始时的备注\n批量追加"
+
+
 def test_note_only_edit_preserves_chunks_fsrs_history_and_existing_session_snapshot(tmp_path, monkeypatch):
     client, db = load_app(tmp_path, monkeypatch)
     collection_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
@@ -304,19 +460,25 @@ def test_move_and_batch_rechunk_preserve_note(tmp_path, monkeypatch):
     source_id = client.get("/api/dashboard").get_json()["collections"][0]["id"]
     target_id = client.post("/api/collections", json={"name": "备注保留目标"}).get_json()["id"]
     sentence = create_sentence(client, source_id, note="不得丢失\n第二行")
+    appended = client.post(
+        "/api/sentences/batch-note",
+        json={"sentenceIds": [sentence["id"]], "note": "批量追加内容"},
+    )
+    assert appended.status_code == 200
+    expected_note = "不得丢失\n第二行\n批量追加内容"
 
     moved = client.post(
         "/api/sentences/move",
         json={"sentenceIds": [sentence["id"]], "targetCollectionId": target_id},
     )
     assert moved.status_code == 200
-    assert client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]["note"] == sentence["note"]
+    assert client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]["note"] == expected_note
 
     rechunked = client.post(
         "/api/sentences/rechunk", json={"sentenceIds": [sentence["id"]]}
     )
     assert rechunked.status_code == 200
-    assert client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]["note"] == sentence["note"]
+    assert client.get(f'/api/sentences/{sentence["id"]}').get_json()["sentence"]["note"] == expected_note
 
 
 def test_note_frontend_form_preview_practice_and_responsive_contracts():

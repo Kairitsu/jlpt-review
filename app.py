@@ -1192,6 +1192,74 @@ def create_app(test_config=None):
             rebuild_fonts()
         return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
 
+    @app.post("/api/sentences/batch-note")
+    def batch_note_sentences():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify(error="请求内容必须是 JSON 对象"), 400
+
+        raw_ids = body.get("sentenceIds")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            return jsonify(error="sentenceIds 必须是非空正整数数组"), 400
+        if any(type(value) is not int or value <= 0 for value in raw_ids):
+            return jsonify(error="sentenceIds 必须是非空正整数数组"), 400
+        sentence_ids = list(dict.fromkeys(raw_ids))
+
+        note_value = body.get("note")
+        if not isinstance(note_value, str):
+            return jsonify(error="备注必须是字符串"), 400
+        note = note_value.strip()
+        if not note:
+            return jsonify(error="备注内容不能为空"), 400
+        if len(note) > MAX_SENTENCE_NOTE_LENGTH:
+            return jsonify(error=f"备注不能超过 {MAX_SENTENCE_NOTE_LENGTH} 个字符"), 400
+
+        placeholders = ",".join("?" for _ in sentence_ids)
+        prepared = []
+        db = get_db()
+        try:
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                rows = db.execute(
+                    f"SELECT id,note FROM sentences WHERE id IN ({placeholders})",
+                    sentence_ids,
+                ).fetchall()
+                rows_by_id = {row["id"]: row for row in rows}
+                missing_ids = [
+                    sentence_id for sentence_id in sentence_ids
+                    if sentence_id not in rows_by_id
+                ]
+                if missing_ids:
+                    missing_text = "、".join(str(sentence_id) for sentence_id in missing_ids)
+                    return jsonify(error=f"句子不存在：{missing_text}；整批未作修改"), 404
+
+                for sentence_id in sentence_ids:
+                    existing = rows_by_id[sentence_id]["note"] or ""
+                    if existing == note or existing.endswith(f"\n{note}"):
+                        continue
+                    appended = note if not existing else f"{existing}\n{note}"
+                    if len(appended) > MAX_SENTENCE_NOTE_LENGTH:
+                        return jsonify(
+                            error=(
+                                f"句子 {sentence_id} 追加备注后将超过 "
+                                f"{MAX_SENTENCE_NOTE_LENGTH} 个字符；整批未作修改"
+                            )
+                        ), 400
+                    prepared.append((appended, sentence_id))
+
+                stamp = now_iso()
+                for appended, sentence_id in prepared:
+                    db.execute(
+                        "UPDATE sentences SET note=?,updated_at=? WHERE id=?",
+                        (appended, stamp, sentence_id),
+                    )
+        finally:
+            db.close()
+
+        if prepared:
+            rebuild_fonts()
+        return jsonify(ok=True, updated=len(prepared))
+
     @app.post("/api/sentences/move")
     def move_sentences():
         body = request.get_json(silent=True) or {}
