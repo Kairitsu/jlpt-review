@@ -284,11 +284,18 @@ async function openRetryRoundDialog() {
   state.report = (await api(`/api/reports/${reportId}`)).report;
   const collection = state.report?.collection;
   const retry = state.report?.retry || {};
+  const candidateCount = Number(retry.candidateCount || 0);
   const max = Number(retry.availableCount || 0);
   const unanswered = Number(retry.unansweredCount || 0);
-  const collectionLabel = collection
-    ? `“${esc(collection.name)}”当前可练习 <strong>${max}</strong> 句，其中包含本轮未回答 <strong>${unanswered}</strong> 句。`
-    : `当前可练习 <strong>${max}</strong> 句，其中包含本轮未回答 <strong>${unanswered}</strong> 句。`;
+  const remainingQuota = Number(retry.remainingAutoReviewQuota || 0);
+  const collectionLabel = collection ? `“${esc(collection.name)}”当前句集` : '当前';
+  const summary = `${collectionLabel}共有 <strong>${candidateCount}</strong> 句可进入下一轮。今日还可自动练习 <strong>${remainingQuota}</strong> 句，本轮最多选择 <strong>${max}</strong> 句。`;
+  const unansweredCopy = unanswered
+    ? `<p class="retry-unanswered-copy">上一轮还有 <strong>${unanswered}</strong> 句未回答，将优先安排；其余位置按自动复习顺序补充。</p>`
+    : '';
+  const emptyHtml = remainingQuota === 0
+    ? '<span class="status-note retry-empty">今日自动复习计划已完成，明天可继续自动复习。仍可进入句集进行专项练习。</span>'
+    : '<span class="status-note retry-empty">当前没有可进入下一轮的句子。</span>';
   const picker = renderCountPicker({
     idPrefix: 'report-count',
     max,
@@ -296,11 +303,11 @@ async function openRetryRoundDialog() {
     startAction: 'start-report-round',
     startLabel: '开始练习',
     groupAriaLabel: '下一轮题目数量',
-    initialHint: max ? '优先选择本轮未回答题目，其余按到期顺序补充。' : '',
+    initialHint: max ? '未回答题目优先；其余按已到期旧卡、新卡的顺序补充。' : '',
     includeStartButton: false,
-    emptyHtml: '<span class="status-note retry-empty">当前没有可再次练习的句子。</span>',
+    emptyHtml,
   });
-  openDialog(`<div class="retry-round-dialog"><h1>再练一轮</h1><p class="retry-collection-total">${collectionLabel}</p>${picker}<div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="start-report-round" ${!max ? 'disabled' : ''}>开始练习</button></div></div>`, { className: 'retry-round-modal', label: '再练一轮' });
+  openDialog(`<div class="retry-round-dialog"><h1>再练一轮</h1><p class="retry-collection-total">${summary}</p>${unansweredCopy}${picker}<div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="start-report-round" ${!max ? 'disabled' : ''}>开始练习</button></div></div>`, { className: 'retry-round-modal', label: '再练一轮' });
   $('#dialog').dataset.retryReportId = reportId;
 }
 
@@ -433,7 +440,7 @@ async function ensureDashboard() {
 }
 function collectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join(''); }
 function setActiveCollection(collectionId) { state.activeCollection = Number(collectionId) || 0; localStorage.setItem('activeCollection', state.activeCollection); }
-function dueCollectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)} · ${c.due} 待复习 · 可自动 ${c.availableAutoReviewCount || 0}</option>`).join(''); }
+function dueCollectionOptions(selected) { return (state.dashboard?.collections || []).map(c => `<option value="${c.id}" ${Number(selected) === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join(''); }
 
 /** Shared practice-count picker (library + home due). idPrefix keeps DOM ids distinct. */
 function countPickerIds(idPrefix) {
@@ -552,7 +559,7 @@ function renderDuePicker(data, active) {
   const defaultHint = max
     ? `本句集有 ${due} 句待复习，本轮最多可自动安排 ${max} 句；已到期旧卡优先，新卡按加入顺序补充。`
     : (quotaComplete
-      ? '今日自动复习计划已完成。仍可进入句集进行专项练习，或在练习报告中再练一轮。'
+      ? '今日自动复习计划已完成，明天可继续自动复习。仍可进入句集进行专项练习。'
       : '该句集当前没有可自动安排的待复习句子。');
   const picker = renderCountPicker({
     idPrefix: 'due-count',
@@ -571,7 +578,7 @@ async function renderHome() {
   const data = await ensureDashboard(); const active = data.collections.find(c => c.id === state.activeCollection) || data.collections[0]; const progress = active?.total ? Math.round(active.learned * 100 / active.total) : 0;
   const autoAvailable = active?.availableAutoReviewCount || 0;
   const quotaComplete = Number(data.remainingAutoReviewQuota || 0) === 0;
-  const planComplete = quotaComplete ? '<p class="auto-review-complete">今日自动复习计划已完成。仍可进入句集进行专项练习，或在练习报告中再练一轮。</p>' : '';
+  const planComplete = quotaComplete ? '<p class="auto-review-complete">今日自动复习计划已完成。仍可进入句集进行专项练习。</p>' : '';
   view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>根据中文翻译，补全日语句子</h1></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom" aria-label="学习状态"><button type="button" class="metric metric-button" data-route="due" aria-label="查看待复习句子，共 ${active?.due || 0} 句"><span class="metric-copy"><strong>${active?.due || 0}</strong><span>待复习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button><div class="metric auto-review-metric" role="status" aria-label="今日还可自动练习 ${autoAvailable} 句"><strong>${autoAvailable}</strong><span>今日还可自动练习</span></div><button type="button" class="metric metric-button" data-route="today" aria-label="查看今日学习句子，共 ${active?.today || 0} 句"><span class="metric-copy"><strong>${active?.today || 0}</strong><span>今日学习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button></div><button class="btn primary" data-action="start-due" ${!autoAvailable ? 'disabled' : ''}>开始句子重组</button>${planComplete}</div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div><button class="card section-card home-stats-entry" data-route="reports"><div class="section-title"><h2>练习历史</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">每轮练习都会保留，可随时回看报告</p></button><button class="card section-card home-stats-entry" data-route="stats"><div class="section-title"><h2>学习概览</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">近期学习 · 复习安排 · 记忆掌握度</p></button></section>`;
   setChrome();
 }
@@ -1156,7 +1163,7 @@ function reportItems(items) { return items.length ? items.map(item => { const un
 async function renderSettings() {
   const [authCfg, tzCfg, fsrsCfg, dailyPlanCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone'), api('/api/settings/fsrs'), api('/api/settings/daily-plan')]);
   const timezoneCard = `<form id="timezone-form" class="card"><div class="settings-title"><div><h2>时区</h2><p>"今日学习"和「统计」页的分桶都按自然日归类，这里设置的时区决定自然日的分界点；不设置时默认按服务器所在时区计算。</p></div><span class="config-status ${tzCfg.timezone ? 'ok' : 'warn'}">${tzCfg.timezone ? '已设置' : '未设置'}</span></div><label class="field">时区<select name="timezone" id="timezone-select">${timezoneOptionsHtml(tzCfg.timezone)}</select></label>${tzCfg.timezone ? '' : `<p class="status-note">当前按服务器时区（UTC${tzCfg.serverUtcOffset}）计算，如果你实际所在地区和服务器不同，建议在上方选择你自己的时区。</p>`}<div class="form-actions"><button class="btn primary" type="submit">保存时区设置</button></div></form>`;
-  const dailyPlanCard = `<form id="daily-plan-form" class="card"><div class="settings-title"><div><h2>每日学习计划</h2><p>限制系统每天通过首页自动安排的复习句子数量。已到期旧卡优先，新卡使用剩余额度。专项练习和“再练一轮”不受此限制。</p></div><span class="config-status ok">${dailyPlanCfg.dailyAutoReviewLimit} 句/天</span></div><label class="field">每日自动复习上限<input name="dailyAutoReviewLimit" type="number" min="1" max="500" step="1" inputmode="numeric" required value="${dailyPlanCfg.dailyAutoReviewLimit}"><small>请输入 1 到 500 之间的整数。</small></label><div class="form-actions"><button class="btn primary" type="submit">保存每日计划</button></div></form>`;
+  const dailyPlanCard = `<form id="daily-plan-form" class="card"><div class="settings-title"><div><h2>每日学习计划</h2><p>首页自动复习和练习报告中的“再练一轮”共享每日额度；句集随机练习和手动勾选的专项练习不受此限制。已到期旧卡优先，新卡使用剩余额度。</p></div><span class="config-status ok">${dailyPlanCfg.dailyAutoReviewLimit} 句/天</span></div><label class="field">每日自动复习上限<input name="dailyAutoReviewLimit" type="number" min="1" max="500" step="1" inputmode="numeric" required value="${dailyPlanCfg.dailyAutoReviewLimit}"><small>请输入 1 到 500 之间的整数。</small></label><div class="form-actions"><button class="btn primary" type="submit">保存每日计划</button></div></form>`;
   view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}${dailyPlanCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答，正式提交时由后端自动评分：第一次核对即答对为“认识”；同一句子连续四个独立练习周期均首次答对（含本轮）为“轻松掌握”；第一次答错、第二次答对为“模糊”；第一次答错后未再次核对，或第二次仍然答错，为“忘记”。从未核对的题目不计入 FSRS。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用标准 GiNZA ja_ginza 文节模型完成；标点与空白固定显示，不会进入候选词块，也不会把句子发送到外部服务。</p><p>可在「学习概览」查看近期学习、未来复习安排和当前记忆状态。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
@@ -1175,7 +1182,7 @@ document.addEventListener('click', async event => {
     else if (action === 'back') navigateBack();
     else if (action === 'new-collection') { const name = prompt('新句集名称：'); if (name) { await api('/api/collections', {method:'POST', body:JSON.stringify({name})}); state.dashboard = null; await renderHome(); } }
     else if (action === 'open-collection') { state.activeCollection = Number(button.dataset.id); route('library', {collectionId:state.activeCollection}); }
-    else if (action === 'start-due') { const active = state.dashboard?.collections.find(c => c.id === state.activeCollection); if (!active?.availableAutoReviewCount) { toast(Number(state.dashboard?.remainingAutoReviewQuota || 0) === 0 ? '今日自动复习计划已完成。仍可进入句集进行专项练习，或在练习报告中再练一轮。' : '当前句集没有可自动安排的待复习句子'); return; } state.homeDuePicker = true; await renderHome(); }
+    else if (action === 'start-due') { const active = state.dashboard?.collections.find(c => c.id === state.activeCollection); if (!active?.availableAutoReviewCount) { toast(Number(state.dashboard?.remainingAutoReviewQuota || 0) === 0 ? '今日自动复习计划已完成。仍可进入句集进行专项练习。' : '当前句集没有可自动安排的待复习句子'); return; } state.homeDuePicker = true; await renderHome(); }
     else if (action === 'set-due-count') {
       selectCountOption('due-count', button);
       const max = Number($('#due-custom-count')?.max || 0);
@@ -1184,7 +1191,7 @@ document.addEventListener('click', async event => {
     else if (action === 'start-due-practice') {
       const collectionId = Number($('#due-collection')?.value), active = state.dashboard?.collections.find(c => c.id === collectionId);
       const max = active?.availableAutoReviewCount || 0;
-      if (!max) { toast(Number(state.dashboard?.remainingAutoReviewQuota || 0) === 0 ? '今日自动复习计划已完成。仍可进入句集进行专项练习，或在练习报告中再练一轮。' : '所选句集当前没有可自动安排的待复习句子'); return; }
+      if (!max) { toast(Number(state.dashboard?.remainingAutoReviewQuota || 0) === 0 ? '今日自动复习计划已完成。仍可进入句集进行专项练习。' : '所选句集当前没有可自动安排的待复习句子'); return; }
       const { custom, selected } = readCountPickerSelection('due-count', { trimCustom: true });
       if (custom) {
         const count = Number(custom);
@@ -1202,7 +1209,7 @@ document.addEventListener('click', async event => {
     else if (action === 'set-report-count') {
       selectCountOption('report-count', button);
       const max = Number($('#report-custom-count')?.max || 0);
-      bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '优先选择本轮未回答题目，其余按到期顺序补充。' });
+      bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '未回答题目优先；其余按已到期旧卡、新卡的顺序补充。' });
     }
     else if (action === 'start-report-round') {
       const reportId = Number($('#dialog').dataset.retryReportId || 0);
@@ -1211,16 +1218,25 @@ document.addEventListener('click', async event => {
       const count = custom ? Number(custom) : selected;
       if (!reportId || !max) return;
       if (custom && (!Number.isInteger(count) || count < 1 || count > max)) {
-        bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '优先选择本轮未回答题目，其余按到期顺序补充。' });
+        bindCountPicker('report-count', max, { mode: 'strict', startAction: 'start-report-round', defaultHint: '未回答题目优先；其余按已到期旧卡、新卡的顺序补充。' });
         return;
       }
       button.disabled = true;
       const oldLabel = button.textContent;
       button.textContent = '正在开始…';
       try {
-        await startPractice({ scope: 'report_retry', reportId, count });
+        await startPractice({
+          scope: 'report_retry',
+          reportId,
+          count,
+          ...(count === 'all' ? {expectedAvailableCount:max} : {}),
+        });
         closeDialog();
       } catch (error) {
+        if (error.status === 409 && Number(error.data?.remainingAutoReviewQuota) === 0) {
+          await openRetryRoundDialog();
+          return;
+        }
         button.disabled = false;
         button.textContent = oldLabel;
         const hint = $('#report-count-hint');
@@ -1352,7 +1368,7 @@ document.addEventListener('input', event => {
     bindCountPicker('report-count', max, {
       mode: 'strict',
       startAction: 'start-report-round',
-      defaultHint: '优先选择本轮未回答题目，其余按到期顺序补充。',
+      defaultHint: '未回答题目优先；其余按已到期旧卡、新卡的顺序补充。',
       clearActive: true,
     });
   }

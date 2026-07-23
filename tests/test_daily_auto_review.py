@@ -1,5 +1,6 @@
 import importlib
 import json
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,11 +31,13 @@ def load_app(tmp_path, monkeypatch):
     monkeypatch.setenv("TRUST_PROXY_COUNT", "0")
     import app
     import db
+    import fsrs_service
 
     importlib.reload(db)
     importlib.reload(app)
     client = app.create_app({"TESTING": True}).test_client()
     monkeypatch.setattr(app, "datetime", FrozenDateTime)
+    monkeypatch.setattr(fsrs_service, "utc_now", lambda: FROZEN_NOW)
     return client, db, app
 
 
@@ -119,6 +122,56 @@ def add_review_event(db_module, sentence_id, reviewed_at, *, source="selected"):
                 reviewed_at,
             ),
         )
+    return session_id
+
+
+def complete_good_session(client, sentences):
+    practice = client.post(
+        "/api/practice/sessions",
+        json={"sentenceIds": [sentence["id"] for sentence in sentences]},
+    )
+    assert practice.status_code == 201
+    session_id = practice.get_json()["sessionId"]
+    for sentence in sentences:
+        checked = client.post(
+            f"/api/practice/sessions/{session_id}/attempts",
+            json={
+                "attemptId": str(uuid.uuid4()),
+                "sentenceId": sentence["id"],
+                "action": "check",
+                "answerOrder": sentence["correctOrder"],
+            },
+        )
+        assert checked.status_code == 200
+    completed = client.post(
+        f"/api/practice/sessions/{session_id}/complete", json={}
+    )
+    assert completed.status_code == 200
+    return session_id
+
+
+def complete_with_unanswered(client, sentences, answered):
+    practice = client.post(
+        "/api/practice/sessions",
+        json={"sentenceIds": [sentence["id"] for sentence in sentences]},
+    )
+    assert practice.status_code == 201
+    session_id = practice.get_json()["sessionId"]
+    checked = client.post(
+        f"/api/practice/sessions/{session_id}/attempts",
+        json={
+            "attemptId": str(uuid.uuid4()),
+            "sentenceId": answered["id"],
+            "action": "check",
+            "answerOrder": answered["correctOrder"],
+        },
+    )
+    assert checked.status_code == 200
+    completed = client.post(
+        f"/api/practice/sessions/{session_id}/complete",
+        json={"confirmUnanswered": True},
+    )
+    assert completed.status_code == 200
     return session_id
 
 
@@ -344,7 +397,216 @@ def test_completed_today_is_distinct_timezone_scoped_and_requires_review_events(
     assert over_limit["remainingAutoReviewQuota"] == 0
 
 
-def test_zero_quota_blocks_only_due_sessions(
+def test_report_retry_quota_caps_all_revalidates_and_completed_retry_consumes_quota(
+    tmp_path, monkeypatch
+):
+    client, db, _ = load_app(tmp_path, monkeypatch)
+    collection_id = default_collection_id(client)
+    assert client.put(
+        "/api/settings/daily-plan", json={"dailyAutoReviewLimit": 50}
+    ).status_code == 200
+    assert client.put(
+        "/api/settings/timezone", json={"timezone": "Asia/Shanghai"}
+    ).status_code == 200
+
+    report_anchor = make_sentence(client, collection_id, "quota-report")
+    report_id = complete_good_session(client, [report_anchor])
+    completed_fillers = [
+        make_sentence(client, collection_id, f"completed-{index}")
+        for index in range(43)
+    ]
+    for sentence in completed_fillers:
+        add_review_event(db, sentence["id"], "2026-01-01T15:00:00+00:00")
+    candidates = [
+        make_sentence(client, collection_id, f"candidate-{index}")
+        for index in range(80)
+    ]
+
+    before_report_read = fsrs_snapshot(db)
+    report = client.get(f"/api/reports/{report_id}").get_json()["report"]
+    assert report["retry"] == {
+        "candidateCount": 80,
+        "availableCount": 6,
+        "unansweredCount": 0,
+        "remainingAutoReviewQuota": 6,
+        "dailyAutoReviewLimit": 50,
+        "quotaLimited": True,
+    }
+    assert fsrs_snapshot(db) == before_report_read
+
+    retry_all = client.post(
+        "/api/practice/sessions",
+        json={"scope": "report_retry", "reportId": report_id, "count": "all"},
+    )
+    assert retry_all.status_code == 201
+    assert len(retry_all.get_json()["sentences"]) == 6
+    assert "剩余额度" in retry_all.get_json()["notice"]
+    with db.get_db() as connection:
+        assert connection.execute(
+            "SELECT source,total FROM practice_sessions WHERE id=?",
+            (retry_all.get_json()["sessionId"],),
+        ).fetchone()["source"] == "report_retry"
+
+    # The dialog can become stale. Recompute both the distinct completed count
+    # and candidate queue under the session-creation transaction.
+    add_review_event(db, candidates[0]["id"], "2026-01-01T15:10:00+00:00")
+    stale_request = client.post(
+        "/api/practice/sessions",
+        json={
+            "scope": "report_retry",
+            "reportId": report_id,
+            "count": "all",
+            "expectedAvailableCount": 6,
+        },
+    )
+    assert stale_request.status_code == 201
+    stale_payload = stale_request.get_json()
+    assert len(stale_payload["sentences"]) == 5
+    assert candidates[0]["id"] not in {
+        sentence["id"] for sentence in stale_payload["sentences"]
+    }
+    assert "已调整为 5 句" in stale_payload["notice"]
+
+    # Completing a report_retry round still creates normal review_events, so
+    # those distinct sentences consume the rest of the shared daily quota.
+    retry_session_id = stale_payload["sessionId"]
+    for sentence in stale_payload["sentences"]:
+        checked = client.post(
+            f"/api/practice/sessions/{retry_session_id}/attempts",
+            json={
+                "attemptId": str(uuid.uuid4()),
+                "sentenceId": sentence["id"],
+                "action": "check",
+                "answerOrder": sentence["correctOrder"],
+            },
+        )
+        assert checked.status_code == 200
+    assert client.post(
+        f"/api/practice/sessions/{retry_session_id}/complete", json={}
+    ).status_code == 200
+    dashboard = client.get("/api/dashboard").get_json()
+    assert dashboard["completedToday"] == 50
+    assert dashboard["remainingAutoReviewQuota"] == 0
+    with db.get_db() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) n FROM review_events WHERE session_id=?",
+            (retry_session_id,),
+        ).fetchone()["n"] == 5
+
+
+def test_report_retry_prioritizes_unanswered_then_reuses_home_queue_order(
+    tmp_path, monkeypatch
+):
+    client, db, _ = load_app(tmp_path, monkeypatch)
+    collection_id = default_collection_id(client)
+    assert client.put(
+        "/api/settings/daily-plan", json={"dailyAutoReviewLimit": 20}
+    ).status_code == 200
+
+    unanswered_future = make_sentence(client, collection_id, "retry-u-future")
+    unanswered_due = make_sentence(client, collection_id, "retry-u-due")
+    answered = make_sentence(client, collection_id, "retry-answered")
+    report_id = complete_with_unanswered(
+        client,
+        [unanswered_future, unanswered_due, answered],
+        answered,
+    )
+    high_risk = make_sentence(client, collection_id, "retry-high-risk")
+    tied_late = make_sentence(client, collection_id, "retry-tied-late")
+    tied_early = make_sentence(client, collection_id, "retry-tied-early")
+    future_old = make_sentence(client, collection_id, "retry-future-old")
+    newer_new = make_sentence(client, collection_id, "retry-newer-new")
+    older_new = make_sentence(client, collection_id, "retry-older-new")
+
+    make_old_card(
+        db, unanswered_future["id"], stability=1.0,
+        next_review_at="2099-01-01T00:00:00+00:00",
+    )
+    make_old_card(
+        db, unanswered_due["id"], stability=5.0,
+        next_review_at="2025-12-01T00:00:00+00:00",
+    )
+    make_old_card(
+        db, high_risk["id"], stability=1.0,
+        next_review_at="2025-12-31T00:00:00+00:00",
+    )
+    make_old_card(
+        db, tied_late["id"], stability=10.0,
+        next_review_at="2025-12-20T00:00:00+00:00",
+    )
+    make_old_card(
+        db, tied_early["id"], stability=10.0,
+        next_review_at="2025-12-10T00:00:00+00:00",
+    )
+    make_old_card(
+        db, future_old["id"], stability=0.1,
+        next_review_at="2099-01-01T00:00:00+00:00",
+    )
+    set_created_at(db, older_new["id"], "2025-01-01T00:00:00+00:00")
+    set_created_at(db, newer_new["id"], "2025-02-01T00:00:00+00:00")
+
+    home = client.post(
+        "/api/practice/sessions",
+        json={"collectionId": collection_id, "count": "all"},
+    )
+    assert home.status_code == 201
+    home_ids = [sentence["id"] for sentence in home.get_json()["sentences"]]
+    assert future_old["id"] not in home_ids
+    supplemental_ids = [
+        sentence_id
+        for sentence_id in home_ids
+        if sentence_id not in {unanswered_future["id"], unanswered_due["id"]}
+    ]
+    assert supplemental_ids == [
+        high_risk["id"],
+        tied_early["id"],
+        tied_late["id"],
+        older_new["id"],
+        newer_new["id"],
+    ]
+
+    before_report_read = fsrs_snapshot(db)
+    report = client.get(f"/api/reports/{report_id}").get_json()["report"]
+    assert report["retry"] == {
+        "candidateCount": 7,
+        "availableCount": 7,
+        "unansweredCount": 2,
+        "remainingAutoReviewQuota": 19,
+        "dailyAutoReviewLimit": 20,
+        "quotaLimited": False,
+    }
+    assert fsrs_snapshot(db) == before_report_read
+    retry = client.post(
+        "/api/practice/sessions",
+        json={"scope": "report_retry", "reportId": report_id, "count": "all"},
+    )
+    assert retry.status_code == 201
+    retry_ids = [sentence["id"] for sentence in retry.get_json()["sentences"]]
+    assert retry_ids == [
+        unanswered_future["id"],
+        unanswered_due["id"],
+        *supplemental_ids,
+    ]
+    assert len(retry_ids) == len(set(retry_ids))
+
+    # Unanswered items are still capped by quota and retain prior position.
+    assert client.put(
+        "/api/settings/daily-plan", json={"dailyAutoReviewLimit": 3}
+    ).status_code == 200
+    limited_report = client.get(f"/api/reports/{report_id}").get_json()["report"]
+    assert limited_report["retry"]["candidateCount"] == 7
+    assert limited_report["retry"]["availableCount"] == 2
+    assert limited_report["retry"]["quotaLimited"] is True
+    limited = client.post(
+        "/api/practice/sessions",
+        json={"scope": "report_retry", "reportId": report_id, "count": "all"},
+    )
+    assert [
+        sentence["id"] for sentence in limited.get_json()["sentences"]
+    ] == [unanswered_future["id"], unanswered_due["id"]]
+
+
+def test_zero_quota_blocks_home_and_report_retry_but_not_manual_or_random(
     tmp_path, monkeypatch
 ):
     client, db, _ = load_app(tmp_path, monkeypatch)
@@ -392,12 +654,21 @@ def test_zero_quota_blocks_only_due_sessions(
         json={"confirmUnanswered": True},
     )
     assert completed_report.status_code == 200
+    report = client.get(f"/api/reports/{report_id}").get_json()["report"]
+    assert report["retry"]["candidateCount"] >= 1
+    assert report["retry"]["availableCount"] == 0
+    assert report["retry"]["remainingAutoReviewQuota"] == 0
+    assert report["retry"]["quotaLimited"] is True
     retry_round = client.post(
         "/api/practice/sessions",
         json={"scope": "report_retry", "reportId": report_id, "count": "all"},
     )
-    assert retry_round.status_code == 201
-    assert retry_round.get_json()["sentences"][0]["id"] == retry_target["id"]
+    assert retry_round.status_code == 409
+    assert retry_round.get_json()["remainingAutoReviewQuota"] == 0
+    assert (
+        retry_round.get_json()["error"]
+        == "今日自动复习计划已完成，明天可继续自动复习。仍可进入句集进行专项练习。"
+    )
 
     with db.get_db() as connection:
         sources = {
@@ -407,7 +678,8 @@ def test_zero_quota_blocks_only_due_sessions(
                 (sessions_before,),
             )
         }
-    assert {"collection", "selected", "report_retry"} <= sources
+    assert {"collection", "selected"} <= sources
+    assert "report_retry" not in sources
 
 
 def test_dashboard_keeps_true_due_count_and_backend_caps_stale_picker_input(
@@ -471,7 +743,10 @@ def test_frontend_uses_dashboard_auto_limit_for_home_picker_and_settings():
     assert "max: due" not in source
     assert 'max="${inputMax}"' in source
     assert "今日还可自动练习" in source
-    assert "今日自动复习计划已完成。仍可进入句集进行专项练习" in source
+    assert "今日自动复习计划已完成。仍可进入句集进行专项练习。" in source
+    assert "首页自动复习和练习报告中的“再练一轮”共享每日额度" in source
+    assert "专项练习和“再练一轮”不受此限制" not in source
+    assert "或在练习报告中再练一轮" not in source
     assert "api('/api/settings/daily-plan')" in source
     assert 'id="daily-plan-form"' in source
     assert 'min="1" max="500" step="1"' in source
@@ -481,3 +756,19 @@ def test_frontend_uses_dashboard_auto_limit_for_home_picker_and_settings():
     assert ".count-option,.custom-count input{min-height:48px}" in styles
     assert ".hero-bottom{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))" in styles
     assert ".hero-bottom .auto-review-metric{grid-column:1/-1;grid-row:2}" in styles
+
+    due_options = source.split("function dueCollectionOptions(selected) {", 1)[1].split(
+        "function countPickerIds", 1
+    )[0]
+    assert "${esc(c.name)}</option>" in due_options
+    assert "c.due" not in due_options
+    assert "availableAutoReviewCount" not in due_options
+    assert (
+        "本句集有 ${due} 句待复习，本轮最多可自动安排 ${max} 句"
+        in source
+    )
+    assert ".home-practice-picker>div,.home-practice-picker .field{min-width:0}" in styles
+    assert (
+        ".home-practice-picker select{width:100%;max-width:100%;min-width:0"
+        in styles
+    )

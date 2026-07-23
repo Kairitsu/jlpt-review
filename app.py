@@ -573,6 +573,40 @@ def _auto_review_candidate_count(
     ).fetchone()["n"])
 
 
+def _auto_review_candidate_rows(
+    db,
+    *,
+    now_dt: datetime,
+    tz_name: str,
+    collection_id: int | None,
+):
+    """Return the canonical automatic queue without applying a daily/count cap.
+
+    Due reviewed cards use current FSRS retrievability, then due time. New
+    cards follow in creation order. Merely reading this queue never schedules
+    a card or writes a review event.
+    """
+    where, params = _auto_review_candidate_query(now_dt, tz_name, collection_id)
+    candidates = db.execute(
+        f"SELECT s.* FROM sentences s WHERE {where}", params
+    ).fetchall()
+    reviewed = [row for row in candidates if row["last_review_at"] is not None]
+    new = [row for row in candidates if row["last_review_at"] is None]
+    latest = datetime.max.replace(tzinfo=timezone.utc)
+
+    def timestamp_key(value):
+        return parse_iso(value) or latest
+
+    reviewed.sort(key=lambda row: (
+        retrievability(row, now_dt),
+        timestamp_key(row["next_review_at"]),
+        timestamp_key(row["created_at"]),
+        row["id"],
+    ))
+    new.sort(key=lambda row: (timestamp_key(row["created_at"]), row["id"]))
+    return [*reviewed, *new]
+
+
 def _resolve_auto_review_count(requested, available: int, subject: str):
     """Strictly validate a due-session count, then clamp stale oversized input."""
     if requested in (None, "all"):
@@ -609,25 +643,12 @@ def _auto_review_sentence_rows(
     Reviewed cards are ordered by current retrievability from the official FSRS
     package, then due/creation/id. New cards follow in creation/id order.
     """
-    where, params = _auto_review_candidate_query(now_dt, tz_name, collection_id)
-    candidates = db.execute(
-        f"SELECT s.* FROM sentences s WHERE {where}", params
-    ).fetchall()
-    reviewed = [row for row in candidates if row["last_review_at"] is not None]
-    new = [row for row in candidates if row["last_review_at"] is None]
-    latest = datetime.max.replace(tzinfo=timezone.utc)
-
-    def timestamp_key(value):
-        return parse_iso(value) or latest
-
-    reviewed.sort(key=lambda row: (
-        retrievability(row, now_dt),
-        timestamp_key(row["next_review_at"]),
-        timestamp_key(row["created_at"]),
-        row["id"],
-    ))
-    new.sort(key=lambda row: (timestamp_key(row["created_at"]), row["id"]))
-    ordered = [*reviewed, *new]
+    ordered = _auto_review_candidate_rows(
+        db,
+        now_dt=now_dt,
+        tz_name=tz_name,
+        collection_id=collection_id,
+    )
     available = min(len(ordered), max(0, int(remaining_quota)))
     limit, notice = _resolve_auto_review_count(requested_count, available, subject)
     if limit is None:
@@ -657,20 +678,48 @@ def _report_item_rows(db, session_id: int):
     ).fetchall()
 
 
-def _report_retry_sentence_rows(db, session_id: int, collection_id: int | None):
-    """Prioritize this report's unanswered rows, then append currently due rows."""
-    unanswered = db.execute(
+def _report_retry_sentence_rows(
+    db,
+    session_id: int,
+    collection_id: int | None,
+    *,
+    now_dt: datetime,
+    tz_name: str,
+):
+    """Build the next-round queue from unanswered items and the auto queue.
+
+    Surviving unanswered items keep report position priority even when the
+    original round was manual or random. The remaining candidates are exactly
+    the same due-old-then-new queue used by the home automatic review flow.
+    """
+    unanswered_rows = db.execute(
         """SELECT s.* FROM practice_items pi
            JOIN sentences s ON s.id=pi.sentence_id
            WHERE pi.session_id=? AND pi.unanswered_at IS NOT NULL
            ORDER BY pi.position""",
         (session_id,),
     ).fetchall()
-    unanswered_ids = {row["id"] for row in unanswered}
-    due = _due_sentence_rows(
-        db, _study_status_context(db), collection_id=collection_id
+    unanswered = []
+    seen = set()
+    for row in unanswered_rows:
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        unanswered.append(row)
+
+    automatic = _auto_review_candidate_rows(
+        db,
+        now_dt=now_dt,
+        tz_name=tz_name,
+        collection_id=collection_id,
     ) if collection_id is not None else []
-    return [*unanswered, *(row for row in due if row["id"] not in unanswered_ids)]
+    ordered = [*unanswered]
+    for row in automatic:
+        if row["id"] in seen:
+            continue
+        seen.add(row["id"])
+        ordered.append(row)
+    return ordered, len(unanswered)
 
 
 def _study_status_rows(db, collection_id: int, status: str, context: dict[str, str]):
@@ -1560,6 +1609,7 @@ def create_app(test_config=None):
                     report_id = int(body.get("reportId"))
                 except (TypeError, ValueError):
                     return jsonify(error="报告参数无效"), 400
+                db.execute("BEGIN IMMEDIATE")
                 report_row = db.execute(
                     """SELECT id FROM practice_sessions
                        WHERE id=? AND completed_at IS NOT NULL AND report_deleted_at IS NULL""",
@@ -1569,16 +1619,54 @@ def create_app(test_config=None):
                     return jsonify(error="报告不存在"), 404
                 report_items = _report_item_rows(db, report_id)
                 collection = _report_collection(db, report_items)
-                candidates = _report_retry_sentence_rows(
-                    db, report_id, collection["id"] if collection else None
+                now_dt = datetime.now(timezone.utc)
+                tz = user_timezone(db)
+                daily_limit = daily_auto_review_limit(db)
+                completed_today = _completed_today_count(db, now_dt, tz)
+                remaining_quota = max(0, daily_limit - completed_today)
+                if remaining_quota == 0:
+                    return jsonify(
+                        error=(
+                            "今日自动复习计划已完成，明天可继续自动复习。"
+                            "仍可进入句集进行专项练习。"
+                        ),
+                        remainingAutoReviewQuota=0,
+                        dailyAutoReviewLimit=daily_limit,
+                    ), 409
+                candidates, _ = _report_retry_sentence_rows(
+                    db,
+                    report_id,
+                    collection["id"] if collection else None,
+                    now_dt=now_dt,
+                    tz_name=tz,
                 )
-                available = len(candidates)
-                if not available:
-                    return jsonify(error="当前没有可再次练习的句子"), 400
-                limit, msg = _resolve_limit(body.get("count"), available, "当前可再次练习")
+                candidate_count = len(candidates)
+                if not candidate_count:
+                    return jsonify(error="当前没有可进入下一轮的句子"), 400
+                available = min(candidate_count, remaining_quota)
+                limit, notice = _resolve_auto_review_count(
+                    body.get("count"), available, "当前下一轮实际可选"
+                )
                 if limit is None:
-                    return jsonify(error=msg), 400
-                notice = msg
+                    return jsonify(error=notice), 400
+                expected_available = body.get("expectedAvailableCount")
+                if (
+                    not notice
+                    and body.get("count") in (None, "all")
+                    and type(expected_available) is int
+                    and expected_available > available
+                ):
+                    notice = (
+                        f"候选或今日额度已变化，本轮已调整为 {available} 句"
+                    )
+                if (
+                    not notice
+                    and body.get("count") in (None, "all")
+                    and candidate_count > available
+                ):
+                    notice = (
+                        f"受今日自动复习剩余额度限制，本轮已安排 {available} 句"
+                    )
                 selected = [row["id"] for row in candidates[:limit]]
                 source = "report_retry"
             elif body.get("scope") == "collection" and body.get("collectionId"):
@@ -1607,7 +1695,10 @@ def create_app(test_config=None):
                 remaining_quota = max(0, daily_limit - completed_today)
                 if remaining_quota == 0:
                     return jsonify(
-                        error="今日自动复习计划已完成。仍可进入句集进行专项练习，或在练习报告中再练一轮。",
+                        error=(
+                            "今日自动复习计划已完成，明天可继续自动复习。"
+                            "仍可进入句集进行专项练习。"
+                        ),
                         remainingAutoReviewQuota=0,
                     ), 409
                 subject = (
@@ -1883,14 +1974,20 @@ def create_app(test_config=None):
                 return jsonify(error="报告不存在"), 404
             items_rows = _report_item_rows(db, session_id)
             collection = _report_collection(db, items_rows)
-            retry_rows = _report_retry_sentence_rows(
-                db, session_id, collection["id"] if collection else None
-            ) if practice["completed_at"] else []
-            retry_unanswered = sum(
-                1 for row in items_rows
-                if row["unanswered_at"] is not None
-                and any(candidate["id"] == row["sentence_id"] for candidate in retry_rows)
+            now_dt = datetime.now(timezone.utc)
+            tz = user_timezone(db)
+            daily_limit = daily_auto_review_limit(db)
+            completed_today = _completed_today_count(db, now_dt, tz)
+            remaining_quota = max(0, daily_limit - completed_today)
+            retry_rows, retry_unanswered = _report_retry_sentence_rows(
+                db,
+                session_id,
+                collection["id"] if collection else None,
+                now_dt=now_dt,
+                tz_name=tz,
             )
+            retry_candidate_count = len(retry_rows)
+            retry_available_count = min(retry_candidate_count, remaining_quota)
         items = []
         for attempt in items_rows:
             snap = snapshot_dict(attempt["sentence_snapshot_json"])
@@ -1908,8 +2005,12 @@ def create_app(test_config=None):
         payload.update(_session_completion_metadata(practice))
         payload["collection"] = collection
         payload["retry"] = {
-            "availableCount": len(retry_rows),
+            "candidateCount": retry_candidate_count,
+            "availableCount": retry_available_count,
             "unansweredCount": retry_unanswered,
+            "remainingAutoReviewQuota": remaining_quota,
+            "dailyAutoReviewLimit": daily_limit,
+            "quotaLimited": retry_candidate_count > retry_available_count,
         }
         payload["items"] = items
         return jsonify(report=payload)

@@ -30,6 +30,24 @@ def make_sentence(client, collection_id, index):
     return response.get_json()["sentence"]
 
 
+def make_old_card(
+    db_module,
+    sentence_id,
+    *,
+    stability=10.0,
+    last_review_at="2025-01-01T00:00:00+00:00",
+    next_review_at="2000-01-01T00:00:00+00:00",
+):
+    with db_module.get_db() as connection:
+        connection.execute(
+            """UPDATE sentences
+               SET fsrs_state=2,fsrs_step=NULL,stability=?,difficulty=5.0,
+                   last_review_at=?,next_review_at=?
+               WHERE id=?""",
+            (stability, last_review_at, next_review_at, sentence_id),
+        )
+
+
 def attempt(client, session_id, sentence, *, correct=False, skip=False):
     return client.post(f"/api/practice/sessions/{session_id}/attempts", json={
         "attemptId": str(uuid.uuid4()),
@@ -161,23 +179,36 @@ def test_report_retry_uses_current_due_scope_and_revalidates_count(tmp_path, mon
     session_id = complete_good_session(client, report_sentence)
 
     with db.get_db() as connection:
-        connection.executemany(
+        connection.execute(
             "UPDATE sentences SET next_review_at=? WHERE id=?",
-            [
-                ("2099-01-01T00:00:00+00:00", report_sentence["id"]),
-                ("2000-01-01T00:00:01+00:00", due_early["id"]),
-                ("2000-01-01T00:00:02+00:00", due_late["id"]),
-                ("2099-01-01T00:00:00+00:00", future["id"]),
-                ("1999-01-01T00:00:00+00:00", other_due["id"]),
-            ],
+            ("2099-01-01T00:00:00+00:00", report_sentence["id"]),
         )
+    make_old_card(
+        db, due_early["id"], next_review_at="2000-01-01T00:00:01+00:00"
+    )
+    make_old_card(
+        db, due_late["id"], next_review_at="2000-01-01T00:00:02+00:00"
+    )
+    make_old_card(
+        db, future["id"], next_review_at="2099-01-01T00:00:00+00:00"
+    )
+    make_old_card(
+        db, other_due["id"], next_review_at="1999-01-01T00:00:00+00:00"
+    )
 
     report = client.get(f"/api/reports/{session_id}").get_json()["report"]
     assert report["collection"] == {
         "id": source["id"], "name": source["name"], "available": 4,
         "dueCount": 2,
     }
-    assert report["retry"] == {"availableCount": 2, "unansweredCount": 0}
+    assert report["retry"] == {
+        "candidateCount": 2,
+        "availableCount": 2,
+        "unansweredCount": 0,
+        "remainingAutoReviewQuota": 49,
+        "dailyAutoReviewLimit": 50,
+        "quotaLimited": False,
+    }
 
     # Simulate a stale open dialog: one candidate is no longer due before Start.
     with db.get_db() as connection:
@@ -210,7 +241,7 @@ def test_report_retry_uses_current_due_scope_and_revalidates_count(tmp_path, mon
         json={"scope": "report_retry", "reportId": session_id, "count": 2},
     )
     assert empty.status_code == 400
-    assert empty.get_json()["error"] == "当前没有可再次练习的句子"
+    assert empty.get_json()["error"] == "当前没有可进入下一轮的句子"
 
 
 def test_force_complete_persists_unanswered_without_touching_fsrs(tmp_path, monkeypatch):
@@ -319,20 +350,33 @@ def test_report_retry_prioritizes_unanswered_and_deduplicates_due(tmp_path, monk
         json={"confirmUnanswered": True},
     ).status_code == 200
 
+    make_old_card(
+        db, unanswered_future["id"], next_review_at="2099-01-01T00:00:00+00:00"
+    )
+    make_old_card(
+        db, unanswered_due["id"], next_review_at="2000-01-01T00:00:03+00:00"
+    )
     with db.get_db() as connection:
-        connection.executemany(
+        connection.execute(
             "UPDATE sentences SET next_review_at=? WHERE id=?",
-            [
-                ("2099-01-01T00:00:00+00:00", unanswered_future["id"]),
-                ("2000-01-01T00:00:03+00:00", unanswered_due["id"]),
-                ("2099-01-01T00:00:00+00:00", answered["id"]),
-                ("2000-01-01T00:00:01+00:00", due_early["id"]),
-                ("2000-01-01T00:00:02+00:00", due_late["id"]),
-            ],
+            ("2099-01-01T00:00:00+00:00", answered["id"]),
         )
+    make_old_card(
+        db, due_early["id"], next_review_at="2000-01-01T00:00:01+00:00"
+    )
+    make_old_card(
+        db, due_late["id"], next_review_at="2000-01-01T00:00:02+00:00"
+    )
 
     report = client.get(f"/api/reports/{session_id}").get_json()["report"]
-    assert report["retry"] == {"availableCount": 4, "unansweredCount": 2}
+    assert report["retry"] == {
+        "candidateCount": 4,
+        "availableCount": 4,
+        "unansweredCount": 2,
+        "remainingAutoReviewQuota": 49,
+        "dailyAutoReviewLimit": 50,
+        "quotaLimited": False,
+    }
     retry_one = client.post("/api/practice/sessions", json={
         "scope": "report_retry", "reportId": session_id, "count": 1,
     }).get_json()
@@ -407,10 +451,20 @@ def test_report_frontend_has_only_new_actions_and_route_scoped_fab():
     assert "retry-wrong" not in source
     assert "data-action=\"open-retry-round\"" in source
     assert "state.route === 'report'" in source
+    assert "const candidateCount = Number(retry.candidateCount || 0)" in source
     assert "const max = Number(retry.availableCount || 0)" in source
+    assert "const remainingQuota = Number(retry.remainingAutoReviewQuota || 0)" in source
     assert "state.report = (await api(`/api/reports/${reportId}`)).report;" in source
-    assert "await startPractice({ scope: 'report_retry', reportId, count });" in source
-    assert "当前没有可再次练习的句子" in source
+    assert "scope: 'report_retry'" in source
+    assert "...(count === 'all' ? {expectedAvailableCount:max} : {})" in source
+    assert "当前没有可进入下一轮的句子" in source
+    assert "上一轮还有 <strong>${unanswered}</strong> 句未回答，将优先安排" in source
+    assert "未回答题目优先；其余按已到期旧卡、新卡的顺序补充。" in source
+    assert (
+        "今日自动复习计划已完成，明天可继续自动复习。"
+        "仍可进入句集进行专项练习。"
+    ) in source
+    assert "重新练习本轮题目" not in source
     assert 'data-action="skip"' not in source
     assert "practice.items.flatMap" in source
     assert "data-action=\"previous-question\"" in source
