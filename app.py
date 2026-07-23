@@ -56,6 +56,10 @@ from tokenizer import (
 )
 
 MAX_SENTENCE_NOTE_LENGTH = 1000
+DAILY_AUTO_REVIEW_LIMIT_KEY = "daily_auto_review_limit"
+DEFAULT_DAILY_AUTO_REVIEW_LIMIT = 50
+MIN_DAILY_AUTO_REVIEW_LIMIT = 1
+MAX_DAILY_AUTO_REVIEW_LIMIT = 500
 
 
 def truthy(name: str, default=False):
@@ -252,6 +256,18 @@ def answers_match(answer, correct, chunks):
 def user_timezone(db) -> str:
     """Configured IANA timezone, or "" to fall back to the server's local timezone."""
     return setting(db, "user_timezone", "")
+
+
+def daily_auto_review_limit(db) -> int:
+    """Return the validated stored limit, falling back safely for legacy data."""
+    raw = setting(db, DAILY_AUTO_REVIEW_LIMIT_KEY, str(DEFAULT_DAILY_AUTO_REVIEW_LIMIT))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_AUTO_REVIEW_LIMIT
+    if not MIN_DAILY_AUTO_REVIEW_LIMIT <= value <= MAX_DAILY_AUTO_REVIEW_LIMIT:
+        return DEFAULT_DAILY_AUTO_REVIEW_LIMIT
+    return value
 
 
 _STATS_TIMELINE_DAYS = (
@@ -501,6 +517,122 @@ def _due_sentence_rows(
         query += " LIMIT ?"
         params.append(limit)
     return db.execute(query, params).fetchall()
+
+
+def _completed_today_count(db, now_dt: datetime, tz_name: str) -> int:
+    """Count distinct sentences with a formal review event in the user's day."""
+    today_start, tomorrow_start = local_day_utc_bounds(now_dt, tz_name=tz_name)
+    return int(db.execute(
+        """SELECT COUNT(DISTINCT sentence_id) n
+           FROM review_events
+           WHERE reviewed_at>=? AND reviewed_at<?""",
+        (
+            today_start.isoformat(timespec="seconds"),
+            tomorrow_start.isoformat(timespec="seconds"),
+        ),
+    ).fetchone()["n"])
+
+
+def _auto_review_candidate_query(
+    now_dt: datetime,
+    tz_name: str,
+    collection_id: int | None = None,
+) -> tuple[str, list]:
+    """Build the shared automatic-queue predicate and parameters."""
+    today_start, tomorrow_start = local_day_utc_bounds(now_dt, tz_name=tz_name)
+    where = """(
+        s.last_review_at IS NULL
+        OR (s.last_review_at IS NOT NULL AND s.next_review_at<=?)
+      )
+      AND NOT EXISTS(
+        SELECT 1 FROM review_events re
+        WHERE re.sentence_id=s.id
+          AND re.reviewed_at>=? AND re.reviewed_at<?
+      )"""
+    params = [
+        now_dt.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        today_start.isoformat(timespec="seconds"),
+        tomorrow_start.isoformat(timespec="seconds"),
+    ]
+    if collection_id is not None:
+        where += " AND s.collection_id=?"
+        params.append(collection_id)
+    return where, params
+
+
+def _auto_review_candidate_count(
+    db,
+    *,
+    now_dt: datetime,
+    tz_name: str,
+    collection_id: int | None = None,
+) -> int:
+    where, params = _auto_review_candidate_query(now_dt, tz_name, collection_id)
+    return int(db.execute(
+        f"SELECT COUNT(*) n FROM sentences s WHERE {where}", params
+    ).fetchone()["n"])
+
+
+def _resolve_auto_review_count(requested, available: int, subject: str):
+    """Strictly validate a due-session count, then clamp stale oversized input."""
+    if requested in (None, "all"):
+        return available, ""
+    if isinstance(requested, bool):
+        return None, "题目数量必须是正整数"
+    if type(requested) is int:
+        limit = requested
+    elif isinstance(requested, str) and requested.strip().isdigit():
+        limit = int(requested.strip())
+    else:
+        return None, "题目数量必须是正整数"
+    if limit < 1:
+        return None, "题目数量必须是正整数"
+    notice = ""
+    if limit > available:
+        notice = f"{subject}只有 {available} 句，已调整为全部"
+        limit = available
+    return limit, notice
+
+
+def _auto_review_sentence_rows(
+    db,
+    *,
+    now_dt: datetime,
+    tz_name: str,
+    collection_id: int | None,
+    remaining_quota: int,
+    requested_count,
+    subject: str = "当前可自动复习",
+):
+    """Build and cap the home automatic queue without changing FSRS state.
+
+    Reviewed cards are ordered by current retrievability from the official FSRS
+    package, then due/creation/id. New cards follow in creation/id order.
+    """
+    where, params = _auto_review_candidate_query(now_dt, tz_name, collection_id)
+    candidates = db.execute(
+        f"SELECT s.* FROM sentences s WHERE {where}", params
+    ).fetchall()
+    reviewed = [row for row in candidates if row["last_review_at"] is not None]
+    new = [row for row in candidates if row["last_review_at"] is None]
+    latest = datetime.max.replace(tzinfo=timezone.utc)
+
+    def timestamp_key(value):
+        return parse_iso(value) or latest
+
+    reviewed.sort(key=lambda row: (
+        retrievability(row, now_dt),
+        timestamp_key(row["next_review_at"]),
+        timestamp_key(row["created_at"]),
+        row["id"],
+    ))
+    new.sort(key=lambda row: (timestamp_key(row["created_at"]), row["id"]))
+    ordered = [*reviewed, *new]
+    available = min(len(ordered), max(0, int(remaining_quota)))
+    limit, notice = _resolve_auto_review_count(requested_count, available, subject)
+    if limit is None:
+        raise ValueError(notice)
+    return ordered[:limit], available, notice
 
 
 def _report_item_rows(db, session_id: int):
@@ -978,7 +1110,12 @@ def create_app(test_config=None):
     @app.get("/api/dashboard")
     def dashboard():
         with get_db() as db:
-            context = _study_status_context(db)
+            now_dt = datetime.now(timezone.utc)
+            context = _study_status_context(db, now_dt)
+            tz = user_timezone(db)
+            daily_limit = daily_auto_review_limit(db)
+            completed_today = _completed_today_count(db, now_dt, tz)
+            remaining_quota = max(0, daily_limit - completed_today)
             collections = [dict(row) for row in db.execute("""
               SELECT c.id,c.name,COUNT(s.id) total,
                 SUM(CASE WHEN s.last_review_at IS NOT NULL THEN 1 ELSE 0 END) learned
@@ -990,7 +1127,22 @@ def create_app(test_config=None):
                 item["total"], item["learned"] = int(item["total"] or 0), int(item["learned"] or 0)
                 item["due"] = int(due_counts.get(item["id"], 0))
                 item["today"] = int(today_counts.get(item["id"], 0))
-        return jsonify(collections=collections)
+                candidate_count = _auto_review_candidate_count(
+                    db, now_dt=now_dt, tz_name=tz, collection_id=item["id"]
+                )
+                item["availableAutoReviewCount"] = min(candidate_count, remaining_quota)
+            due_total = sum(item["due"] for item in collections)
+            candidate_total = _auto_review_candidate_count(
+                db, now_dt=now_dt, tz_name=tz
+            )
+        return jsonify(
+            collections=collections,
+            due=due_total,
+            dailyAutoReviewLimit=daily_limit,
+            completedToday=completed_today,
+            remainingAutoReviewQuota=remaining_quota,
+            availableAutoReviewCount=min(candidate_total, remaining_quota),
+        )
 
     @app.get("/api/collections/<int:collection_id>/study-status/<status>")
     def collection_study_status(collection_id, status):
@@ -1387,7 +1539,10 @@ def create_app(test_config=None):
 
     @app.post("/api/practice/sessions")
     def start_session():
-        body = request.get_json(silent=True) or {}
+        raw_body = request.get_json(silent=True)
+        if raw_body is not None and not isinstance(raw_body, dict):
+            return jsonify(error="请求内容必须是 JSON 对象"), 400
+        body = raw_body or {}
         ids = body.get("sentenceIds")
         notice = ""
         with get_db() as db:
@@ -1444,19 +1599,37 @@ def create_app(test_config=None):
                         collection_id = int(body["collectionId"])
                     except (TypeError, ValueError):
                         return jsonify(error="参数无效"), 400
-                context = _study_status_context(db)
-                available = _due_sentence_count(db, context, collection_id=collection_id)
-                subject = "当前句集待复习" if collection_id is not None else "当前待复习"
-                limit, msg = _resolve_limit(body.get("count"), available, subject)
-                if limit is None:
-                    return jsonify(error=msg), 400
-                notice = msg
-                selected = [
-                    row["id"]
-                    for row in _due_sentence_rows(
-                        db, context, collection_id=collection_id, limit=limit
+                db.execute("BEGIN IMMEDIATE")
+                now_dt = datetime.now(timezone.utc)
+                tz = user_timezone(db)
+                daily_limit = daily_auto_review_limit(db)
+                completed_today = _completed_today_count(db, now_dt, tz)
+                remaining_quota = max(0, daily_limit - completed_today)
+                if remaining_quota == 0:
+                    return jsonify(
+                        error="今日自动复习计划已完成。仍可进入句集进行专项练习，或在练习报告中再练一轮。",
+                        remainingAutoReviewQuota=0,
+                    ), 409
+                subject = (
+                    "当前句集可自动复习"
+                    if collection_id is not None
+                    else "当前可自动复习"
+                )
+                try:
+                    rows, available, notice = _auto_review_sentence_rows(
+                        db,
+                        now_dt=now_dt,
+                        tz_name=tz,
+                        collection_id=collection_id,
+                        remaining_quota=remaining_quota,
+                        requested_count=body.get("count"),
+                        subject=subject,
                     )
-                ]
+                except ValueError as exc:
+                    return jsonify(error=str(exc)), 400
+                if not available:
+                    return jsonify(error="当前没有可自动安排的待复习句子"), 400
+                selected = [row["id"] for row in rows]
                 source = "due"
             if not selected:
                 return jsonify(error="当前没有待复习句子"), 400
@@ -1789,6 +1962,33 @@ def create_app(test_config=None):
             maximumIntervalDays=MAXIMUM_INTERVAL_DAYS,
             version=FSRS_VERSION,
         )
+
+    @app.get("/api/settings/daily-plan")
+    def get_daily_plan_settings():
+        with get_db() as db:
+            value = daily_auto_review_limit(db)
+        return jsonify(dailyAutoReviewLimit=value)
+
+    @app.put("/api/settings/daily-plan")
+    def save_daily_plan_settings():
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify(error="请求内容必须是 JSON 对象"), 400
+        value = body.get("dailyAutoReviewLimit")
+        if (
+            type(value) is not int
+            or not MIN_DAILY_AUTO_REVIEW_LIMIT <= value <= MAX_DAILY_AUTO_REVIEW_LIMIT
+        ):
+            return jsonify(
+                error=(
+                    "每日自动复习上限必须是 "
+                    f"{MIN_DAILY_AUTO_REVIEW_LIMIT} 到 "
+                    f"{MAX_DAILY_AUTO_REVIEW_LIMIT} 之间的整数"
+                )
+            ), 400
+        with get_db() as db:
+            set_setting(db, DAILY_AUTO_REVIEW_LIMIT_KEY, str(value))
+        return jsonify(ok=True, dailyAutoReviewLimit=value)
 
     @app.get("/api/settings/timezone")
     def get_timezone_settings():

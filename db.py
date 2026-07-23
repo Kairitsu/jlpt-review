@@ -499,6 +499,9 @@ def init_db(*, enable_fuzzing: bool = True) -> None:
 
         db.execute("DELETE FROM settings WHERE key IN ('scheduler_mode','base_url','model','custom_params','api_key_encrypted')")
         db.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES('daily_auto_review_limit','50')"
+        )
+        db.execute(
             "INSERT OR IGNORE INTO collections(name,created_at,updated_at) VALUES('默认句集',?,?)",
             (stamp, stamp),
         )
