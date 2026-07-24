@@ -21,6 +21,8 @@ const CALENDAR_VIEWS = {
 const statsCharts = {};
 const statsState = {
   data: null,
+  rootData: null,
+  cardType: 'sentence_order',
   calendarView: 'performance',
   hiddenCalendarSeries: {
     performance: new Set(),
@@ -39,7 +41,7 @@ function destroyStatsCharts() {
   Object.keys(statsCharts).forEach(destroyChart);
 }
 
-function clearStatsCache() { statsState.data = null; }
+function clearStatsCache() { statsState.data = null; statsState.rootData = null; }
 
 function formatPercent(value) {
   if (value == null || !Number.isFinite(Number(value))) return '暂无比例';
@@ -58,6 +60,14 @@ function formatDurationMs(value) {
   const seconds = Math.round((ms % 60_000) / 1000);
   if (!seconds || seconds === 60) return `${minutes + (seconds === 60 ? 1 : 0)} 分钟`;
   return `${minutes} 分钟 ${seconds} 秒`;
+}
+
+function statsCountUnit() {
+  return statsState.cardType === 'kanji_reading' ? '张' : '句';
+}
+
+function statsCountLabel() {
+  return statsState.cardType === 'kanji_reading' ? '读音卡数' : '句子数';
 }
 
 function dateLabel(day) {
@@ -189,7 +199,7 @@ function calendarTooltipCallbacks() {
       label(context) {
         const day = statsState.data.timeline[context.dataIndex];
         const group = ratingGroup(day, context.dataset.key);
-        return group ? `${group.label}：${group.count} 句（${formatPercent(group.percentage)}）` : '';
+        return group ? `${group.label}：${group.count} ${statsCountUnit()}（${formatPercent(group.percentage)}）` : '';
       },
       footer(items) {
         const ratings = statsState.data.timeline[items[0]?.dataIndex]?.actual?.ratings;
@@ -275,11 +285,11 @@ function masterySummaryText(group) {
   const ratio = group.includedInPercentage
     ? `占有效记录 ${formatPercent(group.percentage)}`
     : '不计入掌握度比例';
-  return `${group.label}，${group.count} 句，${ratio}，${group.status}`;
+  return `${group.label}，${group.count} ${statsCountUnit()}，${ratio}，${group.status}`;
 }
 
 function masteryListHtml() {
-  return statsState.data.memoryMastery.groups.map((group, index) => `<div class="stats-mastery-item stats-data-point" tabindex="0" data-chart="mastery" data-index="${index}" aria-label="${esc(masterySummaryText(group))}"><i style="--series-color:${STATS_COLORS[group.key]}" aria-hidden="true"></i><div><strong>${esc(group.label)}</strong><span>${group.count} 句 · ${group.includedInPercentage ? formatPercent(group.percentage) : '不计入掌握度比例'}</span><small>${esc(group.status)}</small></div></div>`).join('');
+  return statsState.data.memoryMastery.groups.map((group, index) => `<div class="stats-mastery-item stats-data-point" tabindex="0" data-chart="mastery" data-index="${index}" aria-label="${esc(masterySummaryText(group))}"><i style="--series-color:${STATS_COLORS[group.key]}" aria-hidden="true"></i><div><strong>${esc(group.label)}</strong><span>${group.count} ${statsCountUnit()} · ${group.includedInPercentage ? formatPercent(group.percentage) : '不计入掌握度比例'}</span><small>${esc(group.status)}</small></div></div>`).join('');
 }
 
 function renderMasteryChart() {
@@ -300,7 +310,7 @@ function renderMasteryChart() {
   options.plugins.tooltip = tooltipOptions({
     label(context) {
       const group = groups[context.dataIndex];
-      return `${group.count} 句 · ${group.includedInPercentage ? formatPercent(group.percentage) : '不计入掌握度比例'}`;
+      return `${group.count} ${statsCountUnit()} · ${group.includedInPercentage ? formatPercent(group.percentage) : '不计入掌握度比例'}`;
     },
     afterLabel(context) { return groups[context.dataIndex].status; },
   });
@@ -310,7 +320,7 @@ function renderMasteryChart() {
       grid: {color: 'rgba(104, 130, 125, .13)'},
       border: {display: false},
       ticks: {precision: 0, color: '#68827d'},
-      title: axisTitle('句子数'),
+      title: axisTitle(statsCountLabel()),
     },
     y: {
       grid: {display: false}, border: {display: false},
@@ -322,7 +332,7 @@ function renderMasteryChart() {
     data: {
       labels: groups.map(group => group.label),
       datasets: [{
-        label: '句子数',
+        label: statsCountLabel(),
         data: groups.map(group => group.count),
         backgroundColor: groups.map(group => STATS_COLORS[group.key]),
         borderRadius: 8, borderSkipped: false, maxBarThickness: 34,
@@ -339,7 +349,7 @@ function renderMasteryView() {
 }
 
 function upcomingDueTableHtml(days) {
-  const rows = days.map(day => `<tr><th scope="row">${esc(day.monthDay)} · ${esc(day.relativeLabel)}</th><td>${esc(day.weekday)}</td><td>${day.count} 句</td></tr>`).join('');
+  const rows = days.map(day => `<tr><th scope="row">${esc(day.monthDay)} · ${esc(day.relativeLabel)}</th><td>${esc(day.weekday)}</td><td>${day.count} ${statsCountUnit()}</td></tr>`).join('');
   return `<div class="stats-upcoming-table-wrap"><table class="stats-upcoming-table" aria-labelledby="stats-upcoming-title"><thead><tr><th scope="col">日期</th><th scope="col">星期</th><th scope="col">预计到期</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
@@ -348,6 +358,10 @@ function statsPageHtml(data) {
   const timezoneLabel = data.timezone.name || '服务器本地时区';
   return `<section class="page stats-page">
     <div class="page-head"><div><h1>学习概览</h1><p>查看近期学习情况、未来复习安排和当前记忆状态。</p></div></div>
+    <div class="stats-card-type-switch" role="group" aria-label="练习题型">
+      <button class="stats-view-button ${statsState.cardType === 'sentence_order' ? 'active' : ''}" data-action="stats-card-type" data-card-type="sentence_order" aria-pressed="${statsState.cardType === 'sentence_order'}">句子重组</button>
+      <button class="stats-view-button ${statsState.cardType === 'kanji_reading' ? 'active' : ''}" data-action="stats-card-type" data-card-type="kanji_reading" aria-pressed="${statsState.cardType === 'kanji_reading'}">汉字读音</button>
+    </div>
     <article class="card stats-card stats-calendar-card">
       <div class="stats-card-head"><div><h2>学习日历</h2><p>查看最近五天的学习表现与学习时长。</p></div><span class="stats-timezone" title="统计生成时间：${esc(data.generatedAt)}">${esc(timezoneLabel)}</span></div>
       <div class="stats-view-switch" role="group" aria-label="日历图表视图">${viewControlsHtml()}</div>
@@ -367,11 +381,11 @@ function statsPageHtml(data) {
       <p class="stats-footnote">未来复习数量依据当前学习进度估算，完成新的练习后可能发生变化。</p>
     </article>
     <article class="card stats-card stats-memory-card">
-      <div class="stats-card-head"><div><h2>当前记忆掌握度</h2><p>有效记录 ${mastery.effectiveSentenceCount} 句 · 尚无有效记录 ${mastery.untrackedSentenceCount} 句</p></div></div>
-      <p id="stats-memory-empty" class="stats-empty-inline hidden" role="status">还没有已学习的句子，完成学习后这里会显示记忆状态。</p>
+      <div class="stats-card-head"><div><h2>当前记忆掌握度</h2><p>有效记录 ${mastery.effectiveSentenceCount} ${statsCountUnit()} · 尚无有效记录 ${mastery.untrackedSentenceCount} ${statsCountUnit()}</p></div></div>
+      <p id="stats-memory-empty" class="stats-empty-inline hidden" role="status">还没有已学习的${statsState.cardType === 'kanji_reading' ? '读音卡' : '句子'}，完成学习后这里会显示记忆状态。</p>
       <div class="stats-chart-wrap stats-memory-chart"><canvas id="chart-memory-mastery" role="img" aria-label="当前记忆掌握度图表" aria-describedby="stats-memory-list"></canvas></div>
       <div id="stats-memory-list" class="stats-mastery-list" aria-label="当前记忆掌握度文字摘要"></div>
-      <p class="stats-footnote">系统根据每个句子的历史表现和距上次复习的时间，估算你现在仍能正确回忆它的概率。这个数值会随时间变化，并在完成复习后重新计算。</p>
+      <p class="stats-footnote">系统根据${statsState.cardType === 'kanji_reading' ? '每张读音卡' : '每个句子'}的历史表现和距上次复习的时间，估算你现在仍能正确回忆它的概率。这个数值会随时间变化，并在完成复习后重新计算。</p>
     </article>
   </section>`;
 }
@@ -383,7 +397,10 @@ async function renderStats() {
   view.innerHTML = '<section class="page stats-page"><p class="status-note">正在整理学习概览…</p></section>';
   setChrome();
   try {
-    statsState.data = await api('/api/stats/summary');
+    statsState.rootData = await api('/api/stats/summary');
+    statsState.data = statsState.cardType === 'kanji_reading'
+      ? {...statsState.rootData, ...statsState.rootData.kanjiReading}
+      : statsState.rootData;
     view.innerHTML = statsPageHtml(statsState.data);
     renderCalendarView();
     renderMasteryView();
@@ -403,6 +420,19 @@ function updateCalendarSeriesVisibility() {
 
 function handleStatsAction(action, button) {
   if (!statsState.data) return false;
+  if (action === 'stats-card-type') {
+    const requested = button.dataset.cardType;
+    if (!['sentence_order', 'kanji_reading'].includes(requested) || requested === statsState.cardType) return true;
+    statsState.cardType = requested;
+    statsState.data = requested === 'kanji_reading'
+      ? {...statsState.rootData, ...statsState.rootData.kanjiReading}
+      : statsState.rootData;
+    destroyStatsCharts();
+    view.innerHTML = statsPageHtml(statsState.data);
+    renderCalendarView();
+    renderMasteryView();
+    return true;
+  }
   if (action === 'stats-view') {
     const requested = button.dataset.view;
     if (!CALENDAR_VIEWS[requested] || requested === statsState.calendarView) return true;

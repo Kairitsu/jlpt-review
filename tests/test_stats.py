@@ -84,8 +84,10 @@ def add_review_event(
     is_new=False,
 ):
     with db_module.get_db() as connection:
-        sentence = connection.execute(
-            "SELECT * FROM sentences WHERE id=?", (sentence_id,)
+        card = connection.execute(
+            """SELECT * FROM practice_cards
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (sentence_id,),
         ).fetchone()
         session_id = connection.execute(
             """INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at)
@@ -94,20 +96,20 @@ def add_review_event(
         ).lastrowid
         connection.execute(
             """INSERT INTO review_events(
-                 sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
+                 card_id,sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
                  fsrs_state_before,fsrs_state_after,fsrs_step_before,fsrs_step_after,
                  stability_before,stability_after,difficulty_before,difficulty_after,
                  next_review_before,next_review_after,fsrs_version,created_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                sentence_id, session_id, int(rating), reviewed_at,
+                card["id"], sentence_id, session_id, int(rating), reviewed_at,
                 duration_ms, int(is_new),
-                sentence["fsrs_state"], sentence["fsrs_state"],
-                sentence["fsrs_step"], sentence["fsrs_step"],
-                sentence["stability"], sentence["stability"],
-                sentence["difficulty"], sentence["difficulty"],
-                sentence["next_review_at"], sentence["next_review_at"],
-                sentence["fsrs_version"], reviewed_at,
+                card["fsrs_state"], card["fsrs_state"],
+                card["fsrs_step"], card["fsrs_step"],
+                card["stability"], card["stability"],
+                card["difficulty"], card["difficulty"],
+                card["next_review_at"], card["next_review_at"],
+                card["fsrs_version"], reviewed_at,
             ),
         )
 
@@ -311,6 +313,7 @@ def test_learning_overview_replaces_old_stats_fields_and_keeps_fsrs_settings(
     )["count"] == 1
     assert set(data) == {
         "generatedAt", "timezone", "timeline", "upcomingDue", "memoryMastery",
+        "kanjiReading",
     }
     for removed in (
         "forecast", "retentionPct", "reviewedCards",
@@ -361,18 +364,24 @@ def test_history_and_upcoming_due_use_user_timezone_and_half_open_day_ranges(
         rating=Rating.Easy, duration_ms=70_000, is_new=False,
     )
     with db.get_db() as connection:
+        schedules = [
+            ("2025-12-20T00:00:00+00:00", sentences[0]["id"]),
+            (FROZEN_NOW.isoformat(timespec="seconds"), sentences[1]["id"]),
+            ("2026-01-02T16:00:00+00:00", sentences[2]["id"]),
+            ("2026-01-03T15:59:59+00:00", sentences[3]["id"]),
+            ("2026-01-03T16:00:00+00:00", sentences[4]["id"]),
+            ("2026-01-04T16:00:00+00:00", sentences[5]["id"]),
+            ("2026-01-05T15:59:59+00:00", sentences[6]["id"]),
+            ("2026-01-05T16:00:00+00:00", sentences[7]["id"]),
+        ]
         connection.executemany(
             "UPDATE sentences SET next_review_at=? WHERE id=?",
-            [
-                ("2025-12-20T00:00:00+00:00", sentences[0]["id"]),
-                (FROZEN_NOW.isoformat(timespec="seconds"), sentences[1]["id"]),
-                ("2026-01-02T16:00:00+00:00", sentences[2]["id"]),
-                ("2026-01-03T15:59:59+00:00", sentences[3]["id"]),
-                ("2026-01-03T16:00:00+00:00", sentences[4]["id"]),
-                ("2026-01-04T16:00:00+00:00", sentences[5]["id"]),
-                ("2026-01-05T15:59:59+00:00", sentences[6]["id"]),
-                ("2026-01-05T16:00:00+00:00", sentences[7]["id"]),
-            ],
+            schedules,
+        )
+        connection.executemany(
+            """UPDATE practice_cards SET next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            schedules,
         )
 
     data = client.get("/api/stats/summary").get_json()
@@ -512,9 +521,29 @@ def test_memory_mastery_uses_official_service_boundary_and_exclusive_ranges(
                SET last_review_at=?,stability=1.0,difficulty=5.0 WHERE id=?""",
             [("2026-01-01T00:00:00+00:00", item["id"]) for item in tracked],
         )
+        connection.executemany(
+            """UPDATE practice_cards
+               SET last_review_at=?,stability=1.0,difficulty=5.0
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            [("2026-01-01T00:00:00+00:00", item["id"]) for item in tracked],
+        )
 
+    with db.get_db() as connection:
+        tracked_card_ids = [
+            connection.execute(
+                """SELECT id FROM practice_cards
+                   WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+                (item["id"],),
+            ).fetchone()["id"]
+            for item in tracked
+        ]
+        untracked_card_id = connection.execute(
+            """SELECT id FROM practice_cards
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (untracked["id"],),
+        ).fetchone()["id"]
     probabilities = dict(zip(
-        [item["id"] for item in tracked],
+        tracked_card_ids,
         [0.95, 0.949, 0.90, 0.899, 0.80, 0.799],
         strict=True,
     ))
@@ -544,7 +573,7 @@ def test_memory_mastery_uses_official_service_boundary_and_exclusive_ranges(
         "status": "尚无有效学习记录",
         "includedInPercentage": False,
     }
-    assert untracked["id"] not in {sentence_id for sentence_id, _ in calls}
+    assert untracked_card_id not in {card_id for card_id, _ in calls}
 
 
 def test_stats_frontend_has_two_history_views_upcoming_table_and_dynamic_today():

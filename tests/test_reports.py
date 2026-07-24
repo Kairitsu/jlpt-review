@@ -46,6 +46,13 @@ def make_old_card(
                WHERE id=?""",
             (stability, last_review_at, next_review_at, sentence_id),
         )
+        connection.execute(
+            """UPDATE practice_cards
+               SET fsrs_state=2,fsrs_step=NULL,stability=?,difficulty=5.0,
+                   last_review_at=?,next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (stability, last_review_at, next_review_at, sentence_id),
+        )
 
 
 def attempt(client, session_id, sentence, *, correct=False, skip=False):
@@ -183,6 +190,11 @@ def test_report_retry_uses_current_due_scope_and_revalidates_count(tmp_path, mon
             "UPDATE sentences SET next_review_at=? WHERE id=?",
             ("2099-01-01T00:00:00+00:00", report_sentence["id"]),
         )
+        connection.execute(
+            """UPDATE practice_cards SET next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            ("2099-01-01T00:00:00+00:00", report_sentence["id"]),
+        )
     make_old_card(
         db, due_early["id"], next_review_at="2000-01-01T00:00:01+00:00"
     )
@@ -216,6 +228,11 @@ def test_report_retry_uses_current_due_scope_and_revalidates_count(tmp_path, mon
             "UPDATE sentences SET next_review_at=? WHERE id=?",
             ("2099-01-01T00:00:00+00:00", due_early["id"]),
         )
+        connection.execute(
+            """UPDATE practice_cards SET next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            ("2099-01-01T00:00:00+00:00", due_early["id"]),
+        )
     retry = client.post(
         "/api/practice/sessions",
         json={"scope": "report_retry", "reportId": session_id, "count": 2},
@@ -234,6 +251,11 @@ def test_report_retry_uses_current_due_scope_and_revalidates_count(tmp_path, mon
     with db.get_db() as connection:
         connection.execute(
             "UPDATE sentences SET next_review_at=? WHERE id=?",
+            ("2099-01-01T00:00:00+00:00", due_late["id"]),
+        )
+        connection.execute(
+            """UPDATE practice_cards SET next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
             ("2099-01-01T00:00:00+00:00", due_late["id"]),
         )
     empty = client.post(
@@ -361,6 +383,11 @@ def test_report_retry_prioritizes_unanswered_and_deduplicates_due(tmp_path, monk
             "UPDATE sentences SET next_review_at=? WHERE id=?",
             ("2099-01-01T00:00:00+00:00", answered["id"]),
         )
+        connection.execute(
+            """UPDATE practice_cards SET next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            ("2099-01-01T00:00:00+00:00", answered["id"]),
+        )
     make_old_card(
         db, due_early["id"], next_review_at="2000-01-01T00:00:01+00:00"
     )
@@ -457,8 +484,8 @@ def test_report_frontend_has_only_new_actions_and_route_scoped_fab():
     assert "state.report = (await api(`/api/reports/${reportId}`)).report;" in source
     assert "scope: 'report_retry'" in source
     assert "...(count === 'all' ? {expectedAvailableCount:max} : {})" in source
-    assert "当前没有可进入下一轮的句子" in source
-    assert "上一轮还有 <strong>${unanswered}</strong> 句未回答，将优先安排" in source
+    assert "当前没有可进入下一轮的练习卡" in source
+    assert "上一轮还有 <strong>${unanswered}</strong> 题未回答，将优先安排" in source
     assert "未回答题目优先；其余按已到期旧卡、新卡的顺序补充。" in source
     assert (
         "今日自动复习计划已完成，明天可继续自动复习。"
@@ -484,7 +511,7 @@ def test_practice_exit_uses_shared_idempotent_round_submission_and_report_route(
         "const secondaryRoutes", 1
     )[0]
 
-    assert source.count('data-action="exit-practice"') == 2
+    assert source.count('data-action="exit-practice"') == 4
     assert "openExitPracticeDialog()" in source
     assert "提前结束并提交？" in source
     assert "当前还没有完成任何题目" in source

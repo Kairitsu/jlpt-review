@@ -109,14 +109,18 @@ def test_batch_rechunk_only_updates_selected_and_preserves_memory_and_history(tm
         "/api/sentences/rechunk", json={"sentenceIds": [first["id"], second["id"]]}
     )
     assert response.status_code == 200
-    assert response.get_json() == {"ok": True, "updated": 2}
+    response_data = response.get_json()
+    assert response_data["ok"] is True
+    assert response_data["updated"] == 2
+    assert response_data["readingCardCount"] >= 0
+    assert response_data["readingSkipCount"] >= 0
 
     from tokenizer import reconstruct_sentence, validate_practice_data
     for before in (first_before, second_before):
         after = client.get(f'/api/sentences/{before["id"]}').get_json()["sentence"]
         assert after["chunksManuallyEdited"] is False
-        assert after["chunkSource"] in {"ginza", "fallback"}
-        assert after["chunkSchemaVersion"] == 2
+        assert after["chunkSource"] == "kwja_tiny_phrase"
+        assert after["chunkSchemaVersion"] == 3
         assert after["chunks"] != before["chunks"]
         assert after["chinese"] == before["chinese"]
         assert after["japanese"] == before["japanese"]

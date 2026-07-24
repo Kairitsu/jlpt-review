@@ -23,6 +23,7 @@
 .stats-card-head p{margin:3px 0 0;color:var(--muted);font-size:14px}
 .stats-timezone{display:inline-flex;align-items:center;min-height:32px;padding:4px 11px;border-radius:999px;background:var(--mint);color:var(--primary);font-size:12px;font-weight:750;white-space:nowrap}
 .stats-view-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;max-width:500px;margin-bottom:12px;padding:4px;border:1px solid var(--border);border-radius:16px;background:#f6fbfa}
+.stats-card-type-switch{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;max-width:500px;margin:-8px 0 18px;padding:4px;border:1px solid var(--border);border-radius:16px;background:#f6fbfa}
 .stats-view-button{min-height:44px;padding:7px 12px;border:0;border-radius:12px;background:transparent;color:var(--muted);font-size:14px;font-weight:750}
 .stats-view-button.active{background:#fff;color:var(--primary);box-shadow:0 3px 10px rgba(30,91,78,.08)}
 .stats-series-controls{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px}
@@ -169,7 +170,7 @@
 .incomplete-answer-error:empty{display:none}
 .incomplete-answer-modal .btn:disabled{cursor:wait}
 
-/* ---- GiNZA bunsetu slots with immutable punctuation ---- */
+/* ---- KWJA phrase slots with immutable punctuation ---- */
 .preview-structure,.answer-sequence{display:flex;flex-wrap:wrap;align-items:flex-end;column-gap:8px;row-gap:16px;min-width:0}
 .preview-structure{margin:18px 0;padding:18px;border:1px solid var(--border);border-radius:16px;background:#fbfefd;font-size:20px}
 .answer-preview-slot{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:6px 12px;border:0;border-bottom:2px solid #78aa9d;border-radius:8px 8px 2px 2px;background:var(--mint);color:var(--primary);font-weight:750}
@@ -230,4 +231,66 @@ button.answer-preview-slot{border:1px solid #b9d9d5;border-bottom:3px solid #78a
   .unanswered-practice-modal,.incomplete-answer-modal{padding:22px 18px}
   .unanswered-practice-modal .form-actions,.incomplete-answer-modal .form-actions{display:grid;grid-template-columns:1fr 1fr}
   .unanswered-practice-modal .form-actions .btn,.incomplete-answer-modal .form-actions .btn{width:100%;min-height:48px;padding-inline:10px}
+}
+
+/* ---- Independent kanji-reading cards ---- */
+.kanji-home-card{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:18px;margin-top:22px;padding:24px}
+.kanji-home-card h2{margin:3px 0 2px;font-size:24px}.kanji-home-card p{margin:0;color:var(--muted)}
+.practice-type-label{display:inline-flex;align-items:center;min-height:28px;padding:3px 10px;border-radius:999px;background:var(--mint);color:var(--primary);font-size:12px;font-weight:800}
+.kanji-home-metrics{display:flex;align-items:center;justify-content:flex-end;gap:10px;grid-column:1}
+.kanji-home-metrics span{display:inline-flex;align-items:baseline;gap:5px;padding:7px 10px;border:1px solid var(--border);border-radius:12px;background:#f8fcfb;color:var(--muted);font-size:13px}
+.kanji-home-metrics strong{color:var(--ink);font-size:18px;font-variant-numeric:tabular-nums}
+.kanji-home-card>.btn{grid-column:2;grid-row:1/3;min-width:180px}
+.reading-card-manager{margin-top:20px;border:1px solid var(--border);border-radius:16px;background:#fbfefd;overflow:hidden}
+.reading-card-manager summary{min-height:50px;padding:12px 16px;color:var(--primary);font-weight:800;cursor:pointer}
+.reading-card-manager>p{margin:0;padding:0 16px 12px;color:var(--muted);font-size:13px}
+.reading-card-list{border-top:1px solid var(--border)}
+.reading-card-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 16px;border-top:1px solid var(--border)}
+.reading-card-row:first-child{border-top:0}.reading-card-row.disabled{opacity:.55}
+.reading-card-row>div:first-child{min-width:0;display:grid;grid-template-columns:auto 1fr;gap:1px 12px;align-items:center}
+.reading-card-row strong{font-size:18px}.reading-card-row span{color:var(--primary);font-weight:750}
+.reading-card-row small{grid-column:1/-1;color:var(--muted);overflow-wrap:anywhere}
+.empty.compact{padding:22px 14px}
+.reading-edit-dialog input{font-family:var(--font-ja)}
+.reading-question{padding:clamp(24px,4vw,38px);text-align:center}
+.reading-question-hint{margin:0 0 18px;color:var(--muted);font-size:14px}
+.reading-sentence{font-size:clamp(25px,4vw,38px);font-weight:650;line-height:2;overflow-wrap:anywhere}
+.reading-target{text-decoration-line:underline;text-decoration-color:var(--primary);text-decoration-thickness:3px;text-underline-offset:8px;background:linear-gradient(transparent 72%,var(--mint) 72%)}
+.reading-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:22px 0}
+.reading-option{min-width:0;min-height:64px;display:grid;grid-template-columns:42px minmax(0,1fr);align-items:center;gap:12px;border:1px solid #a7c9c0;border-radius:16px;background:#fff;padding:9px 16px;text-align:left;font-size:20px;font-weight:750;transition:background-color .18s ease,border-color .18s ease,box-shadow .18s ease}
+.reading-option:hover:not(:disabled){border-color:var(--primary);box-shadow:0 5px 15px rgba(20,107,90,.09)}
+.reading-option.selected{border-color:var(--primary);background:var(--mint);box-shadow:inset 0 0 0 1px var(--primary)}
+.reading-option.correct{border-color:var(--good);background:var(--good-bg);color:var(--good)}
+.reading-option.wrong{border-color:var(--danger);background:var(--danger-bg);color:var(--danger)}
+.reading-option:disabled{opacity:1;cursor:default}
+.reading-option-letter{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:#edf7f4;color:var(--primary);font-size:14px}
+.reading-option.correct .reading-option-letter{background:#cce8d7;color:var(--good)}
+.reading-option.wrong .reading-option-letter{background:#f3d2ce;color:var(--danger)}
+.reading-note{margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.reading-note p{margin:4px 0 0;white-space:pre-wrap}
+.reading-practice-actions{grid-template-columns:minmax(116px,1fr) minmax(116px,1fr) auto minmax(160px,1.35fr)!important}
+.reading-practice-actions .practice-check{grid-column:4}
+.reading-report-item h3{font-family:var(--font-ja)}
+
+@media(max-width:800px){
+  .kanji-home-card{grid-template-columns:minmax(0,1fr)}
+  .kanji-home-metrics{grid-column:1;justify-content:flex-start;flex-wrap:wrap}
+  .kanji-home-card>.btn{grid-column:1;grid-row:auto;width:100%;min-height:48px}
+  .reading-card-row{align-items:flex-start;flex-direction:column}
+  .reading-card-row .row-actions{width:100%}
+  .reading-card-row .small-btn{flex:1;min-height:48px}
+  .reading-practice-actions{grid-template-columns:1fr 1fr!important}
+  .reading-practice-actions .practice-check{grid-column:1/-1}
+}
+
+@media(max-width:480px){
+  .kanji-home-card{padding:20px}
+  .kanji-home-metrics{display:grid;grid-template-columns:1fr 1fr;width:100%}
+  .kanji-home-metrics span:last-child{grid-column:1/-1}
+  .reading-options{grid-template-columns:minmax(0,1fr);gap:10px}
+  .reading-option{min-height:58px;padding:8px 12px;font-size:18px}
+  .reading-question{padding:22px 16px}
+  .reading-sentence{font-size:25px}
+  .reading-card-row>div:first-child{grid-template-columns:1fr}
+  .reading-card-row small{grid-column:1}
 }

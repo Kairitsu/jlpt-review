@@ -14,7 +14,14 @@ from flask import Flask, jsonify, request, send_from_directory, session
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from auth import authed, clear, configured as auth_configured, fail, keys, lock_remaining
-from db import get_db, init_db, json_load, now_iso, set_setting, setting
+from card_service import (
+    card_dict,
+    card_payload,
+    corpus_readings,
+    ensure_sentence_order_card,
+    reconcile_reading_cards,
+)
+from db import DATA_DIR, get_db, init_db, json_load, now_iso, set_setting, setting
 from fsrs import Rating
 from fsrs_service import (
     DESIRED_RETENTION,
@@ -46,20 +53,28 @@ from memory import (
     parse_iso,
 )
 from security import hash_password, verify_password
+from kwja_analyzer import (
+    KWJAAnalyzerClient,
+    KWJAAnalyzerError,
+    KWJAUnavailableError,
+)
+from reading_cards import generate_reading_cards, validate_reading_payload
 from tokenizer import (
     CHUNK_SCHEMA_VERSION,
     TOKENIZER_NAME,
     analyze_sentence,
-    furigana_segments,
     structure_from_manual_chunks,
     validate_practice_data,
 )
 
 MAX_SENTENCE_NOTE_LENGTH = 1000
 DAILY_AUTO_REVIEW_LIMIT_KEY = "daily_auto_review_limit"
+DAILY_KANJI_REVIEW_LIMIT_KEY = "daily_kanji_reading_review_limit"
 DEFAULT_DAILY_AUTO_REVIEW_LIMIT = 50
+DEFAULT_DAILY_KANJI_REVIEW_LIMIT = 30
 MIN_DAILY_AUTO_REVIEW_LIMIT = 1
 MAX_DAILY_AUTO_REVIEW_LIMIT = 500
+MAINTENANCE_FLAG_PATH = DATA_DIR / "maintenance.flag"
 
 
 def truthy(name: str, default=False):
@@ -101,7 +116,32 @@ def sentence_dict(row):
     data["chunkSchemaVersion"] = int(data.pop("chunk_schema_version", 1) or 1)
     data["chunksManuallyEdited"] = bool(data.pop("chunks_manually_edited", 0))
     data["furigana"] = json_load(data.pop("furigana_json", "[]"), [])
+    data["analysis"] = json_load(data.pop("analysis_json", None), None)
     return data
+
+
+def practice_card_snapshot(card_row, sentence_row, *, option_order=None):
+    sentence = sentence_snapshot(sentence_row)
+    payload = card_payload(card_row)
+    if card_row["card_type"] == "kanji_reading" and option_order is not None:
+        by_id = {
+            option.get("id"): option
+            for option in payload.get("options", [])
+            if isinstance(option, dict)
+        }
+        payload = dict(payload)
+        payload["options"] = [
+            by_id[option_id]
+            for option_id in option_order
+            if option_id in by_id
+        ]
+    return {
+        "type": card_row["card_type"],
+        "cardId": card_row["id"],
+        "cardKey": card_row["card_key"],
+        "payload": payload,
+        "sentence": sentence,
+    }
 
 
 def sentence_snapshot(row):
@@ -270,6 +310,29 @@ def daily_auto_review_limit(db) -> int:
     return value
 
 
+def daily_kanji_review_limit(db) -> int:
+    raw = setting(
+        db,
+        DAILY_KANJI_REVIEW_LIMIT_KEY,
+        str(DEFAULT_DAILY_KANJI_REVIEW_LIMIT),
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_KANJI_REVIEW_LIMIT
+    if not MIN_DAILY_AUTO_REVIEW_LIMIT <= value <= MAX_DAILY_AUTO_REVIEW_LIMIT:
+        return DEFAULT_DAILY_KANJI_REVIEW_LIMIT
+    return value
+
+
+def daily_limit_for_card_type(db, card_type: str) -> int:
+    return (
+        daily_kanji_review_limit(db)
+        if card_type == "kanji_reading"
+        else daily_auto_review_limit(db)
+    )
+
+
 _STATS_TIMELINE_DAYS = (
     (-4, "4天前"),
     (-3, "3天前"),
@@ -367,7 +430,12 @@ def _stats_timeline(events, now_dt: datetime, tz_name: str) -> list[dict]:
     return days
 
 
-def _stats_upcoming_due(db, now_dt: datetime, tz_name: str) -> list[dict]:
+def _stats_upcoming_due(
+    db,
+    now_dt: datetime,
+    tz_name: str,
+    card_type: str = "sentence_order",
+) -> list[dict]:
     """Count cards due in the next three user-calendar days, excluding today."""
     today = local_date(now_dt, tz_name=tz_name)
     days = []
@@ -375,9 +443,11 @@ def _stats_upcoming_due(db, now_dt: datetime, tz_name: str) -> list[dict]:
         day = today + timedelta(days=offset)
         start, end = local_date_utc_bounds(day, tz_name=tz_name)
         count = db.execute(
-            """SELECT COUNT(*) n FROM sentences
-               WHERE next_review_at>=? AND next_review_at<?""",
+            """SELECT COUNT(*) n FROM practice_cards
+               WHERE card_type=? AND active=1
+                 AND next_review_at>=? AND next_review_at<?""",
             (
+                card_type,
                 start.isoformat(timespec="seconds"),
                 end.isoformat(timespec="seconds"),
             ),
@@ -445,7 +515,9 @@ def _memory_mastery_summary(sentences, now_dt: datetime) -> dict:
     }
 
 
-_DUE_STATUS_CONDITION = "s.next_review_at<=?"
+_DUE_STATUS_CONDITION = (
+    "pc.card_type='sentence_order' AND pc.active=1 AND pc.next_review_at<=?"
+)
 _TODAY_STATUS_CONDITION = "re.reviewed_at>=? AND re.reviewed_at<?"
 
 
@@ -466,7 +538,9 @@ def _study_status_counts(db, context: dict[str, str]):
     due = {
         row["collection_id"]: row["n"]
         for row in db.execute(
-            f"""SELECT s.collection_id,COUNT(*) n FROM sentences s
+            f"""SELECT s.collection_id,COUNT(*) n
+                FROM practice_cards pc
+                JOIN sentences s ON s.id=pc.sentence_id
                 WHERE {_DUE_STATUS_CONDITION} GROUP BY s.collection_id""",
             (context["now"],),
         )
@@ -475,8 +549,12 @@ def _study_status_counts(db, context: dict[str, str]):
         row["collection_id"]: row["n"]
         for row in db.execute(
             f"""SELECT s.collection_id,COUNT(DISTINCT re.sentence_id) n
-                FROM review_events re JOIN sentences s ON s.id=re.sentence_id
-                WHERE {_TODAY_STATUS_CONDITION} GROUP BY s.collection_id""",
+                FROM review_events re
+                JOIN practice_cards pc ON pc.id=re.card_id
+                JOIN sentences s ON s.id=re.sentence_id
+                WHERE pc.card_type='sentence_order'
+                  AND {_TODAY_STATUS_CONDITION}
+                GROUP BY s.collection_id""",
             (context["today_start"], context["tomorrow_start"]),
         )
     }
@@ -493,7 +571,9 @@ def _due_sentence_count(
         where += " AND s.collection_id=?"
         params.append(collection_id)
     return int(db.execute(
-        f"SELECT COUNT(*) n FROM sentences s WHERE {where}", params
+        f"""SELECT COUNT(*) n FROM practice_cards pc
+            JOIN sentences s ON s.id=pc.sentence_id WHERE {where}""",
+        params,
     ).fetchone()["n"])
 
 
@@ -510,8 +590,9 @@ def _due_sentence_rows(
         where += " AND s.collection_id=?"
         params.append(collection_id)
     query = (
-        f"SELECT s.* FROM sentences s WHERE {where} "
-        "ORDER BY s.next_review_at ASC,s.created_at ASC,s.id ASC"
+        f"""SELECT s.* FROM practice_cards pc
+            JOIN sentences s ON s.id=pc.sentence_id WHERE {where} """
+        "ORDER BY pc.next_review_at ASC,pc.created_at ASC,pc.id ASC"
     )
     if limit is not None:
         query += " LIMIT ?"
@@ -519,14 +600,22 @@ def _due_sentence_rows(
     return db.execute(query, params).fetchall()
 
 
-def _completed_today_count(db, now_dt: datetime, tz_name: str) -> int:
-    """Count distinct sentences with a formal review event in the user's day."""
+def _completed_today_count(
+    db,
+    now_dt: datetime,
+    tz_name: str,
+    card_type: str = "sentence_order",
+) -> int:
+    """Count distinct cards of one type reviewed in the user's natural day."""
     today_start, tomorrow_start = local_day_utc_bounds(now_dt, tz_name=tz_name)
     return int(db.execute(
-        """SELECT COUNT(DISTINCT sentence_id) n
-           FROM review_events
-           WHERE reviewed_at>=? AND reviewed_at<?""",
+        """SELECT COUNT(DISTINCT re.card_id) n
+           FROM review_events re
+           JOIN practice_cards pc ON pc.id=re.card_id
+           WHERE pc.card_type=?
+             AND re.reviewed_at>=? AND re.reviewed_at<?""",
         (
+            card_type,
             today_start.isoformat(timespec="seconds"),
             tomorrow_start.isoformat(timespec="seconds"),
         ),
@@ -537,19 +626,22 @@ def _auto_review_candidate_query(
     now_dt: datetime,
     tz_name: str,
     collection_id: int | None = None,
+    card_type: str = "sentence_order",
 ) -> tuple[str, list]:
     """Build the shared automatic-queue predicate and parameters."""
     today_start, tomorrow_start = local_day_utc_bounds(now_dt, tz_name=tz_name)
-    where = """(
-        s.last_review_at IS NULL
-        OR (s.last_review_at IS NOT NULL AND s.next_review_at<=?)
+    where = """pc.card_type=? AND pc.active=1
+      AND (
+        pc.last_review_at IS NULL
+        OR (pc.last_review_at IS NOT NULL AND pc.next_review_at<=?)
       )
       AND NOT EXISTS(
         SELECT 1 FROM review_events re
-        WHERE re.sentence_id=s.id
+        WHERE re.card_id=pc.id
           AND re.reviewed_at>=? AND re.reviewed_at<?
       )"""
     params = [
+        card_type,
         now_dt.astimezone(timezone.utc).isoformat(timespec="seconds"),
         today_start.isoformat(timespec="seconds"),
         tomorrow_start.isoformat(timespec="seconds"),
@@ -566,10 +658,15 @@ def _auto_review_candidate_count(
     now_dt: datetime,
     tz_name: str,
     collection_id: int | None = None,
+    card_type: str = "sentence_order",
 ) -> int:
-    where, params = _auto_review_candidate_query(now_dt, tz_name, collection_id)
+    where, params = _auto_review_candidate_query(
+        now_dt, tz_name, collection_id, card_type
+    )
     return int(db.execute(
-        f"SELECT COUNT(*) n FROM sentences s WHERE {where}", params
+        f"""SELECT COUNT(*) n FROM practice_cards pc
+            JOIN sentences s ON s.id=pc.sentence_id WHERE {where}""",
+        params,
     ).fetchone()["n"])
 
 
@@ -579,6 +676,7 @@ def _auto_review_candidate_rows(
     now_dt: datetime,
     tz_name: str,
     collection_id: int | None,
+    card_type: str = "sentence_order",
 ):
     """Return the canonical automatic queue without applying a daily/count cap.
 
@@ -586,9 +684,15 @@ def _auto_review_candidate_rows(
     cards follow in creation order. Merely reading this queue never schedules
     a card or writes a review event.
     """
-    where, params = _auto_review_candidate_query(now_dt, tz_name, collection_id)
+    where, params = _auto_review_candidate_query(
+        now_dt, tz_name, collection_id, card_type
+    )
     candidates = db.execute(
-        f"SELECT s.* FROM sentences s WHERE {where}", params
+        f"""SELECT pc.*,s.collection_id,s.id sentence_id
+            FROM practice_cards pc
+            JOIN sentences s ON s.id=pc.sentence_id
+            WHERE {where}""",
+        params,
     ).fetchall()
     reviewed = [row for row in candidates if row["last_review_at"] is not None]
     new = [row for row in candidates if row["last_review_at"] is None]
@@ -637,6 +741,7 @@ def _auto_review_sentence_rows(
     remaining_quota: int,
     requested_count,
     subject: str = "当前可自动复习",
+    card_type: str = "sentence_order",
 ):
     """Build and cap the home automatic queue without changing FSRS state.
 
@@ -648,6 +753,7 @@ def _auto_review_sentence_rows(
         now_dt=now_dt,
         tz_name=tz_name,
         collection_id=collection_id,
+        card_type=card_type,
     )
     available = min(len(ordered), max(0, int(remaining_quota)))
     limit, notice = _resolve_auto_review_count(requested_count, available, subject)
@@ -660,15 +766,21 @@ def _report_item_rows(db, session_id: int):
     """Return persisted report rows, including explicitly unanswered items."""
     return db.execute(
         """SELECT
-             pi.session_id,pi.sentence_id,pi.position,pi.finalized_at,pi.unanswered_at,
+             pi.session_id,pi.card_id,pi.sentence_id,pi.position,
+             pi.finalized_at,pi.unanswered_at,
              pi.final_status,pi.fsrs_rating,pi.easy_selected,
+             pc.card_type,pc.card_key,
+             CASE WHEN pi.unanswered_at IS NOT NULL
+                  THEN pi.draft_answer_json ELSE a.answer_json END answer_json,
              CASE WHEN pi.unanswered_at IS NOT NULL
                   THEN pi.draft_answer_order_json ELSE a.answer_order_json END answer_order_json,
+             COALESCE(a.card_snapshot_json,pi.card_snapshot_json) card_snapshot_json,
              COALESCE(a.sentence_snapshot_json,pi.sentence_snapshot_json) sentence_snapshot_json
            FROM practice_items pi
+           JOIN practice_cards pc ON pc.id=pi.card_id
            LEFT JOIN attempts a ON a.id=(
              SELECT a2.id FROM attempts a2
-             WHERE a2.session_id=pi.session_id AND a2.sentence_id=pi.sentence_id
+             WHERE a2.session_id=pi.session_id AND a2.card_id=pi.card_id
              ORDER BY a2.id DESC LIMIT 1
            )
            WHERE pi.session_id=?
@@ -685,6 +797,7 @@ def _report_retry_sentence_rows(
     *,
     now_dt: datetime,
     tz_name: str,
+    card_type: str = "sentence_order",
 ):
     """Build the next-round queue from unanswered items and the auto queue.
 
@@ -693,11 +806,14 @@ def _report_retry_sentence_rows(
     the same due-old-then-new queue used by the home automatic review flow.
     """
     unanswered_rows = db.execute(
-        """SELECT s.* FROM practice_items pi
+        """SELECT pc.*,s.collection_id,s.id sentence_id
+           FROM practice_items pi
+           JOIN practice_cards pc ON pc.id=pi.card_id
            JOIN sentences s ON s.id=pi.sentence_id
            WHERE pi.session_id=? AND pi.unanswered_at IS NOT NULL
+             AND pc.active=1 AND pc.card_type=?
            ORDER BY pi.position""",
-        (session_id,),
+        (session_id, card_type),
     ).fetchall()
     unanswered = []
     seen = set()
@@ -712,6 +828,7 @@ def _report_retry_sentence_rows(
         now_dt=now_dt,
         tz_name=tz_name,
         collection_id=collection_id,
+        card_type=card_type,
     ) if collection_id is not None else []
     ordered = [*unanswered]
     for row in automatic:
@@ -732,7 +849,9 @@ def _study_status_rows(db, collection_id: int, status: str, context: dict[str, s
             JOIN (
               SELECT re.sentence_id,MAX(re.reviewed_at) today_last_review_at
               FROM review_events re
-              WHERE {_TODAY_STATUS_CONDITION}
+              JOIN practice_cards pc ON pc.id=re.card_id
+              WHERE pc.card_type='sentence_order'
+                AND {_TODAY_STATUS_CONDITION}
               GROUP BY re.sentence_id
             ) today_events ON today_events.sentence_id=s.id
             WHERE s.collection_id=?
@@ -758,7 +877,7 @@ def _server_utc_offset_label() -> str:
 
 
 def _prior_consecutive_first_correct_count(
-    db, session_id: int, sentence_id: int
+    db, session_id: int, card_id: int
 ) -> int:
     """Count consecutive first-check successes before the current session.
 
@@ -774,8 +893,8 @@ def _prior_consecutive_first_correct_count(
            JOIN practice_sessions previous_session ON previous_session.id=re.session_id
            JOIN practice_sessions current_session ON current_session.id=?
            JOIN practice_items pi
-             ON pi.session_id=re.session_id AND pi.sentence_id=re.sentence_id
-           WHERE re.sentence_id=?
+             ON pi.session_id=re.session_id AND pi.card_id=re.card_id
+           WHERE re.card_id=?
              AND re.session_id<>?
              AND pi.finalized_at IS NOT NULL
              AND (
@@ -786,7 +905,7 @@ def _prior_consecutive_first_correct_count(
                )
              )
            ORDER BY previous_session.created_at DESC,previous_session.id DESC,re.id DESC""",
-        (session_id, sentence_id, session_id),
+        (session_id, card_id, session_id),
     ).fetchall()
     count = 0
     for row in rows:
@@ -798,11 +917,11 @@ def _prior_consecutive_first_correct_count(
     return count
 
 
-def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing: bool):
+def _finalize_question(db, session_id: int, card_id: int, *, enable_fuzzing: bool):
     """Finalize exactly one practice item inside the caller's transaction."""
     item = db.execute(
-        "SELECT * FROM practice_items WHERE session_id=? AND sentence_id=?",
-        (session_id, sentence_id),
+        "SELECT * FROM practice_items WHERE session_id=? AND card_id=?",
+        (session_id, card_id),
     ).fetchone()
     if not item:
         return None, "练习或句子不存在"
@@ -826,15 +945,15 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing:
 
     attempts = db.execute(
         """SELECT * FROM attempts
-           WHERE session_id=? AND sentence_id=?
+           WHERE session_id=? AND card_id=?
            ORDER BY attempt_number,id""",
-        (session_id, sentence_id),
+        (session_id, card_id),
     ).fetchall()
     if not attempts:
         return None, "当前题还没有作答记录"
     facts = attempt_facts(attempts)
     prior_consecutive = (
-        _prior_consecutive_first_correct_count(db, session_id, sentence_id)
+        _prior_consecutive_first_correct_count(db, session_id, card_id)
         if facts.first_attempt_correct is True
         else 0
     )
@@ -850,14 +969,16 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing:
         db.execute(
             """UPDATE practice_items
                SET finalized_at=?,final_status='skipped',fsrs_rating=NULL,easy_selected=0
-               WHERE session_id=? AND sentence_id=? AND finalized_at IS NULL""",
-            (stamp, session_id, sentence_id),
+               WHERE session_id=? AND card_id=? AND finalized_at IS NULL""",
+            (stamp, session_id, card_id),
         )
         return {"finalized": True, "status": "skipped", "rating": None, "ratingLabel": None}, None
 
-    row = db.execute("SELECT * FROM sentences WHERE id=?", (sentence_id,)).fetchone()
+    row = db.execute(
+        "SELECT * FROM practice_cards WHERE id=? AND active=1", (card_id,)
+    ).fetchone()
     if not row:
-        return None, "句子不存在"
+        return None, "练习卡不存在"
     duration_ms = sum(max(0, int(attempt["duration_ms"] or 0)) for attempt in attempts)
     outcome = fsrs_review(
         row,
@@ -867,26 +988,46 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing:
     )
     after = outcome.after
     db.execute(
-        """UPDATE sentences SET fsrs_state=?,fsrs_step=?,stability=?,difficulty=?,
+        """UPDATE practice_cards SET fsrs_state=?,fsrs_step=?,stability=?,difficulty=?,
            last_review_at=?,next_review_at=?,fsrs_version=?,updated_at=? WHERE id=?""",
         (
             after["fsrs_state"], after["fsrs_step"], after["stability"], after["difficulty"],
             after["last_review_at"], after["next_review_at"], after["fsrs_version"], stamp,
-            sentence_id,
+            card_id,
         ),
     )
+    if row["card_type"] == "sentence_order":
+        # Legacy sentence scheduling columns remain a rollback/read-compatibility
+        # mirror only.  Reading cards never write them.
+        db.execute(
+            """UPDATE sentences
+               SET fsrs_state=?,fsrs_step=?,stability=?,difficulty=?,
+                   last_review_at=?,next_review_at=?,fsrs_version=?,updated_at=?
+               WHERE id=?""",
+            (
+                after["fsrs_state"],
+                after["fsrs_step"],
+                after["stability"],
+                after["difficulty"],
+                after["last_review_at"],
+                after["next_review_at"],
+                after["fsrs_version"],
+                stamp,
+                row["sentence_id"],
+            ),
+        )
     before = outcome.before
     db.execute(
         """INSERT INTO review_events(
-             sentence_id,session_id,rating,attempt_count,first_attempt_correct,
+             card_id,sentence_id,session_id,rating,attempt_count,first_attempt_correct,
              second_attempt_correct,final_attempt_correct,rating_policy_version,
              reviewed_at,duration_ms,is_new,
              fsrs_state_before,fsrs_state_after,fsrs_step_before,fsrs_step_after,
              stability_before,stability_after,difficulty_before,difficulty_after,
              next_review_before,next_review_after,fsrs_version,created_at
-           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            sentence_id, session_id, int(rating), facts.attempt_count,
+            card_id, row["sentence_id"], session_id, int(rating), facts.attempt_count,
             int(facts.first_attempt_correct),
             None if facts.second_attempt_correct is None else int(facts.second_attempt_correct),
             int(facts.final_attempt_correct), RATING_POLICY_VERSION,
@@ -899,8 +1040,8 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing:
     )
     db.execute(
         """UPDATE practice_items SET finalized_at=?,final_status=?,fsrs_rating=?,easy_selected=?
-           WHERE session_id=? AND sentence_id=? AND finalized_at IS NULL""",
-        (stamp, final_status, int(rating), 0, session_id, sentence_id),
+           WHERE session_id=? AND card_id=? AND finalized_at IS NULL""",
+        (stamp, final_status, int(rating), 0, session_id, card_id),
     )
     return {
         "finalized": True,
@@ -912,37 +1053,51 @@ def _finalize_question(db, session_id: int, sentence_id: int, *, enable_fuzzing:
 
 
 def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
-    """Validate and persist temporary arrangements supplied at round submission."""
+    """Validate and persist temporary answers supplied at round submission."""
     if drafts is None:
         return None
     if not isinstance(drafts, list):
-        return "临时排列格式无效"
+        return "临时答案格式无效"
 
     rows = db.execute(
-        """SELECT pi.sentence_id,pi.sentence_snapshot_json,s.chunks_json,s.chinese,s.note,
+        """SELECT pi.card_id,pi.sentence_id,pi.card_snapshot_json,
+                  pi.sentence_snapshot_json,pc.card_type,pc.card_key,pc.payload_json,
+                  s.chunks_json,s.chinese,s.note,
                   s.japanese,s.correct_order_json,s.practice_structure_json,
                   s.chunk_source,s.chunk_schema_version,s.chunks_manually_edited,
                   s.furigana_json,s.collection_id
            FROM practice_items pi
+           JOIN practice_cards pc ON pc.id=pi.card_id
            LEFT JOIN sentences s ON s.id=pi.sentence_id
            WHERE pi.session_id=?""",
         (session_id,),
     ).fetchall()
-    by_id = {row["sentence_id"]: row for row in rows}
+    by_card_id = {row["card_id"]: row for row in rows}
+    by_sentence_id = {
+        row["sentence_id"]: row
+        for row in rows
+        if row["card_type"] == "sentence_order"
+    }
     updates = []
     seen = set()
     for draft in drafts:
         if not isinstance(draft, dict):
-            return "临时排列格式无效"
+            return "临时答案格式无效"
         try:
-            sentence_id = int(draft.get("sentenceId"))
+            card_id = int(draft.get("cardId") or 0)
         except (TypeError, ValueError):
-            return "临时排列格式无效"
-        answer = draft.get("answerOrder")
-        if sentence_id in seen or sentence_id not in by_id or not isinstance(answer, list):
-            return "临时排列格式无效"
-        seen.add(sentence_id)
-        row = by_id[sentence_id]
+            card_id = 0
+        if not card_id:
+            try:
+                row = by_sentence_id[int(draft.get("sentenceId"))]
+                card_id = row["card_id"]
+            except (TypeError, ValueError, KeyError):
+                return "临时答案格式无效"
+        if card_id in seen or card_id not in by_card_id:
+            return "临时答案格式无效"
+        seen.add(card_id)
+        row = by_card_id[card_id]
+        sentence_id = row["sentence_id"]
         snapshot = snapshot_dict(row["sentence_snapshot_json"])
         if not snapshot and row["chunks_json"] is not None:
             snapshot = {
@@ -959,20 +1114,72 @@ def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
                 "furigana": json_load(row["furigana_json"], []),
                 "collectionId": row["collection_id"],
             }
-        valid_ids = {
-            chunk.get("id") for chunk in snapshot.get("chunks", [])
-            if isinstance(chunk, dict) and isinstance(chunk.get("id"), str)
-        }
-        if any(not isinstance(value, str) or value not in valid_ids for value in answer):
-            return "临时排列包含无效词块"
-        if len(answer) > len(valid_ids) or len(set(answer)) != len(answer):
-            return "临时排列包含无效词块"
-        updates.append((json.dumps(answer), json.dumps(snapshot, ensure_ascii=False), session_id, sentence_id))
+        card_snapshot = json_load(row["card_snapshot_json"], {})
+        if not isinstance(card_snapshot, dict) or not card_snapshot:
+            card_snapshot = {
+                "type": row["card_type"],
+                "cardId": card_id,
+                "cardKey": row["card_key"],
+                "payload": json_load(row["payload_json"], {}),
+                "sentence": snapshot,
+            }
+
+        if row["card_type"] == "sentence_order":
+            answer_order = draft.get("answerOrder")
+            if not isinstance(answer_order, list):
+                answer_data = draft.get("answer")
+                answer_order = (
+                    answer_data.get("orderedChunkIds")
+                    if isinstance(answer_data, dict)
+                    else None
+                )
+            if not isinstance(answer_order, list):
+                return "临时排列格式无效"
+            valid_ids = {
+                chunk.get("id") for chunk in snapshot.get("chunks", [])
+                if isinstance(chunk, dict) and isinstance(chunk.get("id"), str)
+            }
+            if any(
+                not isinstance(value, str) or value not in valid_ids
+                for value in answer_order
+            ):
+                return "临时排列包含无效词块"
+            if len(answer_order) > len(valid_ids) or len(set(answer_order)) != len(answer_order):
+                return "临时排列包含无效词块"
+            answer = {"type": "sentence_order", "orderedChunkIds": answer_order}
+        else:
+            answer_data = draft.get("answer")
+            selected = (
+                answer_data.get("selectedOptionId")
+                if isinstance(answer_data, dict)
+                else draft.get("selectedOptionId")
+            )
+            option_ids = {
+                option.get("id")
+                for option in (card_snapshot.get("payload", {}).get("options") or [])
+                if isinstance(option, dict)
+            }
+            if selected is not None and selected not in option_ids:
+                return "临时读音答案包含无效选项"
+            answer = {"type": "kanji_reading", "selectedOptionId": selected}
+            answer_order = []
+        updates.append(
+            (
+                json.dumps(answer, ensure_ascii=False),
+                json.dumps(answer_order, ensure_ascii=False),
+                json.dumps(card_snapshot, ensure_ascii=False),
+                json.dumps(snapshot, ensure_ascii=False),
+                session_id,
+                card_id,
+            )
+        )
 
     db.executemany(
         """UPDATE practice_items
-           SET draft_answer_order_json=?,sentence_snapshot_json=COALESCE(sentence_snapshot_json,?)
-           WHERE session_id=? AND sentence_id=?""",
+           SET draft_answer_json=?,draft_answer_order_json=?,
+               card_snapshot_json=COALESCE(card_snapshot_json,?),
+               sentence_snapshot_json=COALESCE(sentence_snapshot_json,?)
+           WHERE session_id=? AND card_id=?""",
         updates,
     )
     return None
@@ -981,13 +1188,13 @@ def _persist_session_drafts(db, session_id: int, drafts) -> str | None:
 def _session_unanswered_rows(db, session_id: int):
     """Determine unanswered items from persisted valid check attempts only."""
     return db.execute(
-        """SELECT pi.sentence_id,pi.position FROM practice_items pi
+        """SELECT pi.card_id,pi.sentence_id,pi.position FROM practice_items pi
            WHERE pi.session_id=?
              AND pi.finalized_at IS NULL
              AND pi.unanswered_at IS NULL
              AND NOT EXISTS(
                SELECT 1 FROM attempts a
-               WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id
+               WHERE a.session_id=pi.session_id AND a.card_id=pi.card_id
                  AND a.status IN ('correct','wrong')
              )
            ORDER BY pi.position""",
@@ -1004,7 +1211,7 @@ def _session_completed_item_count(db, session_id: int) -> int:
                pi.finalized_at IS NOT NULL
                OR EXISTS(
                  SELECT 1 FROM attempts a
-                 WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id
+                 WHERE a.session_id=pi.session_id AND a.card_id=pi.card_id
                    AND a.status IN ('correct','wrong')
                )
              )""",
@@ -1058,6 +1265,14 @@ def create_app(test_config=None):
             or request.path.startswith("/api/fonts/files/")
         ):
             return None
+        if (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            and MAINTENANCE_FLAG_PATH.exists()
+        ):
+            return jsonify(
+                error="系统正在执行可恢复的数据迁移，暂时停止写入",
+                maintenance=True,
+            ), 503
         with get_db() as db:
             if not auth_configured(db) or authed():
                 return None
@@ -1121,7 +1336,26 @@ def create_app(test_config=None):
 
     @app.get("/api/health")
     def health():
-        return jsonify(ok=True, time=int(time.time()), tokenizer=TOKENIZER_NAME)
+        return jsonify(
+            ok=True,
+            time=int(time.time()),
+            tokenizer=TOKENIZER_NAME,
+            maintenance=MAINTENANCE_FLAG_PATH.exists(),
+        )
+
+    @app.get("/api/analyzer/health")
+    def analyzer_health():
+        try:
+            return jsonify(KWJAAnalyzerClient().health())
+        except KWJAUnavailableError as exc:
+            return jsonify(ok=False, error=str(exc)), 503
+
+    @app.post("/api/analyzer/warmup")
+    def analyzer_warmup():
+        try:
+            return jsonify(KWJAAnalyzerClient().warmup())
+        except KWJAAnalyzerError as exc:
+            return jsonify(ok=False, error=str(exc)), 503
 
     @app.get("/api/auth/status")
     def auth_status():
@@ -1165,10 +1399,22 @@ def create_app(test_config=None):
             daily_limit = daily_auto_review_limit(db)
             completed_today = _completed_today_count(db, now_dt, tz)
             remaining_quota = max(0, daily_limit - completed_today)
+            kanji_daily_limit = daily_kanji_review_limit(db)
+            kanji_completed_today = _completed_today_count(
+                db, now_dt, tz, "kanji_reading"
+            )
+            kanji_remaining_quota = max(
+                0, kanji_daily_limit - kanji_completed_today
+            )
             collections = [dict(row) for row in db.execute("""
               SELECT c.id,c.name,COUNT(s.id) total,
-                SUM(CASE WHEN s.last_review_at IS NOT NULL THEN 1 ELSE 0 END) learned
-              FROM collections c LEFT JOIN sentences s ON s.collection_id=c.id
+                SUM(CASE WHEN pc.last_review_at IS NOT NULL THEN 1 ELSE 0 END) learned
+              FROM collections c
+              LEFT JOIN sentences s ON s.collection_id=c.id
+              LEFT JOIN practice_cards pc
+                ON pc.sentence_id=s.id
+               AND pc.card_type='sentence_order'
+               AND pc.active=1
               GROUP BY c.id ORDER BY c.created_at
             """)]
             due_counts, today_counts = _study_status_counts(db, context)
@@ -1180,9 +1426,32 @@ def create_app(test_config=None):
                     db, now_dt=now_dt, tz_name=tz, collection_id=item["id"]
                 )
                 item["availableAutoReviewCount"] = min(candidate_count, remaining_quota)
+                kanji_candidate_count = _auto_review_candidate_count(
+                    db,
+                    now_dt=now_dt,
+                    tz_name=tz,
+                    collection_id=item["id"],
+                    card_type="kanji_reading",
+                )
+                item["availableKanjiReviewCount"] = min(
+                    kanji_candidate_count, kanji_remaining_quota
+                )
+                item["kanjiCardCount"] = db.execute(
+                    """SELECT COUNT(*) n FROM practice_cards pc
+                       JOIN sentences s ON s.id=pc.sentence_id
+                       WHERE pc.card_type='kanji_reading' AND pc.active=1
+                         AND s.collection_id=?""",
+                    (item["id"],),
+                ).fetchone()["n"]
             due_total = sum(item["due"] for item in collections)
             candidate_total = _auto_review_candidate_count(
                 db, now_dt=now_dt, tz_name=tz
+            )
+            kanji_candidate_total = _auto_review_candidate_count(
+                db,
+                now_dt=now_dt,
+                tz_name=tz,
+                card_type="kanji_reading",
             )
         return jsonify(
             collections=collections,
@@ -1191,6 +1460,14 @@ def create_app(test_config=None):
             completedToday=completed_today,
             remainingAutoReviewQuota=remaining_quota,
             availableAutoReviewCount=min(candidate_total, remaining_quota),
+            kanjiReading={
+                "dailyLimit": kanji_daily_limit,
+                "completedToday": kanji_completed_today,
+                "remainingQuota": kanji_remaining_quota,
+                "availableReviewCount": min(
+                    kanji_candidate_total, kanji_remaining_quota
+                ),
+            },
         )
 
     @app.get("/api/collections/<int:collection_id>/study-status/<status>")
@@ -1263,7 +1540,19 @@ def create_app(test_config=None):
         japanese, chinese = body["japanese"], body["chinese"].strip()
         if not japanese.strip() or not chinese:
             return jsonify(error="中文翻译和日语原句都不能为空"), 400
-        analysis = analyze_sentence(japanese)
+        try:
+            analysis = analyze_sentence(japanese)
+            with get_db() as db:
+                readings = corpus_readings(db)
+            reading_cards, reading_skips = generate_reading_cards(
+                japanese,
+                analysis["analysis"],
+                corpus_readings=readings,
+            )
+        except KWJAUnavailableError as exc:
+            return jsonify(error=str(exc), analyzerUnavailable=True), 503
+        except (KWJAAnalyzerError, ValueError) as exc:
+            return jsonify(error=str(exc)), 422
         return jsonify(
             chunks=analysis["chunks"],
             correctOrder=analysis["correctOrder"],
@@ -1271,6 +1560,10 @@ def create_app(test_config=None):
             source=analysis["source"],
             schemaVersion=analysis["schemaVersion"],
             sentenceFurigana=analysis["furigana"],
+            analysis=analysis["analysis"],
+            readingCards=reading_cards,
+            readingCardCount=len(reading_cards),
+            readingSkips=reading_skips,
         )
 
     def validate_sentence_payload(body):
@@ -1311,19 +1604,62 @@ def create_app(test_config=None):
         if order != ids:
             return None, "正确词块顺序必须与原句中的词块顺序一致"
         source = "manual" if legacy_payload else body.get("chunkSource")
-        if source not in {"ginza", "fallback", "manual", "manual_migrated"}:
-            source = "manual" if body.get("chunksManuallyEdited") is True else "ginza"
+        if source not in {"kwja_tiny_phrase", "manual", "manual_migrated"}:
+            source = (
+                "manual"
+                if body.get("chunksManuallyEdited") is True
+                else "kwja_tiny_phrase"
+            )
         manually_edited = legacy_payload or body.get("chunksManuallyEdited") is True or source.startswith("manual")
         try:
             collection_id = int(body.get("collectionId"))
         except (ValueError, TypeError):
             return None, "请选择所属句集"
+        reading_overrides = body.get("readingCards", [])
+        disabled_keys = body.get("disabledReadingCardKeys", [])
+        if not isinstance(reading_overrides, list) or not isinstance(disabled_keys, list):
+            return None, "读音题设置格式无效"
+        if any(not isinstance(value, str) for value in disabled_keys):
+            return None, "读音题禁用列表格式无效"
         return {
             "collection_id": collection_id, "chinese": chinese, "note": note,
             "japanese": japanese,
             "chunks": chunks, "order": order, "structure": structure,
             "source": source, "manually_edited": manually_edited,
+            "reading_overrides": reading_overrides,
+            "disabled_reading_keys": set(disabled_keys),
         }, ""
+
+    def apply_reading_preferences(item, generated):
+        generated_by_key = {card["cardKey"]: card for card in generated}
+        for override in item["reading_overrides"]:
+            if not isinstance(override, dict):
+                raise ValueError("读音题设置格式无效")
+            key = override.get("cardKey")
+            payload = override.get("payload")
+            original = generated_by_key.get(key)
+            if not isinstance(payload, dict):
+                raise ValueError("读音题数据格式无效")
+            if not original:
+                raise ValueError("读音题目标已变化，请重新执行 KWJA 分析")
+            if payload.get("target") != original["payload"].get("target"):
+                raise ValueError("读音题目标位置不能手动改变")
+            valid, message = validate_reading_payload(item["japanese"], payload)
+            if not valid:
+                raise ValueError(message)
+            original["payload"] = payload
+        return generated
+
+    def disable_requested_reading_cards(db, sentence_id, keys, stamp):
+        if not keys:
+            return
+        placeholders = ",".join("?" for _ in keys)
+        db.execute(
+            f"""UPDATE practice_cards SET active=0,updated_at=?
+                WHERE sentence_id=? AND card_type='kanji_reading'
+                  AND active=1 AND card_key IN ({placeholders})""",
+            [stamp, sentence_id, *sorted(keys)],
+        )
 
     @app.post("/api/sentences")
     def create_sentence():
@@ -1332,27 +1668,64 @@ def create_app(test_config=None):
             return jsonify(error=error), 400
         stamp = now_iso()
         try:
-            furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
+            analysis = analyze_sentence(item["japanese"])
+            with get_db() as read_db:
+                readings = corpus_readings(read_db)
+            reading_cards, reading_skips = generate_reading_cards(
+                item["japanese"],
+                analysis["analysis"],
+                corpus_readings=readings,
+            )
+            reading_cards = apply_reading_preferences(item, reading_cards)
+            furigana_json = json.dumps(analysis["furigana"], ensure_ascii=False)
             with get_db() as db:
+                db.execute("BEGIN IMMEDIATE")
                 card = card_fields(new_card(0, datetime.now(timezone.utc)))
                 cursor = db.execute("""INSERT INTO sentences(
                     collection_id,chinese,note,japanese,chunks_json,correct_order_json,
                     practice_structure_json,chunk_source,chunk_schema_version,
-                    chunks_manually_edited,furigana_json,
+                    chunks_manually_edited,furigana_json,analysis_json,
+                    analysis_input_sha256,analysis_version,analysis_updated_at,
                     fsrs_state,fsrs_step,stability,difficulty,last_review_at,next_review_at,
                     fsrs_version,created_at,updated_at
-                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     item["collection_id"], item["chinese"], item["note"], item["japanese"],
                     json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]),
                     json.dumps(item["structure"], ensure_ascii=False), item["source"],
                     CHUNK_SCHEMA_VERSION, int(item["manually_edited"]),
-                    furigana_json, card["fsrs_state"], card["fsrs_step"], card["stability"],
+                    furigana_json,
+                    json.dumps(analysis["analysis"], ensure_ascii=False),
+                    analysis["analysis"]["inputSha256"],
+                    analysis["analysis"]["analyzerVersion"],
+                    stamp,
+                    card["fsrs_state"], card["fsrs_step"], card["stability"],
                     card["difficulty"], card["last_review_at"], card["next_review_at"],
                     FSRS_VERSION, stamp, stamp,
                 ))
-                row = db.execute("SELECT * FROM sentences WHERE id=?", (cursor.lastrowid,)).fetchone()
+                sentence_id = cursor.lastrowid
+                ensure_sentence_order_card(db, sentence_id, stamp)
+                card_stats = reconcile_reading_cards(
+                    db, sentence_id, reading_cards, stamp=stamp
+                )
+                disable_requested_reading_cards(
+                    db,
+                    sentence_id,
+                    item["disabled_reading_keys"],
+                    stamp,
+                )
+                row = db.execute(
+                    "SELECT * FROM sentences WHERE id=?", (sentence_id,)
+                ).fetchone()
             rebuild_fonts()
-            return jsonify(sentence=sentence_dict(row)), 201
+            return jsonify(
+                sentence=sentence_dict(row),
+                readingCardCount=card_stats["created"] + card_stats["preserved"],
+                readingSkips=reading_skips,
+            ), 201
+        except KWJAUnavailableError as exc:
+            return jsonify(error=str(exc), analyzerUnavailable=True), 503
+        except (KWJAAnalyzerError, ValueError) as exc:
+            return jsonify(error=str(exc)), 422
         except sqlite3.IntegrityError:
             return jsonify(error="所属句集不存在"), 400
 
@@ -1379,29 +1752,215 @@ def create_app(test_config=None):
             row = db.execute("SELECT s.*,c.name collection_name FROM sentences s JOIN collections c ON c.id=s.collection_id WHERE s.id=?", (sentence_id,)).fetchone()
         return jsonify(sentence=sentence_dict(row)) if row else (jsonify(error="句子不存在"), 404)
 
+    @app.get("/api/sentences/<int:sentence_id>/cards")
+    def sentence_cards(sentence_id):
+        with get_db() as db:
+            sentence = db.execute(
+                "SELECT * FROM sentences WHERE id=?", (sentence_id,)
+            ).fetchone()
+            if not sentence:
+                return jsonify(error="句子不存在"), 404
+            rows = db.execute(
+                """SELECT * FROM practice_cards
+                   WHERE sentence_id=? ORDER BY card_type,id""",
+                (sentence_id,),
+            ).fetchall()
+        item = sentence_dict(sentence)
+        return jsonify(
+            cards=[card_dict(row, item) for row in rows],
+            activeReadingCount=sum(
+                1
+                for row in rows
+                if row["card_type"] == "kanji_reading" and row["active"]
+            ),
+        )
+
+    @app.patch("/api/practice/cards/<int:card_id>")
+    def update_practice_card(card_id):
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify(error="请求内容必须是 JSON 对象"), 400
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            card = db.execute(
+                """SELECT pc.*,s.japanese FROM practice_cards pc
+                   JOIN sentences s ON s.id=pc.sentence_id
+                   WHERE pc.id=?""",
+                (card_id,),
+            ).fetchone()
+            if not card or card["card_type"] != "kanji_reading":
+                return jsonify(error="汉字读音卡不存在"), 404
+            stamp = now_iso()
+            if "active" in body:
+                active = body["active"]
+                if type(active) is not bool:
+                    return jsonify(error="active 必须是布尔值"), 400
+                try:
+                    db.execute(
+                        """UPDATE practice_cards SET active=?,updated_at=?
+                           WHERE id=?""",
+                        (int(active), stamp, card_id),
+                    )
+                except sqlite3.IntegrityError:
+                    return jsonify(error="同一目标已有启用中的读音卡"), 409
+            if "payload" in body:
+                payload = body["payload"]
+                valid, message = validate_reading_payload(
+                    card["japanese"], payload
+                )
+                if not valid:
+                    return jsonify(error=message), 400
+                old_payload = card_payload(card)
+                if (
+                    old_payload.get("target") != payload.get("target")
+                    or old_payload.get("correctReading")
+                    != payload.get("correctReading")
+                ):
+                    db.execute(
+                        """UPDATE practice_cards SET active=0,updated_at=?
+                           WHERE id=?""",
+                        (stamp, card_id),
+                    )
+                    fresh = card_fields(
+                        new_card(0, datetime.now(timezone.utc))
+                    )
+                    cursor = db.execute(
+                        """INSERT INTO practice_cards(
+                             sentence_id,card_type,card_key,payload_json,active,
+                             fsrs_state,fsrs_step,stability,difficulty,
+                             last_review_at,next_review_at,fsrs_version,
+                             created_at,updated_at
+                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            card["sentence_id"],
+                            "kanji_reading",
+                            card["card_key"],
+                            json.dumps(payload, ensure_ascii=False),
+                            1,
+                            fresh["fsrs_state"],
+                            fresh["fsrs_step"],
+                            fresh["stability"],
+                            fresh["difficulty"],
+                            fresh["last_review_at"],
+                            fresh["next_review_at"],
+                            fresh["fsrs_version"],
+                            stamp,
+                            stamp,
+                        ),
+                    )
+                    card_id = cursor.lastrowid
+                else:
+                    db.execute(
+                        """UPDATE practice_cards SET payload_json=?,updated_at=?
+                           WHERE id=?""",
+                        (
+                            json.dumps(payload, ensure_ascii=False),
+                            stamp,
+                            card_id,
+                        ),
+                    )
+            updated = db.execute(
+                "SELECT * FROM practice_cards WHERE id=?", (card_id,)
+            ).fetchone()
+        return jsonify(ok=True, card=dict(updated) if updated else None)
+
+    @app.post("/api/sentences/<int:sentence_id>/reading-cards/regenerate")
+    def regenerate_reading_cards(sentence_id):
+        with get_db() as read_db:
+            row = read_db.execute(
+                "SELECT japanese FROM sentences WHERE id=?", (sentence_id,)
+            ).fetchone()
+            if not row:
+                return jsonify(error="句子不存在"), 404
+            corpus = corpus_readings(read_db, exclude_sentence_id=sentence_id)
+        try:
+            analysis = analyze_sentence(row["japanese"])
+            generated, skips = generate_reading_cards(
+                row["japanese"],
+                analysis["analysis"],
+                corpus_readings=corpus,
+            )
+        except KWJAUnavailableError as exc:
+            return jsonify(error=str(exc), analyzerUnavailable=True), 503
+        except (KWJAAnalyzerError, ValueError) as exc:
+            return jsonify(error=str(exc)), 422
+        stamp = now_iso()
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            stats = reconcile_reading_cards(
+                db, sentence_id, generated, stamp=stamp
+            )
+        return jsonify(
+            ok=True,
+            activeCount=stats["created"] + stats["preserved"],
+            stats=stats,
+            skips=skips,
+        )
+
     @app.put("/api/sentences/<int:sentence_id>")
     def update_sentence(sentence_id):
         item, error = validate_sentence_payload(request.get_json(silent=True) or {})
         if error:
             return jsonify(error=error), 400
-        furigana_json = json.dumps(furigana_segments(item["japanese"]), ensure_ascii=False)
+        try:
+            analysis = analyze_sentence(item["japanese"])
+            with get_db() as read_db:
+                readings = corpus_readings(
+                    read_db, exclude_sentence_id=sentence_id
+                )
+            reading_cards, reading_skips = generate_reading_cards(
+                item["japanese"],
+                analysis["analysis"],
+                corpus_readings=readings,
+            )
+            reading_cards = apply_reading_preferences(item, reading_cards)
+        except KWJAUnavailableError as exc:
+            return jsonify(error=str(exc), analyzerUnavailable=True), 503
+        except (KWJAAnalyzerError, ValueError) as exc:
+            return jsonify(error=str(exc)), 422
+        furigana_json = json.dumps(analysis["furigana"], ensure_ascii=False)
+        stamp = now_iso()
         with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
             changed = db.execute(
                 """UPDATE sentences SET collection_id=?,chinese=?,note=?,japanese=?,
                    chunks_json=?,correct_order_json=?,practice_structure_json=?,
                    chunk_source=?,chunk_schema_version=?,chunks_manually_edited=?,
-                   furigana_json=?,updated_at=? WHERE id=?""",
+                   furigana_json=?,analysis_json=?,analysis_input_sha256=?,
+                   analysis_version=?,analysis_updated_at=?,updated_at=? WHERE id=?""",
                 (
                     item["collection_id"], item["chinese"], item["note"], item["japanese"],
                     json.dumps(item["chunks"], ensure_ascii=False), json.dumps(item["order"]),
                     json.dumps(item["structure"], ensure_ascii=False), item["source"],
                     CHUNK_SCHEMA_VERSION, int(item["manually_edited"]), furigana_json,
-                    now_iso(), sentence_id,
+                    json.dumps(analysis["analysis"], ensure_ascii=False),
+                    analysis["analysis"]["inputSha256"],
+                    analysis["analysis"]["analyzerVersion"],
+                    stamp, stamp, sentence_id,
                 ),
             ).rowcount
+            if changed:
+                ensure_sentence_order_card(db, sentence_id, stamp)
+                card_stats = reconcile_reading_cards(
+                    db, sentence_id, reading_cards, stamp=stamp
+                )
+                disable_requested_reading_cards(
+                    db,
+                    sentence_id,
+                    item["disabled_reading_keys"],
+                    stamp,
+                )
         if changed:
             rebuild_fonts()
-        return jsonify(ok=True) if changed else (jsonify(error="句子不存在"), 404)
+        return (
+            jsonify(
+                ok=True,
+                readingCardCount=card_stats["created"] + card_stats["preserved"],
+                readingSkips=reading_skips,
+            )
+            if changed
+            else (jsonify(error="句子不存在"), 404)
+        )
 
     @app.post("/api/sentences/batch-note")
     def batch_note_sentences():
@@ -1514,6 +2073,8 @@ def create_app(test_config=None):
             return jsonify(error=f"句子不存在：{missing_text}；整批未作修改"), 404
 
         prepared = []
+        with get_db() as corpus_db:
+            shared_corpus = corpus_readings(corpus_db)
         for sentence_id in sentence_ids:
             japanese = rows_by_id[sentence_id]["japanese"]
             try:
@@ -1527,10 +2088,15 @@ def create_app(test_config=None):
                 source = analysis["source"]
                 schema_version = analysis["schemaVersion"]
                 furigana = analysis["furigana"]
-                if source not in {"ginza", "fallback"}:
+                if source != "kwja_tiny_phrase":
                     raise ValueError("自动分块来源无效")
                 if type(schema_version) is not int or schema_version <= 0:
                     raise ValueError("分块结构版本无效")
+                reading_cards, reading_skips = generate_reading_cards(
+                    japanese,
+                    analysis["analysis"],
+                    corpus_readings=shared_corpus,
+                )
                 prepared.append((
                     json.dumps(chunks, ensure_ascii=False),
                     json.dumps(order, ensure_ascii=False),
@@ -1538,9 +2104,19 @@ def create_app(test_config=None):
                     source,
                     schema_version,
                     json.dumps(furigana, ensure_ascii=False),
+                    json.dumps(analysis["analysis"], ensure_ascii=False),
+                    analysis["analysis"]["inputSha256"],
+                    analysis["analysis"]["analyzerVersion"],
+                    reading_cards,
+                    reading_skips,
                     sentence_id,
                     japanese,
                 ))
+            except KWJAUnavailableError as exc:
+                return jsonify(
+                    error=f"KWJA 解析服务暂时不可用；整批未作修改：{exc}",
+                    analyzerUnavailable=True,
+                ), 503
             except Exception as exc:
                 return jsonify(
                     error=f"句子 {sentence_id} 重新分块失败：{exc}；整批未作修改"
@@ -1550,30 +2126,48 @@ def create_app(test_config=None):
         db = get_db()
         try:
             with db:
+                generated_total = 0
+                skipped_total = 0
                 for (
                     chunks_json, order_json, structure_json, source,
-                    schema_version, furigana_json, sentence_id, japanese,
+                    schema_version, furigana_json, analysis_json,
+                    analysis_sha, analysis_version, reading_cards, reading_skips,
+                    sentence_id, japanese,
                 ) in prepared:
                     changed = db.execute(
                         """UPDATE sentences SET
                            chunks_json=?,correct_order_json=?,practice_structure_json=?,
                            chunk_source=?,chunk_schema_version=?,chunks_manually_edited=0,
-                           furigana_json=?,updated_at=?
+                           furigana_json=?,analysis_json=?,analysis_input_sha256=?,
+                           analysis_version=?,analysis_updated_at=?,updated_at=?
                            WHERE id=? AND japanese=?""",
                         (
                             chunks_json, order_json, structure_json, source,
-                            schema_version, furigana_json, stamp, sentence_id, japanese,
+                            schema_version, furigana_json, analysis_json,
+                            analysis_sha, analysis_version, stamp, stamp,
+                            sentence_id, japanese,
                         ),
                     ).rowcount
                     if changed != 1:
                         raise RuntimeError(f"句子 {sentence_id} 在处理期间发生变化")
+                    ensure_sentence_order_card(db, sentence_id, stamp)
+                    card_stats = reconcile_reading_cards(
+                        db, sentence_id, reading_cards, stamp=stamp
+                    )
+                    generated_total += card_stats["created"] + card_stats["preserved"]
+                    skipped_total += len(reading_skips)
         except Exception as exc:
             return jsonify(error=f"批量重新分块失败：{exc}；整批已回滚"), 409
         finally:
             db.close()
 
         rebuild_fonts()
-        return jsonify(ok=True, updated=len(prepared))
+        return jsonify(
+            ok=True,
+            updated=len(prepared),
+            readingCardCount=generated_total,
+            readingSkipCount=skipped_total,
+        )
 
     @app.delete("/api/sentences/<int:sentence_id>")
     def delete_sentence(sentence_id):
@@ -1592,17 +2186,50 @@ def create_app(test_config=None):
         if raw_body is not None and not isinstance(raw_body, dict):
             return jsonify(error="请求内容必须是 JSON 对象"), 400
         body = raw_body or {}
-        ids = body.get("sentenceIds")
+        card_type = body.get("cardType", "sentence_order")
+        if card_type not in {"sentence_order", "kanji_reading"}:
+            return jsonify(error="练习题型无效"), 400
+        sentence_ids = body.get("sentenceIds")
+        requested_card_ids = body.get("cardIds")
         notice = ""
         with get_db() as db:
-            if isinstance(ids, list) and ids:
+            if isinstance(requested_card_ids, list) and requested_card_ids:
                 try:
-                    clean = [int(value) for value in ids]
+                    clean = list(dict.fromkeys(int(value) for value in requested_card_ids))
                 except (ValueError, TypeError):
                     return jsonify(error="参数无效"), 400
                 placeholders = ",".join("?" for _ in clean)
-                rows = db.execute(f"SELECT id FROM sentences WHERE id IN ({placeholders})", clean).fetchall()
-                selected = [row["id"] for row in rows]
+                rows = db.execute(
+                    f"""SELECT id FROM practice_cards
+                        WHERE id IN ({placeholders})
+                          AND card_type=? AND active=1""",
+                    [*clean, card_type],
+                ).fetchall()
+                found = {row["id"] for row in rows}
+                selected = [card_id for card_id in clean if card_id in found]
+                source = "selected"
+            elif isinstance(sentence_ids, list) and sentence_ids:
+                try:
+                    clean = list(dict.fromkeys(int(value) for value in sentence_ids))
+                except (ValueError, TypeError):
+                    return jsonify(error="参数无效"), 400
+                placeholders = ",".join("?" for _ in clean)
+                rows = db.execute(
+                    f"""SELECT pc.id,pc.sentence_id
+                        FROM practice_cards pc
+                        WHERE pc.sentence_id IN ({placeholders})
+                          AND pc.card_type=? AND pc.active=1
+                        ORDER BY pc.sentence_id,pc.id""",
+                    [*clean, card_type],
+                ).fetchall()
+                by_sentence: dict[int, list[int]] = {}
+                for row in rows:
+                    by_sentence.setdefault(row["sentence_id"], []).append(row["id"])
+                selected = [
+                    card_id
+                    for sentence_id in clean
+                    for card_id in by_sentence.get(sentence_id, [])
+                ]
                 source = "selected"
             elif body.get("scope") == "report_retry":
                 try:
@@ -1611,18 +2238,21 @@ def create_app(test_config=None):
                     return jsonify(error="报告参数无效"), 400
                 db.execute("BEGIN IMMEDIATE")
                 report_row = db.execute(
-                    """SELECT id FROM practice_sessions
+                    """SELECT id,card_type FROM practice_sessions
                        WHERE id=? AND completed_at IS NOT NULL AND report_deleted_at IS NULL""",
                     (report_id,),
                 ).fetchone()
                 if not report_row:
                     return jsonify(error="报告不存在"), 404
+                card_type = report_row["card_type"] or "sentence_order"
                 report_items = _report_item_rows(db, report_id)
                 collection = _report_collection(db, report_items)
                 now_dt = datetime.now(timezone.utc)
                 tz = user_timezone(db)
-                daily_limit = daily_auto_review_limit(db)
-                completed_today = _completed_today_count(db, now_dt, tz)
+                daily_limit = daily_limit_for_card_type(db, card_type)
+                completed_today = _completed_today_count(
+                    db, now_dt, tz, card_type
+                )
                 remaining_quota = max(0, daily_limit - completed_today)
                 if remaining_quota == 0:
                     return jsonify(
@@ -1639,6 +2269,7 @@ def create_app(test_config=None):
                     collection["id"] if collection else None,
                     now_dt=now_dt,
                     tz_name=tz,
+                    card_type=card_type,
                 )
                 candidate_count = len(candidates)
                 if not candidate_count:
@@ -1671,14 +2302,30 @@ def create_app(test_config=None):
                 source = "report_retry"
             elif body.get("scope") == "collection" and body.get("collectionId"):
                 collection_id = int(body["collectionId"])
-                available = db.execute("SELECT COUNT(*) n FROM sentences WHERE collection_id=?", (collection_id,)).fetchone()["n"]
+                available = db.execute(
+                    """SELECT COUNT(*) n FROM practice_cards pc
+                       JOIN sentences s ON s.id=pc.sentence_id
+                       WHERE pc.card_type=? AND pc.active=1
+                         AND s.collection_id=?""",
+                    (card_type, collection_id),
+                ).fetchone()["n"]
                 if not available:
-                    return jsonify(error="当前句集还没有句子"), 400
+                    return jsonify(error="当前句集还没有该题型的练习卡"), 400
                 limit, msg = _resolve_limit(body.get("count"), available, "当前句集")
                 if limit is None:
                     return jsonify(error=msg), 400
                 notice = msg
-                selected = [row["id"] for row in db.execute("SELECT id FROM sentences WHERE collection_id=? ORDER BY RANDOM() LIMIT ?", (collection_id, limit))]
+                selected = [
+                    row["id"]
+                    for row in db.execute(
+                        """SELECT pc.id FROM practice_cards pc
+                           JOIN sentences s ON s.id=pc.sentence_id
+                           WHERE pc.card_type=? AND pc.active=1
+                             AND s.collection_id=?
+                           ORDER BY RANDOM() LIMIT ?""",
+                        (card_type, collection_id, limit),
+                    )
+                ]
                 source = "collection"
             else:
                 collection_id = None
@@ -1690,8 +2337,10 @@ def create_app(test_config=None):
                 db.execute("BEGIN IMMEDIATE")
                 now_dt = datetime.now(timezone.utc)
                 tz = user_timezone(db)
-                daily_limit = daily_auto_review_limit(db)
-                completed_today = _completed_today_count(db, now_dt, tz)
+                daily_limit = daily_limit_for_card_type(db, card_type)
+                completed_today = _completed_today_count(
+                    db, now_dt, tz, card_type
+                )
                 remaining_quota = max(0, daily_limit - completed_today)
                 if remaining_quota == 0:
                     return jsonify(
@@ -1715,6 +2364,7 @@ def create_app(test_config=None):
                         remaining_quota=remaining_quota,
                         requested_count=body.get("count"),
                         subject=subject,
+                        card_type=card_type,
                     )
                 except ValueError as exc:
                     return jsonify(error=str(exc)), 400
@@ -1723,32 +2373,115 @@ def create_app(test_config=None):
                 selected = [row["id"] for row in rows]
                 source = "due"
             if not selected:
-                return jsonify(error="当前没有待复习句子"), 400
-            cursor = db.execute("INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at) VALUES(?,?,?,?)", (source, json.dumps(selected), len(selected), now_iso()))
+                return jsonify(error="当前没有待复习练习卡"), 400
+
+            placeholders = ",".join("?" for _ in selected)
+            card_rows = db.execute(
+                f"""SELECT pc.*,s.id joined_sentence_id
+                    FROM practice_cards pc
+                    JOIN sentences s ON s.id=pc.sentence_id
+                    WHERE pc.id IN ({placeholders})""",
+                selected,
+            ).fetchall()
+            cards_by_id = {row["id"]: row for row in card_rows}
+            selected = [card_id for card_id in selected if card_id in cards_by_id]
+            selected_sentence_ids = [
+                cards_by_id[card_id]["sentence_id"] for card_id in selected
+            ]
+            cursor = db.execute(
+                """INSERT INTO practice_sessions(
+                     source,sentence_ids_json,card_ids_json,card_type,total,created_at
+                   ) VALUES(?,?,?,?,?,?)""",
+                (
+                    source,
+                    json.dumps(selected_sentence_ids),
+                    json.dumps(selected),
+                    card_type,
+                    len(selected),
+                    now_iso(),
+                ),
+            )
             session_id = cursor.lastrowid
-            rows = db.execute(f"SELECT * FROM sentences WHERE id IN ({','.join('?' for _ in selected)})", selected).fetchall()
+            unique_sentence_ids = list(dict.fromkeys(selected_sentence_ids))
+            rows = db.execute(
+                f"""SELECT * FROM sentences
+                    WHERE id IN ({','.join('?' for _ in unique_sentence_ids)})""",
+                unique_sentence_ids,
+            ).fetchall()
             rows_by_id = {row["id"]: row for row in rows}
+            response_cards = []
+            response_sentences = []
+            item_rows = []
+            randomizer = secrets.SystemRandom()
+            for position, card_id in enumerate(selected):
+                card_row = cards_by_id[card_id]
+                sentence_row = rows_by_id[card_row["sentence_id"]]
+                option_order = None
+                if card_type == "kanji_reading":
+                    option_ids = [
+                        option.get("id")
+                        for option in card_payload(card_row).get("options", [])
+                        if isinstance(option, dict)
+                    ]
+                    option_order = randomizer.sample(option_ids, len(option_ids))
+                card_snapshot = practice_card_snapshot(
+                    card_row, sentence_row, option_order=option_order
+                )
+                sentence_snapshot_value = sentence_snapshot(sentence_row)
+                item_rows.append(
+                    (
+                        session_id,
+                        card_id,
+                        card_row["sentence_id"],
+                        position,
+                        json.dumps(card_snapshot, ensure_ascii=False),
+                        json.dumps(sentence_snapshot_value, ensure_ascii=False),
+                    )
+                )
+                sentence_item = sentence_dict(sentence_row)
+                sentence_item["cardId"] = card_id
+                response_sentences.append(sentence_item)
+                response_cards.append(
+                    {
+                        "cardId": card_id,
+                        "sentenceId": card_row["sentence_id"],
+                        "cardType": card_type,
+                        "cardKey": card_row["card_key"],
+                        "payload": card_snapshot["payload"],
+                        "sentence": sentence_item,
+                    }
+                )
             db.executemany(
                 """INSERT INTO practice_items(
-                     session_id,sentence_id,position,sentence_snapshot_json
-                   ) VALUES(?,?,?,?)""",
-                [
-                    (
-                        session_id, sentence_id, position,
-                        json.dumps(sentence_snapshot(rows_by_id[sentence_id]), ensure_ascii=False),
-                    )
-                    for position, sentence_id in enumerate(selected)
-                ],
+                     session_id,card_id,sentence_id,position,
+                     card_snapshot_json,sentence_snapshot_json
+                   ) VALUES(?,?,?,?,?,?)""",
+                item_rows,
             )
-            mapped = {row["id"]: sentence_dict(row) for row in rows}
-        return jsonify(sessionId=session_id, sentences=[mapped[x] for x in selected], notice=notice), 201
+        return jsonify(
+            sessionId=session_id,
+            cardType=card_type,
+            cards=response_cards,
+            sentences=response_sentences,
+            notice=notice,
+        ), 201
 
     @app.post("/api/practice/sessions/<int:session_id>/attempts")
     def record_attempt(session_id):
         body = request.get_json(silent=True) or {}
+        raw_card_id = body.get("cardId")
+        raw_sentence_id = body.get("sentenceId")
         try:
-            sentence_id = int(body.get("sentenceId", 0))
+            card_id = int(raw_card_id or 0)
         except (ValueError, TypeError):
+            return jsonify(error="参数无效"), 400
+        try:
+            requested_sentence_id = int(raw_sentence_id or 0)
+        except (ValueError, TypeError):
+            return jsonify(error="参数无效"), 400
+        if (raw_card_id is not None and card_id <= 0) or (
+            raw_sentence_id is not None and requested_sentence_id <= 0
+        ):
             return jsonify(error="参数无效"), 400
         action = str(body.get("action", "check"))
         if action not in {"check", "skip"}:
@@ -1761,9 +2494,6 @@ def create_app(test_config=None):
         ):
             return jsonify(error="缺少有效的 attemptId"), 400
         client_attempt_id = client_attempt_id.strip()
-        answer = body.get("answerOrder")
-        if not isinstance(answer, list):
-            answer = []
         try:
             duration_ms = max(0, int(body.get("durationMs") or 0))
         except (TypeError, ValueError):
@@ -1778,10 +2508,16 @@ def create_app(test_config=None):
             if duplicate:
                 if (
                     duplicate["session_id"] != session_id
-                    or duplicate["sentence_id"] != sentence_id
+                    or (card_id and duplicate["card_id"] != card_id)
+                    or (
+                        not card_id
+                        and requested_sentence_id
+                        and duplicate["sentence_id"] != requested_sentence_id
+                    )
                 ):
                     return jsonify(error="attemptId 已用于其他核对请求"), 409
                 snapshot = snapshot_dict(duplicate["sentence_snapshot_json"])
+                card_snapshot = json_load(duplicate["card_snapshot_json"], {})
                 status = duplicate["status"]
                 return jsonify(
                     attemptId=duplicate["id"],
@@ -1789,40 +2525,117 @@ def create_app(test_config=None):
                     attemptNumber=duplicate["attempt_number"],
                     status=status,
                     correctOrder=snapshot.get("correctOrder", []),
+                    correctReading=card_snapshot.get("payload", {}).get(
+                        "correctReading"
+                    ),
                     correct=status == "correct",
                     duplicate=True,
                 )
             practice = db.execute("SELECT * FROM practice_sessions WHERE id=?", (session_id,)).fetchone()
-            row = db.execute("SELECT * FROM sentences WHERE id=?", (sentence_id,)).fetchone()
-            item_row = db.execute(
-                """SELECT finalized_at,unanswered_at,sentence_snapshot_json
-                   FROM practice_items
-                   WHERE session_id=? AND sentence_id=?""",
-                (session_id, sentence_id),
+            if not practice:
+                return jsonify(error="练习不存在"), 404
+            if not card_id:
+                try:
+                    sentence_id = requested_sentence_id
+                except (ValueError, TypeError):
+                    return jsonify(error="参数无效"), 400
+                legacy_item = db.execute(
+                    """SELECT card_id FROM practice_items
+                       WHERE session_id=? AND sentence_id=?
+                         AND card_id IN(
+                           SELECT id FROM practice_cards
+                           WHERE card_type='sentence_order'
+                         )""",
+                    (session_id, sentence_id),
+                ).fetchone()
+                card_id = legacy_item["card_id"] if legacy_item else 0
+            card = db.execute(
+                "SELECT * FROM practice_cards WHERE id=?", (card_id,)
             ).fetchone()
-            if not practice or not row or not item_row:
-                return jsonify(error="练习或句子不存在"), 404
+            item_row = db.execute(
+                """SELECT finalized_at,unanswered_at,sentence_snapshot_json,
+                          card_snapshot_json,sentence_id
+                   FROM practice_items
+                   WHERE session_id=? AND card_id=?""",
+                (session_id, card_id),
+            ).fetchone()
+            if not card or not item_row:
+                return jsonify(error="练习或练习卡不存在"), 404
             if practice["completed_at"]:
                 return jsonify(error="本轮练习已经提交"), 409
             if item_row["finalized_at"] or item_row["unanswered_at"]:
                 return jsonify(error="当前题已经结束"), 409
             snapshot = snapshot_dict(item_row["sentence_snapshot_json"])
-            item = snapshot if snapshot.get("chunks") and snapshot.get("correctOrder") else sentence_snapshot(row)
-            status = "skipped" if action == "skip" else ("correct" if answers_match(answer, item["correctOrder"], item["chunks"]) else "wrong")
+            card_snapshot_value = json_load(item_row["card_snapshot_json"], {})
+            if not isinstance(card_snapshot_value, dict):
+                card_snapshot_value = {}
+            card_type = card_snapshot_value.get("type") or card["card_type"]
+            payload = card_snapshot_value.get("payload") or card_payload(card)
+            if card_type == "sentence_order":
+                answer_order = body.get("answerOrder")
+                answer_data = body.get("answer")
+                if not isinstance(answer_order, list) and isinstance(answer_data, dict):
+                    answer_order = answer_data.get("orderedChunkIds")
+                if not isinstance(answer_order, list):
+                    answer_order = []
+                answer = {
+                    "type": "sentence_order",
+                    "orderedChunkIds": answer_order,
+                }
+                is_correct = answers_match(
+                    answer_order,
+                    snapshot.get("correctOrder", []),
+                    snapshot.get("chunks", []),
+                )
+            else:
+                answer_data = body.get("answer")
+                selected_option_id = (
+                    answer_data.get("selectedOptionId")
+                    if isinstance(answer_data, dict)
+                    else body.get("selectedOptionId")
+                )
+                valid_option_ids = {
+                    option.get("id")
+                    for option in payload.get("options", [])
+                    if isinstance(option, dict)
+                }
+                if action == "check" and selected_option_id not in valid_option_ids:
+                    return jsonify(error="请选择有效的读音选项"), 400
+                answer_order = []
+                answer = {
+                    "type": "kanji_reading",
+                    "selectedOptionId": selected_option_id,
+                }
+                is_correct = selected_option_id == payload.get("correctOptionId")
+            status = (
+                "skipped"
+                if action == "skip"
+                else ("correct" if is_correct else "wrong")
+            )
             attempt_number = db.execute(
                 """SELECT COALESCE(MAX(attempt_number),0)+1 next_number
-                   FROM attempts WHERE session_id=? AND sentence_id=?""",
-                (session_id, sentence_id),
+                   FROM attempts WHERE session_id=? AND card_id=?""",
+                (session_id, card_id),
             ).fetchone()["next_number"]
             cursor = db.execute(
                 """INSERT INTO attempts(
-                     session_id,sentence_id,client_attempt_id,attempt_number,status,
-                     answer_order_json,sentence_snapshot_json,duration_ms,created_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                     session_id,card_id,sentence_id,client_attempt_id,
+                     attempt_number,status,answer_json,answer_order_json,
+                     card_snapshot_json,sentence_snapshot_json,duration_ms,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    session_id, sentence_id, client_attempt_id, attempt_number,
-                    status, json.dumps(answer),
-                    json.dumps(item, ensure_ascii=False), duration_ms, stamp,
+                    session_id,
+                    card_id,
+                    item_row["sentence_id"],
+                    client_attempt_id,
+                    attempt_number,
+                    status,
+                    json.dumps(answer, ensure_ascii=False),
+                    json.dumps(answer_order, ensure_ascii=False),
+                    json.dumps(card_snapshot_value, ensure_ascii=False),
+                    json.dumps(snapshot, ensure_ascii=False),
+                    duration_ms,
+                    stamp,
                 ),
             )
         return jsonify(
@@ -1830,17 +2643,42 @@ def create_app(test_config=None):
             clientAttemptId=client_attempt_id,
             attemptNumber=attempt_number,
             status=status,
-            correctOrder=item["correctOrder"],
+            cardType=card_type,
+            correctOrder=snapshot.get("correctOrder", []),
+            correctReading=payload.get("correctReading"),
+            correctOptionId=payload.get("correctOptionId"),
             correct=status == "correct",
         )
 
-    @app.post("/api/practice/sessions/<int:session_id>/sentences/<int:sentence_id>/complete")
-    def complete_question(session_id, sentence_id):
-        body = request.get_json(silent=True) or {}
+    @app.post("/api/practice/sessions/<int:session_id>/cards/<int:card_id>/complete")
+    def complete_card_question(session_id, card_id):
         with get_db() as db:
             db.execute("BEGIN IMMEDIATE")
             result, error = _finalize_question(
-                db, session_id, sentence_id,
+                db,
+                session_id,
+                card_id,
+                enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]),
+            )
+            if error:
+                return jsonify(error=error), 404 if "不存在" in error else 409
+        return jsonify(result)
+
+    @app.post("/api/practice/sessions/<int:session_id>/sentences/<int:sentence_id>/complete")
+    def complete_question(session_id, sentence_id):
+        with get_db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            item = db.execute(
+                """SELECT pi.card_id FROM practice_items pi
+                   JOIN practice_cards pc ON pc.id=pi.card_id
+                   WHERE pi.session_id=? AND pi.sentence_id=?
+                     AND pc.card_type='sentence_order'""",
+                (session_id, sentence_id),
+            ).fetchone()
+            if not item:
+                return jsonify(error="练习或句子不存在"), 404
+            result, error = _finalize_question(
+                db, session_id, item["card_id"],
                 enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]),
             )
             if error:
@@ -1890,19 +2728,19 @@ def create_app(test_config=None):
                     requiresConfirmation=True,
                 ), 409
             pending = db.execute(
-                """SELECT pi.sentence_id FROM practice_items pi
+                """SELECT pi.card_id FROM practice_items pi
                    WHERE pi.session_id=? AND pi.finalized_at IS NULL
                      AND pi.unanswered_at IS NULL
                      AND EXISTS(
                        SELECT 1 FROM attempts a
-                       WHERE a.session_id=pi.session_id AND a.sentence_id=pi.sentence_id
+                       WHERE a.session_id=pi.session_id AND a.card_id=pi.card_id
                          AND a.status IN ('correct','wrong')
                      )""",
                 (session_id,),
             ).fetchall()
             for pending_item in pending:
                 _, error = _finalize_question(
-                    db, session_id, pending_item["sentence_id"],
+                    db, session_id, pending_item["card_id"],
                     enable_fuzzing=bool(app.config["FSRS_ENABLE_FUZZING"]),
                 )
                 if error:
@@ -1911,10 +2749,10 @@ def create_app(test_config=None):
             if unanswered_rows:
                 db.executemany(
                     """UPDATE practice_items SET unanswered_at=?
-                       WHERE session_id=? AND sentence_id=?
+                       WHERE session_id=? AND card_id=?
                          AND finalized_at IS NULL AND unanswered_at IS NULL""",
                     [
-                        (stamp, session_id, row["sentence_id"])
+                        (stamp, session_id, row["card_id"])
                         for row in unanswered_rows
                     ],
                 )
@@ -1976,8 +2814,11 @@ def create_app(test_config=None):
             collection = _report_collection(db, items_rows)
             now_dt = datetime.now(timezone.utc)
             tz = user_timezone(db)
-            daily_limit = daily_auto_review_limit(db)
-            completed_today = _completed_today_count(db, now_dt, tz)
+            card_type = practice["card_type"] or "sentence_order"
+            daily_limit = daily_limit_for_card_type(db, card_type)
+            completed_today = _completed_today_count(
+                db, now_dt, tz, card_type
+            )
             remaining_quota = max(0, daily_limit - completed_today)
             retry_rows, retry_unanswered = _report_retry_sentence_rows(
                 db,
@@ -1985,23 +2826,69 @@ def create_app(test_config=None):
                 collection["id"] if collection else None,
                 now_dt=now_dt,
                 tz_name=tz,
+                card_type=card_type,
             )
             retry_candidate_count = len(retry_rows)
             retry_available_count = min(retry_candidate_count, remaining_quota)
         items = []
         for attempt in items_rows:
             snap = snapshot_dict(attempt["sentence_snapshot_json"])
-            by_id = {chunk["id"]: chunk for chunk in snap.get("chunks", [])}
-            answer = json_load(attempt["answer_order_json"], [])
+            card_snapshot_value = json_load(attempt["card_snapshot_json"], {})
+            item_type = (
+                card_snapshot_value.get("type")
+                if isinstance(card_snapshot_value, dict)
+                else None
+            ) or attempt["card_type"] or "sentence_order"
+            answer_data = json_load(attempt["answer_json"], {})
+            if not isinstance(answer_data, dict):
+                answer_data = {}
             rating = Rating(attempt["fsrs_rating"]) if attempt["fsrs_rating"] else None
             status = "unanswered" if attempt["unanswered_at"] else attempt["final_status"]
-            items.append({
-                "status": status, "answerOrder": answer,
-                "answerText": "".join(by_id.get(value, {}).get("text", "") for value in answer),
-                "rating": RATING_NAMES.get(rating), "ratingLabel": RATING_LABELS_ZH.get(rating), **snap,
-            })
+            if item_type == "kanji_reading":
+                card_payload_value = (
+                    card_snapshot_value.get("payload", {})
+                    if isinstance(card_snapshot_value, dict)
+                    else {}
+                )
+                options = card_payload_value.get("options") or []
+                option_by_id = {
+                    option.get("id"): option.get("reading")
+                    for option in options
+                    if isinstance(option, dict)
+                }
+                selected_option_id = answer_data.get("selectedOptionId")
+                items.append(
+                    {
+                        "cardType": item_type,
+                        "cardId": attempt["card_id"],
+                        "status": status,
+                        "target": card_payload_value.get("target"),
+                        "options": options,
+                        "selectedOptionId": selected_option_id,
+                        "selectedReading": option_by_id.get(selected_option_id),
+                        "correctReading": card_payload_value.get("correctReading"),
+                        "rating": RATING_NAMES.get(rating),
+                        "ratingLabel": RATING_LABELS_ZH.get(rating),
+                        **snap,
+                    }
+                )
+            else:
+                by_id = {
+                    chunk["id"]: chunk for chunk in snap.get("chunks", [])
+                }
+                answer = answer_data.get("orderedChunkIds")
+                if not isinstance(answer, list):
+                    answer = json_load(attempt["answer_order_json"], [])
+                items.append({
+                    "cardType": "sentence_order",
+                    "cardId": attempt["card_id"],
+                    "status": status, "answerOrder": answer,
+                    "answerText": "".join(by_id.get(value, {}).get("text", "") for value in answer),
+                    "rating": RATING_NAMES.get(rating), "ratingLabel": RATING_LABELS_ZH.get(rating), **snap,
+                })
         payload = dict(practice)
         payload["ratingCounts"] = _rating_counts(items_rows)
+        payload["cardType"] = practice["card_type"] or "sentence_order"
         payload.update(_session_completion_metadata(practice))
         payload["collection"] = collection
         payload["retry"] = {
@@ -2068,7 +2955,11 @@ def create_app(test_config=None):
     def get_daily_plan_settings():
         with get_db() as db:
             value = daily_auto_review_limit(db)
-        return jsonify(dailyAutoReviewLimit=value)
+            kanji_value = daily_kanji_review_limit(db)
+        return jsonify(
+            dailyAutoReviewLimit=value,
+            dailyKanjiReadingReviewLimit=kanji_value,
+        )
 
     @app.put("/api/settings/daily-plan")
     def save_daily_plan_settings():
@@ -2087,9 +2978,34 @@ def create_app(test_config=None):
                     f"{MAX_DAILY_AUTO_REVIEW_LIMIT} 之间的整数"
                 )
             ), 400
+        kanji_value = body.get(
+            "dailyKanjiReadingReviewLimit",
+            None,
+        )
+        if kanji_value is None:
+            with get_db() as db:
+                kanji_value = daily_kanji_review_limit(db)
+        if (
+            type(kanji_value) is not int
+            or not MIN_DAILY_AUTO_REVIEW_LIMIT
+            <= kanji_value
+            <= MAX_DAILY_AUTO_REVIEW_LIMIT
+        ):
+            return jsonify(
+                error=(
+                    "每日汉字读音自动复习上限必须是 "
+                    f"{MIN_DAILY_AUTO_REVIEW_LIMIT} 到 "
+                    f"{MAX_DAILY_AUTO_REVIEW_LIMIT} 之间的整数"
+                )
+            ), 400
         with get_db() as db:
             set_setting(db, DAILY_AUTO_REVIEW_LIMIT_KEY, str(value))
-        return jsonify(ok=True, dailyAutoReviewLimit=value)
+            set_setting(db, DAILY_KANJI_REVIEW_LIMIT_KEY, str(kanji_value))
+        return jsonify(
+            ok=True,
+            dailyAutoReviewLimit=value,
+            dailyKanjiReadingReviewLimit=kanji_value,
+        )
 
     @app.get("/api/settings/timezone")
     def get_timezone_settings():
@@ -2123,13 +3039,43 @@ def create_app(test_config=None):
                 today + timedelta(days=1), tz_name=tz
             )[0].isoformat(timespec="seconds")
             events = [dict(row) for row in db.execute(
-                """SELECT rating,reviewed_at,duration_ms,is_new FROM review_events
-                   WHERE reviewed_at>=? AND reviewed_at<? ORDER BY reviewed_at,id""",
+                """SELECT re.rating,re.reviewed_at,re.duration_ms,re.is_new
+                   FROM review_events re
+                   JOIN practice_cards pc ON pc.id=re.card_id
+                   WHERE pc.card_type='sentence_order'
+                     AND re.reviewed_at>=? AND re.reviewed_at<?
+                   ORDER BY re.reviewed_at,re.id""",
                 (event_start, event_end),
             )]
-            sentences = [dict(row) for row in db.execute("SELECT * FROM sentences")]
+            kanji_events = [dict(row) for row in db.execute(
+                """SELECT re.rating,re.reviewed_at,re.duration_ms,re.is_new
+                   FROM review_events re
+                   JOIN practice_cards pc ON pc.id=re.card_id
+                   WHERE pc.card_type='kanji_reading'
+                     AND re.reviewed_at>=? AND re.reviewed_at<?
+                   ORDER BY re.reviewed_at,re.id""",
+                (event_start, event_end),
+            )]
+            order_cards = [
+                dict(row)
+                for row in db.execute(
+                    """SELECT * FROM practice_cards
+                       WHERE card_type='sentence_order' AND active=1"""
+                )
+            ]
+            kanji_cards = [
+                dict(row)
+                for row in db.execute(
+                    """SELECT * FROM practice_cards
+                       WHERE card_type='kanji_reading' AND active=1"""
+                )
+            ]
             timeline = _stats_timeline(events, now_dt, tz)
             upcoming_due = _stats_upcoming_due(db, now_dt, tz)
+            kanji_timeline = _stats_timeline(kanji_events, now_dt, tz)
+            kanji_upcoming_due = _stats_upcoming_due(
+                db, now_dt, tz, "kanji_reading"
+            )
 
         return jsonify(
             generatedAt=now,
@@ -2139,7 +3085,14 @@ def create_app(test_config=None):
             },
             timeline=timeline,
             upcomingDue=upcoming_due,
-            memoryMastery=_memory_mastery_summary(sentences, now_dt),
+            memoryMastery=_memory_mastery_summary(order_cards, now_dt),
+            kanjiReading={
+                "timeline": kanji_timeline,
+                "upcomingDue": kanji_upcoming_due,
+                "memoryMastery": _memory_mastery_summary(
+                    kanji_cards, now_dt
+                ),
+            },
         )
 
     # Build content-subset fonts at startup (no-op if sources missing / already current).

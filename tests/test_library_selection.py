@@ -175,7 +175,7 @@ def test_library_bulk_controls_dialog_sticky_and_mobile_contracts():
     assert "list.innerHTML = items.length ?" in source
     assert "updateLibrarySelectionButtons(); }" in source
     assert 'id="library-selected-count"' in source
-    assert "将使用当前 GiNZA 分块规则重新生成所选 ${ids.length} 句的词块" in source
+    assert "将使用 KWJA tiny 重新生成所选 ${ids.length} 句的文节、注音和汉字读音卡" in source
     assert "已有的人工拆分或合并结果会被覆盖" in source
     assert "正在重新分块…" in source
     assert "await reloadLibrary()" in source

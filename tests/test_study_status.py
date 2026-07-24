@@ -55,8 +55,10 @@ def dashboard_collection(client, collection_id):
 
 def add_review_event(db_module, sentence_id, reviewed_at):
     with db_module.get_db() as connection:
-        sentence = connection.execute(
-            "SELECT * FROM sentences WHERE id=?", (sentence_id,)
+        card = connection.execute(
+            """SELECT * FROM practice_cards
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (sentence_id,),
         ).fetchone()
         session_id = connection.execute(
             """INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at)
@@ -65,19 +67,19 @@ def add_review_event(db_module, sentence_id, reviewed_at):
         ).lastrowid
         connection.execute(
             """INSERT INTO review_events(
-                 sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
+                 card_id,sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
                  fsrs_state_before,fsrs_state_after,fsrs_step_before,fsrs_step_after,
                  stability_before,stability_after,difficulty_before,difficulty_after,
                  next_review_before,next_review_after,fsrs_version,created_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                sentence_id, session_id, 3, reviewed_at, 1000, 0,
-                sentence["fsrs_state"], sentence["fsrs_state"],
-                sentence["fsrs_step"], sentence["fsrs_step"],
-                sentence["stability"], sentence["stability"],
-                sentence["difficulty"], sentence["difficulty"],
-                sentence["next_review_at"], sentence["next_review_at"],
-                sentence["fsrs_version"], reviewed_at,
+                card["id"], sentence_id, session_id, 3, reviewed_at, 1000, 0,
+                card["fsrs_state"], card["fsrs_state"],
+                card["fsrs_step"], card["fsrs_step"],
+                card["stability"], card["stability"],
+                card["difficulty"], card["difficulty"],
+                card["next_review_at"], card["next_review_at"],
+                card["fsrs_version"], reviewed_at,
             ),
         )
 
@@ -101,6 +103,11 @@ def test_due_status_filters_sorts_scopes_and_matches_dashboard(tmp_path, monkeyp
         }
         connection.executemany(
             "UPDATE sentences SET next_review_at=? WHERE id=?",
+            [(stamp, sentence_id) for sentence_id, stamp in schedules.items()],
+        )
+        connection.executemany(
+            """UPDATE practice_cards SET next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
             [(stamp, sentence_id) for sentence_id, stamp in schedules.items()],
         )
 

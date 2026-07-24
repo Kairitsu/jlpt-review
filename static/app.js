@@ -202,7 +202,7 @@ function openMoveSentencesDialog(ids) {
   $('#dialog').dataset.moveIds = ids.join(',');
 }
 function openRechunkSentencesDialog(ids) {
-  openDialog(`<div class="rechunk-sentences-dialog"><h1>重新分块</h1><p class="rechunk-sentences-copy">将使用当前 GiNZA 分块规则重新生成所选 ${ids.length} 句的词块。已有的人工拆分或合并结果会被覆盖；日语原句、中文翻译、所属句集、FSRS 记忆进度和练习历史不会改变。</p><p id="rechunk-sentences-error" class="form-error rechunk-sentences-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-rechunk-sentences">确认重新分块</button></div></div>`, { className: 'rechunk-sentences-modal', label: '确认重新分块' });
+  openDialog(`<div class="rechunk-sentences-dialog"><h1>重新分析</h1><p class="rechunk-sentences-copy">将使用 KWJA tiny 重新生成所选 ${ids.length} 句的文节、注音和汉字读音卡。已有的人工拆分或合并结果会被覆盖；日语原句、翻译、句集、重组卡 FSRS 和历史不会改变。</p><p id="rechunk-sentences-error" class="form-error rechunk-sentences-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="confirm-rechunk-sentences">确认重新分析</button></div></div>`, { className: 'rechunk-sentences-modal', label: '确认重新分析' });
   $('#dialog').dataset.rechunkIds = ids.join(',');
 }
 function openBatchNoteDialog(ids) {
@@ -289,13 +289,13 @@ async function openRetryRoundDialog() {
   const unanswered = Number(retry.unansweredCount || 0);
   const remainingQuota = Number(retry.remainingAutoReviewQuota || 0);
   const collectionLabel = collection ? `“${esc(collection.name)}”当前句集` : '当前';
-  const summary = `${collectionLabel}共有 <strong>${candidateCount}</strong> 句可进入下一轮。今日还可自动练习 <strong>${remainingQuota}</strong> 句，本轮最多选择 <strong>${max}</strong> 句。`;
+  const summary = `${collectionLabel}共有 <strong>${candidateCount}</strong> 题可进入下一轮。今日还可自动练习 <strong>${remainingQuota}</strong> 题，本轮最多选择 <strong>${max}</strong> 题。`;
   const unansweredCopy = unanswered
-    ? `<p class="retry-unanswered-copy">上一轮还有 <strong>${unanswered}</strong> 句未回答，将优先安排；其余位置按自动复习顺序补充。</p>`
+    ? `<p class="retry-unanswered-copy">上一轮还有 <strong>${unanswered}</strong> 题未回答，将优先安排；其余位置按自动复习顺序补充。</p>`
     : '';
   const emptyHtml = remainingQuota === 0
     ? '<span class="status-note retry-empty">今日自动复习计划已完成，明天可继续自动复习。仍可进入句集进行专项练习。</span>'
-    : '<span class="status-note retry-empty">当前没有可进入下一轮的句子。</span>';
+    : '<span class="status-note retry-empty">当前没有可进入下一轮的练习卡。</span>';
   const picker = renderCountPicker({
     idPrefix: 'report-count',
     max,
@@ -306,6 +306,7 @@ async function openRetryRoundDialog() {
     initialHint: max ? '未回答题目优先；其余按已到期旧卡、新卡的顺序补充。' : '',
     includeStartButton: false,
     emptyHtml,
+    unit: '题',
   });
   openDialog(`<div class="retry-round-dialog"><h1>再练一轮</h1><p class="retry-collection-total">${summary}</p>${unansweredCopy}${picker}<div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="start-report-round" ${!max ? 'disabled' : ''}>开始练习</button></div></div>`, { className: 'retry-round-modal', label: '再练一轮' });
   $('#dialog').dataset.retryReportId = reportId;
@@ -376,7 +377,7 @@ function setChrome(practice = false) {
   header.classList.toggle('hidden', practice);
   if (!practice) {
     const secondary = secondaryRoutes.has(state.route);
-    header.innerHTML = `<button class="brand plain-button" data-action="${secondary ? 'back' : 'home'}" aria-label="${secondary ? '返回上一页' : '返回首页'}">${secondary ? '<span class="back-arrow" aria-hidden="true">←</span>' : '<span class="brand-mark">文</span>'}<strong>句子重组</strong></button><button class="icon-button" data-route="settings" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>`;
+    header.innerHTML = `<button class="brand plain-button" data-action="${secondary ? 'back' : 'home'}" aria-label="${secondary ? '返回上一页' : '返回首页'}">${secondary ? '<span class="back-arrow" aria-hidden="true">←</span>' : '<span class="brand-mark">文</span>'}<strong>JLPT Review</strong></button><button class="icon-button" data-route="settings" aria-label="设置" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>`;
   }
   $('#bottom-nav').classList.toggle('hidden', practice);
   $('#fab').classList.toggle('hidden', practice || state.route === 'add' || state.route === 'report' || state.route === 'settings' || state.route === 'stats' || state.route === 'due' || state.route === 'today');
@@ -388,12 +389,12 @@ function historyEntry(name, options = {}) {
   return entry;
 }
 async function route(name, options = {}) {
-  const allowed = new Set(['home','library','add','reports','report','settings','practice','stats','due','today']);
+  const allowed = new Set(['home','library','add','reports','report','settings','practice-order','practice-reading','stats','due','today']);
   if (!allowed.has(name)) name = 'home';
   if (state.route === 'stats' && name !== 'stats' && typeof destroyStatsCharts === 'function') destroyStatsCharts();
   state.route = name; state.routeMeta = options;
   if (!options.fromPop) history[options.replace ? 'replaceState' : 'pushState'](historyEntry(name, options), '', `#${name}`);
-  setChrome(name === 'practice');
+  setChrome(name.startsWith('practice-'));
   if (!options.preserveScroll) window.scrollTo(0, 0);
   try {
     if (name === 'home') await renderHome();
@@ -408,7 +409,7 @@ async function route(name, options = {}) {
       if (typeof renderStats === 'function') await renderStats();
       else view.innerHTML = '<section class="page"><p class="error-text">统计模块未加载</p></section>';
     }
-    else if (name === 'practice') renderPractice();
+    else if (name === 'practice-order' || name === 'practice-reading') renderPractice();
     else if (name === 'report') {
       const id = options.reportId || state.report?.id;
       if (id && (!state.report || state.report.id !== Number(id))) state.report = (await api(`/api/reports/${id}`)).report;
@@ -485,6 +486,7 @@ function renderCountPicker({
   initialHint,
   emptyHtml = null,
   includeStartButton = true,
+  unit = '句',
 }) {
   const cfg = countPickerIds(idPrefix);
   let optionsInner;
@@ -492,7 +494,7 @@ function renderCountPicker({
     optionsInner = emptyHtml;
   } else {
     const nums = filterQuick ? quickOptions.filter(n => n <= max) : quickOptions;
-    const buttons = nums.map(n => `<button class="${cfg.optionClass}" data-action="${cfg.setAction}" data-count="${n}">${n} 句</button>`).join('');
+    const buttons = nums.map(n => `<button class="${cfg.optionClass}" data-action="${cfg.setAction}" data-count="${n}">${n} ${unit}</button>`).join('');
     const inputMax = idPrefix === 'count' ? Math.max(max, 1) : max;
     const startButton = includeStartButton ? `<button class="btn primary" data-action="${startAction}" ${!max ? 'disabled' : ''}>${startLabel}</button>` : '';
     optionsInner = `${buttons}<button class="${cfg.optionClass} active" data-action="${cfg.setAction}" data-count="all">全部</button><label class="custom-count">自定义<input id="${cfg.inputId}" type="number" min="1" max="${inputMax}" inputmode="numeric" placeholder="1-${max}"></label>${startButton}`;
@@ -577,9 +579,11 @@ function renderDuePicker(data, active) {
 async function renderHome() {
   const data = await ensureDashboard(); const active = data.collections.find(c => c.id === state.activeCollection) || data.collections[0]; const progress = active?.total ? Math.round(active.learned * 100 / active.total) : 0;
   const autoAvailable = active?.availableAutoReviewCount || 0;
+  const kanjiAvailable = active?.availableKanjiReviewCount || 0;
+  const kanjiPlan = data.kanjiReading || {};
   const quotaComplete = Number(data.remainingAutoReviewQuota || 0) === 0;
   const planComplete = quotaComplete ? '<p class="auto-review-complete">今日自动复习计划已完成。仍可进入句集进行专项练习。</p>' : '';
-  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>根据中文翻译，补全日语句子</h1></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom" aria-label="学习状态"><button type="button" class="metric metric-button" data-route="due" aria-label="查看待复习句子，共 ${active?.due || 0} 句"><span class="metric-copy"><strong>${active?.due || 0}</strong><span>待复习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button><div class="metric auto-review-metric" role="status" aria-label="今日还可自动练习 ${autoAvailable} 句"><strong>${autoAvailable}</strong><span>今日还可自动练习</span></div><button type="button" class="metric metric-button" data-route="today" aria-label="查看今日学习句子，共 ${active?.today || 0} 句"><span class="metric-copy"><strong>${active?.today || 0}</strong><span>今日学习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button></div><button class="btn primary" data-action="start-due" ${!autoAvailable ? 'disabled' : ''}>开始句子重组</button>${planComplete}</div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total}</small></span><span class="arrow">›</span></button>`).join('')}</div><button class="card section-card home-stats-entry" data-route="reports"><div class="section-title"><h2>练习历史</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">每轮练习都会保留，可随时回看报告</p></button><button class="card section-card home-stats-entry" data-route="stats"><div class="section-title"><h2>学习概览</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">近期学习 · 复习安排 · 记忆掌握度</p></button></section>`;
+  view.innerHTML = `<section class="page home-page"><div class="page-head"><div><h1>根据中文翻译，补全日语句子</h1></div></div><div class="card hero-card"><div class="collection-title"><span class="collection-icon">文</span><div><h2>${esc(active?.name || '还没有句集')}</h2><p>${active?.learned || 0} 已学习 / ${active?.total || 0} 总数量</p></div></div><label class="home-collection-switch">切换句集<select id="home-collection" aria-label="切换句集">${collectionOptions(active?.id)}</select></label><div class="progress" aria-label="学习进度 ${progress}%"><span style="width:${progress}%"></span></div><div class="hero-bottom" aria-label="学习状态"><button type="button" class="metric metric-button" data-route="due" aria-label="查看待复习句子，共 ${active?.due || 0} 句"><span class="metric-copy"><strong>${active?.due || 0}</strong><span>待复习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button><div class="metric auto-review-metric" role="status" aria-label="今日还可自动练习 ${autoAvailable} 句"><strong>${autoAvailable}</strong><span>今日还可自动练习</span></div><button type="button" class="metric metric-button" data-route="today" aria-label="查看今日学习句子，共 ${active?.today || 0} 句"><span class="metric-copy"><strong>${active?.today || 0}</strong><span>今日学习</span></span><span class="metric-arrow" aria-hidden="true">›</span></button></div><button class="btn primary" data-action="start-due" ${!autoAvailable ? 'disabled' : ''}>开始句子重组</button>${planComplete}</div>${state.homeDuePicker ? renderDuePicker(data, active) : ''}<div class="card kanji-home-card"><div><span class="practice-type-label">独立练习</span><h2>汉字读音</h2><p>根据完整句子语境，选择下划线词语的正确读音。</p></div><div class="kanji-home-metrics"><span><strong>${active?.kanjiCardCount || 0}</strong> 张读音卡</span><span><strong>${kanjiAvailable}</strong> 今日可练</span><span><strong>${kanjiPlan.remainingQuota ?? 0}</strong> 剩余额度</span></div><button class="btn primary" data-action="start-kanji-due" ${!kanjiAvailable ? 'disabled' : ''}>开始汉字读音</button></div><div class="card section-card"><div class="section-title"><h2>句子合集</h2><button class="link-button" data-action="new-collection">＋ 新建</button></div>${data.collections.map(c => `<button class="collection-row" data-action="open-collection" data-id="${c.id}"><span class="row-icon">文</span><span class="row-main"><strong>${esc(c.name)}</strong><small>已学 ${c.learned}，共 ${c.total} · 读音卡 ${c.kanjiCardCount || 0}</small></span><span class="arrow">›</span></button>`).join('')}</div><button class="card section-card home-stats-entry" data-route="reports"><div class="section-title"><h2>练习历史</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">每轮练习都会保留，可随时回看报告</p></button><button class="card section-card home-stats-entry" data-route="stats"><div class="section-title"><h2>学习概览</h2><span class="arrow">›</span></div><p class="status-note" style="margin:0">近期学习 · 复习安排 · 记忆掌握度</p></button></section>`;
   setChrome();
 }
 
@@ -605,8 +609,8 @@ async function renderStudyStatus(status, collectionId) {
   setChrome();
 }
 
-function addForm(data = {}) { return `<section class="page"><div class="page-head"><div><h1>${state.editing ? '编辑句子' : '添加句子'}</h1><p>输入中文和完整原句，再检查自动生成的词块。</p></div></div><div class="card form-card"><div class="form-grid"><label class="field full">所属句集<select id="collection">${collectionOptions(data.collection_id || state.activeCollection)}</select></label><div class="form-column"><label class="field">中文翻译<textarea id="chinese" placeholder="例如：即使下雨，我也想去散步。">${esc(data.chinese || '')}</textarea></label><label class="field">备注（可选）<textarea id="note" class="note-input" maxlength="1000" placeholder="例如：に限って：与平日不同、偏偏、特别相信">${esc(sentenceNote(data))}</textarea></label></div><div class="form-column"><label class="field">完整日语原句<textarea id="japanese" lang="ja" placeholder="例如：雨が降っても、散歩に行きたいです。">${esc(data.japanese || '')}</textarea></label></div></div><div class="form-actions"><button class="btn primary" data-action="organize">自动分块</button></div></div><div id="preview-slot"></div></section>`; }
-async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { state.draft = {chunks:state.editing.chunks.map(x => ({...x})), practiceStructure:(state.editing.practiceStructure || []).map(x => ({...x})), source:state.editing.chunkSource || 'legacy', schemaVersion:state.editing.chunkSchemaVersion || 1, manuallyEdited:Boolean(state.editing.chunksManuallyEdited), sentenceFurigana:state.editing.furigana}; renderPreview(); } setChrome(); }
+function addForm(data = {}) { return `<section class="page"><div class="page-head"><div><h1>${state.editing ? '编辑句子' : '添加句子'}</h1><p>输入中文和完整原句，再检查 KWJA 文节与自动读音题。</p></div></div><div class="card form-card"><div class="form-grid"><label class="field full">所属句集<select id="collection">${collectionOptions(data.collection_id || state.activeCollection)}</select></label><div class="form-column"><label class="field">中文翻译<textarea id="chinese" placeholder="例如：即使下雨，我也想去散步。">${esc(data.chinese || '')}</textarea></label><label class="field">备注（可选）<textarea id="note" class="note-input" maxlength="1000" placeholder="例如：に限って：与平日不同、偏偏、特别相信">${esc(sentenceNote(data))}</textarea></label></div><div class="form-column"><label class="field">完整日语原句<textarea id="japanese" lang="ja" placeholder="例如：雨が降っても、散歩に行きたいです。">${esc(data.japanese || '')}</textarea></label></div></div><div class="form-actions"><button class="btn primary" data-action="organize">KWJA 自动分析</button></div></div><div id="preview-slot"></div></section>`; }
+async function renderAdd() { await ensureDashboard(); view.innerHTML = addForm(state.editing || {}); if (state.editing) { const cardData = await api(`/api/sentences/${state.editing.id}/cards`); const latestByKey = new Map(); cardData.cards.filter(card => card.cardType === 'kanji_reading').forEach(card => { const previous = latestByKey.get(card.cardKey); if (!previous || Number(card.cardId) > Number(previous.cardId)) latestByKey.set(card.cardKey, card); }); const readings = [...latestByKey.values()]; state.draft = {chunks:state.editing.chunks.map(x => ({...x})), practiceStructure:(state.editing.practiceStructure || []).map(x => ({...x})), source:state.editing.chunkSource || 'legacy', schemaVersion:state.editing.chunkSchemaVersion || 1, manuallyEdited:Boolean(state.editing.chunksManuallyEdited), sentenceFurigana:state.editing.furigana, readingCards:readings, disabledReadingCardKeys:readings.filter(card => !card.active).map(card => card.cardKey)}; renderPreview(); } setChrome(); }
 function fixedSlotPreview(structure, chunks, {interactive = false} = {}) {
   const map = Object.fromEntries((chunks || []).map(chunk => [chunk.id, chunk]));
   return (structure || []).map(element => {
@@ -633,8 +637,41 @@ function renderPreview() {
   const previewJp = rubyHtml(state.draft.sentenceFurigana) || esc($('#japanese').value);
   const note = sentenceNote({note:$('#note')?.value});
   const noteRow = note ? `<div><span>备注</span><p class="preview-note">${esc(note)}</p></div>` : '';
-  const sourceLabel = state.draft.source === 'fallback' ? '安全降级分块' : (state.draft.manuallyEdited ? '人工调整词块' : 'GiNZA 文节分块');
-  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分块预览</h3><p>横线词块参与练习；标点和空白固定在原位。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div>${noteRow}<div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="preview-structure" aria-label="固定标点与可练习词块结构">${fixedSlotPreview(state.draft.practiceStructure, state.draft.chunks, {interactive:true})}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button></div><p class="status-note">分块方式：${sourceLabel}；固定标点不会进入候选区。</p><div class="form-actions"><button class="btn outline" data-action="organize">重新分块</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
+  const sourceLabel = state.draft.manuallyEdited ? '人工调整词块' : 'KWJA tiny 文节';
+  const readingCards = state.draft.readingCards || [];
+  const disabled = new Set(state.draft.disabledReadingCardKeys || []);
+  const readingRows = readingCards.map((card, index) => { const payload = card.payload || {}; const key = card.cardKey; const active = !disabled.has(key); const options = (payload.options || []).map(option => option.reading).join('、'); return `<div class="reading-card-row ${active ? '' : 'disabled'}"><div><strong lang="ja">${esc(payload.target?.surface || '')}</strong><span lang="ja">${esc(payload.correctReading || '')}</span><small>${esc(options)}</small></div><div class="row-actions"><button class="small-btn" data-action="edit-draft-reading" data-index="${index}">修改</button><button class="small-btn" data-action="toggle-draft-reading" data-index="${index}">${active ? '禁用' : '启用'}</button></div></div>`; }).join('');
+  const readingPanel = `<details class="reading-card-manager"><summary>自动生成 ${readingCards.length} 张汉字读音题</summary><p>合格题目默认启用。每张卡拥有独立 FSRS，修改正确读音会创建新卡。</p><div class="reading-card-list">${readingRows || '<div class="empty compact">当前句子没有可生成的汉字读音题。</div>'}</div></details>`;
+  slot.innerHTML = `<div class="card preview"><div class="preview-head"><div><h3>分析预览</h3><p>横线词块参与句子重组；标点和空白固定在原位。</p></div></div><div class="preview-fields"><div><span>所属句集</span><strong>${esc($('#collection').selectedOptions[0]?.textContent || '')}</strong></div><div><span>中文翻译</span><p>${esc($('#chinese').value)}</p></div>${noteRow}<div><span>日语原句</span><p class="preview-jp" lang="ja">${previewJp}</p></div></div><div class="preview-structure" aria-label="固定标点与可练习词块结构">${fixedSlotPreview(state.draft.practiceStructure, state.draft.chunks, {interactive:true})}</div><div class="chunk-tools"><button class="btn outline" data-action="split-chunk">拆分词块</button><button class="btn outline" data-action="merge-chunks">合并相邻词块</button></div><p class="status-note">分块方式：${sourceLabel}；固定标点不会进入候选区。</p>${readingPanel}<div class="form-actions"><button class="btn outline" data-action="organize">重新分析</button><button class="btn primary" data-action="save-sentence">确认保存</button></div></div>`;
+}
+
+function openDraftReadingEditor(index) {
+  const card = state.draft?.readingCards?.[index];
+  if (!card) return;
+  const payload = card.payload || {};
+  const options = payload.options || [];
+  openDialog(`<div class="reading-edit-dialog"><h1>修改读音题</h1><p>目标词：<strong lang="ja">${esc(payload.target?.surface || '')}</strong></p><label class="field">正确读音<input id="reading-correct-input" lang="ja" value="${esc(payload.correctReading || '')}"></label>${[1,2,3].map((number, offset) => `<label class="field">干扰项 ${number}<input class="reading-distractor-input" lang="ja" value="${esc(options[offset + 1]?.reading || '')}"></label>`).join('')}<p id="reading-edit-error" class="form-error" role="alert"></p><div class="form-actions"><button class="btn outline" data-action="close-dialog">取消</button><button class="btn primary" data-action="save-draft-reading">保存题目</button></div></div>`, {label:'修改汉字读音题'});
+  $('#dialog').dataset.readingIndex = String(index);
+}
+
+function saveDraftReadingEditor() {
+  const index = Number($('#dialog').dataset.readingIndex);
+  const card = state.draft?.readingCards?.[index];
+  if (!card) return;
+  const readings = [$('#reading-correct-input')?.value.trim(), ...$$('.reading-distractor-input').map(input => input.value.trim())];
+  const error = $('#reading-edit-error');
+  if (readings.some(value => !value) || new Set(readings).size !== 4) {
+    if (error) error.textContent = '正确读音和三个干扰项都必须填写且互不相同';
+    return;
+  }
+  const oldOptions = card.payload.options || [];
+  const options = readings.map((reading, optionIndex) => ({
+    id: oldOptions[optionIndex]?.id || manualChunkId(),
+    reading,
+  }));
+  card.payload = {...card.payload, correctReading:readings[0], correctOptionId:options[0].id, options};
+  closeDialog();
+  renderPreview();
 }
 
 async function renderLibrary(collectionId = state.activeCollection) {
@@ -658,20 +695,31 @@ async function reloadLibrary() { const query = new URLSearchParams({collectionId
 async function startPractice(payload) {
   const result = await api('/api/practice/sessions', {method:'POST', body:JSON.stringify(payload)});
   if (result.notice) toast(result.notice);
+  const cardType = result.cardType || payload.cardType || 'sentence_order';
+  const cards = Array.isArray(result.cards) ? result.cards : (result.sentences || []).map(sentence => ({
+    cardId: sentence.cardId || sentence.id,
+    sentenceId: sentence.id,
+    cardType: 'sentence_order',
+    payload: {},
+    sentence,
+  }));
   state.practice = {
     sessionId: result.sessionId,
+    cardType,
+    cards,
     sentences: result.sentences,
     index: 0,
-    items: result.sentences.map(sentence => ({
-      slotAssignments: Array(sentence.chunks.length).fill(null), checked: false, result: null,
-      candidates: shuffle(sentence.chunks.map(chunk => chunk.id)),
+    items: cards.map(card => ({
+      slotAssignments: cardType === 'sentence_order' ? Array(card.sentence.chunks.length).fill(null) : [],
+      selectedOptionId: null, checked: false, result: null,
+      candidates: cardType === 'sentence_order' ? shuffle(card.sentence.chunks.map(chunk => chunk.id)) : [],
       submitting: false, attemptStatuses: [], pendingAttempt: null,
       finalized: false, completion: null, questionStartedAt: Date.now(),
     })),
     submittingRound: false,
     exiting: false,
   };
-  route('practice');
+  route(cardType === 'kanji_reading' ? 'practice-reading' : 'practice-order');
 }
 function shuffle(items) { const result = [...items]; for (let i = result.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [result[i], result[j]] = [result[j], result[i]]; } return result; }
 let clientAttemptSequence = 0;
@@ -911,7 +959,7 @@ function onPracticePointerDown(event) {
   if (event.button != null && event.button !== 0) return;
   const practice = state.practice;
   const item = currentPracticeItem(practice);
-  if (state.route !== 'practice' || !practice || !item || item.checked || item.submitting || practice.submittingRound) return;
+  if (!state.route.startsWith('practice-') || practice?.cardType !== 'sentence_order' || !practice || !item || item.checked || item.submitting || practice.submittingRound) return;
   if (practiceDrag) return;
   const chip = event.target.closest?.('.chosen, .candidate');
   if (!chip || !view.contains(chip)) return;
@@ -981,7 +1029,7 @@ function onPracticePointerCancel(event) {
 }
 
 function practiceDialogBusy() {
-  if (state.route !== 'practice') return false;
+  if (!state.route.startsWith('practice-')) return false;
   return Boolean(state.practice?.exiting || state.practice?.submittingRound || currentPracticeItem()?.submitting);
 }
 function onPracticeKeyDown(event) {
@@ -994,6 +1042,18 @@ function onPracticeKeyDown(event) {
     event.preventDefault();
     abortPracticeDrag();
   }
+  if (state.route === 'practice-reading' && /^[a-dA-D]$/.test(event.key)) {
+    const practice = state.practice;
+    const item = currentPracticeItem(practice);
+    const card = practice?.cards?.[practice.index];
+    if (!item || !card || item.checked || item.submitting || practice.submittingRound) return;
+    const index = event.key.toUpperCase().charCodeAt(0) - 65;
+    const option = card.payload?.options?.[index];
+    if (!option) return;
+    event.preventDefault();
+    item.selectedOptionId = option.id;
+    renderPractice();
+  }
 }
 
 document.addEventListener('pointerdown', onPracticePointerDown);
@@ -1001,8 +1061,41 @@ document.addEventListener('pointermove', onPracticePointerMove, { passive: false
 document.addEventListener('pointerup', onPracticePointerUp);
 document.addEventListener('pointercancel', onPracticePointerCancel);
 document.addEventListener('keydown', onPracticeKeyDown);
+
+function readingTargetHtml(sentence, target) {
+  const chars = Array.from(sentence?.japanese || '');
+  const start = Number(target?.start), end = Number(target?.end);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > chars.length) {
+    return esc(sentence?.japanese || '');
+  }
+  return `${esc(chars.slice(0, start).join(''))}<span class="reading-target">${esc(chars.slice(start, end).join(''))}</span>${esc(chars.slice(end).join(''))}`;
+}
+
+function renderReadingPractice() {
+  const p = state.practice;
+  const item = currentPracticeItem(p);
+  const card = p?.cards?.[p.index];
+  const s = card?.sentence;
+  if (!p || !item || !card || !s) return route('home', {replace:true});
+  const options = card.payload?.options || [];
+  const pct = Math.round((p.index + 1) * 100 / p.cards.length);
+  const busy = item.submitting || p.submittingRound || p.exiting;
+  const last = p.index === p.cards.length - 1;
+  const optionHtml = options.map((option, index) => {
+    const selected = item.selectedOptionId === option.id;
+    const correct = option.id === card.payload?.correctOptionId;
+    const resultClass = item.checked ? (correct ? 'correct' : (selected ? 'wrong' : '')) : '';
+    return `<button class="reading-option ${selected ? 'selected' : ''} ${resultClass}" data-action="select-reading-option" data-option-id="${esc(option.id)}" aria-pressed="${selected}" ${item.checked || busy ? 'disabled' : ''}><span class="reading-option-letter">${String.fromCharCode(65 + index)}</span><span lang="ja">${esc(option.reading)}</span></button>`;
+  }).join('');
+  const note = sentenceNote(s);
+  const details = item.checked ? `<div class="card answer-card reading-answer-card"><h3>${item.result?.correct ? '回答正确' : '正确答案'}</h3><div class="report-line"><span>你的选择</span><strong lang="ja">${esc(options.find(option => option.id === item.selectedOptionId)?.reading || '（未作答）')}</strong></div><div class="report-line"><span>正确读音</span><strong lang="ja">${esc(card.payload?.correctReading || '')}</strong></div><div class="correct-display" lang="ja">${rubyHtml(s.furigana) || esc(s.japanese)}</div><p>${esc(s.chinese)}</p>${note ? `<div class="reading-note"><strong>备注</strong><p>${esc(note)}</p></div>` : ''}</div>` : '';
+  view.innerHTML = `<section class="page practice-page reading-practice-page"><div class="practice-nav"><button class="back" data-action="exit-practice">←　汉字读音</button><div class="thin-progress" aria-label="练习进度"><span style="width:${pct}%"></span></div><button class="exit" data-action="exit-practice">${p.index + 1} / ${p.cards.length}　退出</button></div><h1 class="practice-title">汉字读音</h1><div class="card reading-question"><p class="reading-question-hint">请选择下划线部分在这句话中的读音</p><div class="reading-sentence" lang="ja">${readingTargetHtml(s, card.payload?.target)}</div></div><div class="reading-options" role="group" aria-label="读音选项">${optionHtml}</div>${details}<div class="practice-actions reading-practice-actions"><button class="btn outline practice-prev" data-action="previous-question" ${p.index === 0 || busy ? 'disabled' : ''}>上一题</button><button class="btn outline practice-next" data-action="${last ? 'submit-round' : 'next-question'}" ${busy ? 'disabled' : ''}>${last ? '提交本轮' : '下一题'}</button>${item.checked ? `<button class="btn outline retry-current" data-action="retry-current" ${busy ? 'disabled' : ''}>重新练习本题</button>` : ''}<button class="btn primary practice-check" data-action="check" ${!item.selectedOptionId || item.checked || busy ? 'disabled' : ''}>${item.checked ? '已核对' : '核对答案'}</button></div></section>`;
+  setChrome(true);
+}
+
 function renderPractice() {
   const p = state.practice;
+  if (p?.cardType === 'kanji_reading') return renderReadingPractice();
   const item = currentPracticeItem(p);
   if (!p || !item) return route('home', {replace:true});
   const s = p.sentences[p.index], map = Object.fromEntries(s.chunks.map(c => [c.id, c]));
@@ -1035,10 +1128,18 @@ async function record(action, { confirmIncomplete = false, button = null } = {})
   const item = currentPracticeItem(p);
   if (!p || !item || item.submitting || p.submittingRound || action !== 'check') return;
   if (!practiceReadyToCheck(item, p)) return;
-  if (!practiceAnswerComplete(item) && !confirmIncomplete) { openIncompleteAnswerDialog(); return; }
+  const reading = p.cardType === 'kanji_reading';
+  if (reading && !item.selectedOptionId) return;
+  if (!reading) {
+    if (!practiceAnswerComplete(item) && !confirmIncomplete) { openIncompleteAnswerDialog(); return; }
+  }
   const s = p.sentences[p.index];
+  const card = p.cards[p.index];
   const answerOrder = practiceAnswerOrder(item);
-  const answerKey = JSON.stringify(answerOrder);
+  const answer = reading
+    ? {type:'kanji_reading', selectedOptionId:item.selectedOptionId}
+    : {type:'sentence_order', orderedChunkIds:answerOrder};
+  const answerKey = JSON.stringify(answer);
   if (!item.pendingAttempt || item.pendingAttempt.answerKey !== answerKey) {
     item.pendingAttempt = { id: createClientAttemptId(), answerKey };
   }
@@ -1054,7 +1155,7 @@ async function record(action, { confirmIncomplete = false, button = null } = {})
   item.submitting = true;
   renderPractice();
   try {
-    item.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({sentenceId:s.id, action, attemptId:item.pendingAttempt.id, answerOrder, durationMs})});
+    item.result = await api(`/api/practice/sessions/${p.sessionId}/attempts`, {method:'POST', body:JSON.stringify({cardId:card.cardId, sentenceId:s.id, action, attemptId:item.pendingAttempt.id, answer, answerOrder, durationMs})});
     item.attemptStatuses.push(item.result.status);
     item.pendingAttempt = null;
     item.checked = true;
@@ -1090,8 +1191,12 @@ function roundSubmissionPayload(practice, confirmUnanswered) {
     confirmUnanswered,
     clientUnansweredCount: practiceUnansweredIndexes(practice).length,
     draftAnswers: practice.sentences.map((sentence, index) => ({
+      cardId: practice.cards[index]?.cardId,
       sentenceId: sentence.id,
       answerOrder: practiceAnswerOrder(practice.items[index]),
+      answer: practice.cardType === 'kanji_reading'
+        ? {type:'kanji_reading', selectedOptionId:practice.items[index].selectedOptionId}
+        : {type:'sentence_order', orderedChunkIds:practiceAnswerOrder(practice.items[index])},
     })),
   };
 }
@@ -1155,16 +1260,26 @@ async function submitPracticeRound({ confirmUnanswered = false, button = null } 
 }
 
 function ratingSummaryText(report) { const c = report.ratingCounts || {}; return `忘记 ${c.again || 0} · 模糊 ${c.hard || 0} · 认识 ${c.good || 0} · 轻松掌握 ${c.easy || 0}${c.skipped ? ` · 跳过 ${c.skipped}` : ''}${report.unansweredCount ? ` · 未回答 ${report.unansweredCount}` : ''}`; }
-function historyRoundText(report) { const completed = Number(report.completedCount ?? ((report.correct || 0) + (report.wrong || 0) + (report.skipped || 0))), unanswered = Number(report.unansweredCount || 0); return report.endedEarly ? `提前结束 · 原计划 ${report.total} 句 · 完成 ${completed} 句 · 未完成 ${unanswered} 句` : `本轮 ${report.total} 句`; }
+function historyRoundText(report) { const completed = Number(report.completedCount ?? ((report.correct || 0) + (report.wrong || 0) + (report.skipped || 0))), unanswered = Number(report.unansweredCount || 0), unit = report.cardType === 'kanji_reading' ? '题' : '句'; return report.endedEarly ? `提前结束 · 原计划 ${report.total} ${unit} · 完成 ${completed} ${unit} · 未完成 ${unanswered} ${unit}` : `本轮 ${report.total} ${unit}`; }
 async function renderReports() { const data = await api('/api/reports'); view.innerHTML = `<section class="page"><div class="page-head"><div><h1>练习历史</h1><p>每轮练习都会保留，可随时重新打开。</p></div></div><div class="card section-card">${data.reports.length ? data.reports.map(r => `<div class="history-row"><button class="row-open" data-action="open-report" data-id="${r.id}"><span class="row-icon fsrs-report-icon">FSRS</span><span class="row-main"><strong>${formatDate(r.completed_at)}</strong><small>${historyRoundText(r)} · ${ratingSummaryText(r)}</small></span></button><div class="row-actions"><button class="small-btn" data-action="delete-report" data-id="${r.id}" aria-label="删除这条记录">删除</button><span class="arrow">›</span></div></div>`).join('') : '<div class="empty">完成一次练习后，报告会出现在这里。</div>'}</div></section>`; setChrome(); }
 function renderReport() { const r = state.report; if (!r) return route('reports', {replace:true}); const c = r.ratingCounts || {}; const skipped = c.skipped || 0, unanswered = Number(r.unansweredCount || 0), completed = Number(r.completedCount ?? ((r.correct || 0) + (r.wrong || 0) + (r.skipped || 0))), endedEarly = Boolean(r.endedEarly); const completedItems = (r.items || []).filter(item => item.status !== 'unanswered'), unansweredItems = (r.items || []).filter(item => item.status === 'unanswered'); const details = r.items?.length ? `<div class="report-items-section"><div class="report-section-heading"><h2>已完成题目</h2><span>${completed} 题</span></div>${completedItems.length ? reportItems(completedItems) : '<div class="card empty">没有已完成题目明细。</div>'}</div>${unansweredItems.length ? `<div class="report-items-section unanswered-items"><div class="report-section-heading"><h2>未完成题目</h2><span>${unanswered} 题 · 未计入 FSRS</span></div>${reportItems(unansweredItems)}</div>` : ''}` : reportItems([]); view.innerHTML = `<section class="page"><div class="page-head report-head"><div><h1>本轮练习报告${endedEarly ? '<span class="early-exit-badge">提前结束</span>' : ''}</h1><p>${formatDate(r.completed_at || r.created_at)}</p></div><div class="report-actions"><button class="btn outline" data-action="home">返回首页</button><button class="btn primary" data-action="open-retry-round">再练一轮</button></div></div>${endedEarly ? `<p class="early-exit-report-note">本轮已提前结束：原计划 ${r.total} 题，实际完成 ${completed} 题，未完成 ${unanswered} 题。未完成题目未计入正确率或 FSRS。</p>` : ''}<div class="report-summary"><div class="card stat-card"><strong>${r.total}</strong>原计划</div><div class="card stat-card"><strong>${completed}</strong>实际完成</div><div class="card stat-card"><strong>${unanswered}</strong>未完成</div><div class="card stat-card"><strong>${c.again || 0}</strong>忘记</div><div class="card stat-card"><strong>${c.hard || 0}</strong>模糊</div><div class="card stat-card"><strong>${c.good || 0}</strong>认识</div><div class="card stat-card"><strong>${c.easy || 0}</strong>轻松掌握</div></div>${unanswered ? `<p class="report-unanswered-note">${unanswered} 题未完成，未计入 FSRS，也未判定为错误或遗忘。</p>` : ''}${skipped ? `<p class="report-skip-note">另有 ${skipped} 句历史跳过记录，未计入 FSRS 评分。</p>` : ''}<div id="report-items">${details}</div></section>`; setChrome(); }
-function reportItems(items) { return items.length ? items.map(item => { const unanswered = item.status === 'unanswered'; const statusLabel = unanswered ? '未回答' : (item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过'); return `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${statusLabel}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div>${unanswered ? '<div class="report-line"><span>说明</span><div>未计入 FSRS</div></div>' : ''}</article>`; }).join('') : '<div class="card empty">这份旧报告的题目明细已不可用。</div>'; }
+function reportItems(items) {
+  return items.length ? items.map(item => {
+    const unanswered = item.status === 'unanswered';
+    const statusLabel = unanswered ? '未回答' : (item.ratingLabel ? `FSRS · ${esc(item.ratingLabel)}` : '跳过');
+    if (item.cardType === 'kanji_reading') {
+      return `<article class="card report-item reading-report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.target?.surface || '汉字读音')}</h3><strong>${statusLabel}</strong></div><div class="report-line"><span>完整句子</span><div lang="ja">${esc(item.japanese)}</div></div><div class="report-line"><span>你的选择</span><div lang="ja">${esc(item.selectedReading || '（未作答）')}</div></div><div class="report-line"><span>正确读音</span><div lang="ja">${esc(item.correctReading || '')}</div></div>${unanswered ? '<div class="report-line"><span>说明</span><div>未计入 FSRS</div></div>' : ''}</article>`;
+    }
+    return `<article class="card report-item ${item.status}" data-status="${item.status}"><div class="section-title"><h3>${esc(item.chinese)}</h3><strong>${statusLabel}</strong></div><div class="report-line"><span>你的排列</span><div lang="ja">${esc(item.answerText || '（未作答）')}</div></div><div class="report-line"><span>正确句子</span><div lang="ja">${esc(item.japanese)}</div></div>${unanswered ? '<div class="report-line"><span>说明</span><div>未计入 FSRS</div></div>' : ''}</article>`;
+  }).join('') : '<div class="card empty">这份旧报告的题目明细已不可用。</div>';
+}
 
+// 自动评分契约：从未核对的题目不计入 FSRS。
 async function renderSettings() {
   const [authCfg, tzCfg, fsrsCfg, dailyPlanCfg] = await Promise.all([api('/api/settings/auth'), api('/api/settings/timezone'), api('/api/settings/fsrs'), api('/api/settings/daily-plan')]);
   const timezoneCard = `<form id="timezone-form" class="card"><div class="settings-title"><div><h2>时区</h2><p>"今日学习"和「统计」页的分桶都按自然日归类，这里设置的时区决定自然日的分界点；不设置时默认按服务器所在时区计算。</p></div><span class="config-status ${tzCfg.timezone ? 'ok' : 'warn'}">${tzCfg.timezone ? '已设置' : '未设置'}</span></div><label class="field">时区<select name="timezone" id="timezone-select">${timezoneOptionsHtml(tzCfg.timezone)}</select></label>${tzCfg.timezone ? '' : `<p class="status-note">当前按服务器时区（UTC${tzCfg.serverUtcOffset}）计算，如果你实际所在地区和服务器不同，建议在上方选择你自己的时区。</p>`}<div class="form-actions"><button class="btn primary" type="submit">保存时区设置</button></div></form>`;
-  const dailyPlanCard = `<form id="daily-plan-form" class="card"><div class="settings-title"><div><h2>每日学习计划</h2><p>首页自动复习和练习报告中的“再练一轮”共享每日额度；句集随机练习和手动勾选的专项练习不受此限制。已到期旧卡优先，新卡使用剩余额度。</p></div><span class="config-status ok">${dailyPlanCfg.dailyAutoReviewLimit} 句/天</span></div><label class="field">每日自动复习上限<input name="dailyAutoReviewLimit" type="number" min="1" max="500" step="1" inputmode="numeric" required value="${dailyPlanCfg.dailyAutoReviewLimit}"><small>请输入 1 到 500 之间的整数。</small></label><div class="form-actions"><button class="btn primary" type="submit">保存每日计划</button></div></form>`;
-  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}${dailyPlanCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>所有句子统一由官方 FSRS 系统安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答，正式提交时由后端自动评分：第一次核对即答对为“认识”；同一句子连续四个独立练习周期均首次答对（含本轮）为“轻松掌握”；第一次答错、第二次答对为“模糊”；第一次答错后未再次核对，或第二次仍然答错，为“忘记”。从未核对的题目不计入 FSRS。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“自动分块”，检查词块后确认保存。</p><p>分块完全在本机使用标准 GiNZA ja_ginza 文节模型完成；标点与空白固定显示，不会进入候选词块，也不会把句子发送到外部服务。</p><p>可在「学习概览」查看近期学习、未来复习安排和当前记忆状态。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
+  const dailyPlanCard = `<form id="daily-plan-form" class="card"><div class="settings-title"><div><h2>每日学习计划</h2><p>两种题型分别计算额度；首页自动复习和练习报告中的“再练一轮”共享每日额度，各题型互不挤占。专项练习不受限制。</p></div><span class="config-status ok">分别调度</span></div><label class="field">每日句子重组自动复习上限<input name="dailyAutoReviewLimit" type="number" min="1" max="500" step="1" inputmode="numeric" required value="${dailyPlanCfg.dailyAutoReviewLimit}"><small>已到期旧卡优先，再用新卡补足。</small></label><label class="field">每日汉字读音自动复习上限<input name="dailyKanjiReadingReviewLimit" type="number" min="1" max="500" step="1" inputmode="numeric" required value="${dailyPlanCfg.dailyKanjiReadingReviewLimit}"><small>不会挤占句子重组的每日计划。</small></label><div class="form-actions"><button class="btn primary" type="submit">保存每日计划</button></div></form>`;
+  view.innerHTML = `<section class="page"><div class="page-head"><div><h1>设置</h1><p>管理网站访问认证、时区、复习调度与使用说明。</p></div></div><div class="settings-grid"><form id="auth-form" class="card"><div class="settings-title"><div><h2>访问认证</h2><p>密码仅保存安全哈希，页面不会显示原密码。</p></div><span class="config-status ${authCfg.configured ? 'ok' : 'warn'}">${authCfg.configured ? '已启用' : '未启用'}</span></div><label class="field">用户名<input name="username" value="${esc(authCfg.username || '')}" autocomplete="username"></label><label class="field">新密码 ${authCfg.configured ? '<small>留空表示不修改</small>' : ''}<input name="password" type="password" autocomplete="new-password"></label><label class="check-row"><input name="clearAuth" type="checkbox">关闭应用认证</label><p class="status-note">关闭后将不再要求应用登录，请确认这符合你的访问策略。</p><div class="form-actions"><button class="btn primary" type="submit">保存认证设置</button></div></form>${timezoneCard}${dailyPlanCard}<div class="card"><div class="settings-title"><div><h2>复习调度</h2><p>句子重组卡和汉字读音卡分别由官方 FSRS 安排复习。</p></div><span class="config-status ok">FSRS</span></div><div class="preview-fields"><div><span>当前调度系统</span><strong>${esc(fsrsCfg.system)}</strong></div><div><span>目标保持率</span><strong>${Math.round(fsrsCfg.desiredRetention * 100)}%</strong></div><div><span>最大复习间隔</span><strong>${fsrsCfg.maximumIntervalDays} 天</strong></div><div><span>FSRS 版本</span><strong>${esc(fsrsCfg.version)}</strong></div></div><p class="status-note">核对答案只保存原始作答：第一次核对即答对为“认识”；连续四个独立练习周期均首次答对（含本轮）为“轻松掌握”；其他情况按既有规则评分。读音题作答不会改变对应句子重组卡的进度。</p></div><div class="card settings-help"><h2>使用说明</h2><p>输入中文翻译和完整日语原句，点击“KWJA 自动分析”，检查文节和自动生成的读音题后保存。</p><p>解析由内网中的单实例 KWJA tiny 服务完成；标点与空白固定显示，解析失败不会用字符分割覆盖有效结果。</p><p>练习时不会实时调用模型，所有题目均读取已保存数据。</p><button class="btn outline" data-action="logout">退出登录</button></div></div></section>`;
   setChrome();
 }
 
@@ -1199,6 +1314,12 @@ document.addEventListener('click', async event => {
       }
       state.homeDuePicker = false;
       await startPractice({ collectionId, count: custom || selected });
+    }
+    else if (action === 'start-kanji-due') {
+      const active = state.dashboard?.collections.find(c => c.id === state.activeCollection);
+      const max = active?.availableKanjiReviewCount || 0;
+      if (!max) { toast('当前没有可自动安排的汉字读音题'); return; }
+      await startPractice({cardType:'kanji_reading', collectionId:state.activeCollection, count:'all'});
     }
     else if (action === 'set-count') { selectCountOption('count', button); }
     else if (action === 'start-collection') {
@@ -1243,7 +1364,7 @@ document.addEventListener('click', async event => {
         if (hint) { hint.textContent = error.message; hint.classList.add('error-text'); }
       }
     }
-    else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分块…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.draft.manuallyEdited = false; state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
+    else if (action === 'organize') { const japanese = $('#japanese').value, chinese = $('#chinese').value; button.disabled = true; const old = button.textContent; button.textContent = '正在分析…'; try { state.draft = await api('/api/sentences/organize', {method:'POST', body:JSON.stringify({japanese, chinese})}); state.draft.manuallyEdited = false; state.draft.disabledReadingCardKeys = []; state.selectedChunks = []; renderPreview(); } finally { button.disabled = false; button.textContent = old; } }
     else if (action === 'select-chunk') { const i = Number(button.dataset.index), at = state.selectedChunks.indexOf(i); if (at >= 0) state.selectedChunks.splice(at, 1); else { if (state.selectedChunks.length >= 2) state.selectedChunks.shift(); state.selectedChunks.push(i); } state.selectedChunks.sort((a,b) => a-b); renderPreview(); }
     else if (action === 'split-chunk') {
       if (state.selectedChunks.length !== 1) throw new Error('请先选中一个要拆分的词块');
@@ -1272,8 +1393,11 @@ document.addEventListener('click', async event => {
       state.draft.practiceStructure.splice(xIndex, 2, {type:'slot', chunkId:merged.id, start:merged.start, end:merged.end});
       markDraftManual(); state.selectedChunks = []; renderPreview();
     }
+    else if (action === 'toggle-draft-reading') { const card = state.draft?.readingCards?.[Number(button.dataset.index)]; if (!card) return; const disabled = new Set(state.draft.disabledReadingCardKeys || []); if (disabled.has(card.cardKey)) disabled.delete(card.cardKey); else disabled.add(card.cardKey); state.draft.disabledReadingCardKeys = [...disabled]; renderPreview(); }
+    else if (action === 'edit-draft-reading') openDraftReadingEditor(Number(button.dataset.index));
+    else if (action === 'save-draft-reading') saveDraftReadingEditor();
     else if (action === 'save-sentence') {
-      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, note:$('#note').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id), practiceStructure:state.draft.practiceStructure, chunkSource:state.draft.source, chunksManuallyEdited:Boolean(state.draft.manuallyEdited)};
+      const payload = {collectionId:Number($('#collection').value), chinese:$('#chinese').value, note:$('#note').value, japanese:$('#japanese').value, chunks:state.draft.chunks, correctOrder:state.draft.chunks.map(c => c.id), practiceStructure:state.draft.practiceStructure, chunkSource:state.draft.source, chunksManuallyEdited:Boolean(state.draft.manuallyEdited), readingCards:(state.draft.readingCards || []).map(card => ({cardKey:card.cardKey, payload:card.payload})), disabledReadingCardKeys:state.draft.disabledReadingCardKeys || []};
       const wasEditing = Boolean(state.editing);
       if (wasEditing) await api(`/api/sentences/${state.editing.id}`, {method:'PUT', body:JSON.stringify(payload)});
       else await api('/api/sentences', {method:'POST', body:JSON.stringify(payload)});
@@ -1317,7 +1441,8 @@ document.addEventListener('click', async event => {
     else if (action === 'check') await record('check');
     else if (action === 'continue-incomplete-answer') { if (!practiceDialogBusy()) closeDialog(); }
     else if (action === 'confirm-incomplete-answer') await record('check', {confirmIncomplete:true, button});
-    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; resetPracticeSlotAssignments(item); item.checked = false; item.result = null; item.submitting = false; item.pendingAttempt = null; item.questionStartedAt = Date.now(); renderPractice(); }
+    else if (action === 'retry-current') { const item = currentPracticeItem(); if (!item || item.submitting || state.practice?.submittingRound) return; resetPracticeSlotAssignments(item); item.selectedOptionId = null; item.checked = false; item.result = null; item.submitting = false; item.pendingAttempt = null; item.questionStartedAt = Date.now(); renderPractice(); }
+    else if (action === 'select-reading-option') { const p = state.practice, item = currentPracticeItem(p); if (!p || p.cardType !== 'kanji_reading' || !item || item.checked || item.submitting || p.submittingRound) return; item.selectedOptionId = button.dataset.optionId; renderPractice(); }
     else if (action === 'previous-question') navigatePractice(-1);
     else if (action === 'next-question') navigatePractice(1);
     else if (action === 'submit-round') await submitPracticeRound();
@@ -1379,7 +1504,7 @@ document.addEventListener('submit', async event => {
     if (event.target.id === 'login-form') { const body = Object.fromEntries(new FormData(event.target)); await api('/api/auth/login', {method:'POST', body:JSON.stringify(body)}); hideLogin(); await loadTimezoneState(); const entry = history.state || {route:'home'}; route(entry.route || 'home', {...entry, replace:true}); }
     else if (event.target.id === 'auth-form') { const form = new FormData(event.target), clearAuth = form.get('clearAuth') === 'on'; const body = {username:form.get('username'), password:form.get('password'), clearAuth}; await api('/api/settings/auth', {method:'PUT', body:JSON.stringify(body)}); toast(clearAuth ? '应用认证已关闭' : '访问认证已保存并立即生效'); await renderSettings(); }
     else if (event.target.id === 'timezone-form') { const tz = new FormData(event.target).get('timezone') || ''; const result = await api('/api/settings/timezone', {method:'PUT', body:JSON.stringify({timezone: tz})}); state.timezone = result.timezone || ''; state.dashboard = null; if (typeof window.clearStatsCache === 'function') window.clearStatsCache(); toast('时区设置已保存'); await renderSettings(); }
-    else if (event.target.id === 'daily-plan-form') { const raw = new FormData(event.target).get('dailyAutoReviewLimit'); const dailyAutoReviewLimit = Number(raw); if (!Number.isInteger(dailyAutoReviewLimit) || dailyAutoReviewLimit < 1 || dailyAutoReviewLimit > 500) throw new Error('每日自动复习上限必须是 1 到 500 之间的整数'); await api('/api/settings/daily-plan', {method:'PUT', body:JSON.stringify({dailyAutoReviewLimit})}); state.dashboard = null; toast('每日学习计划已保存'); await renderSettings(); }
+    else if (event.target.id === 'daily-plan-form') { const form = new FormData(event.target); const dailyAutoReviewLimit = Number(form.get('dailyAutoReviewLimit')); const dailyKanjiReadingReviewLimit = Number(form.get('dailyKanjiReadingReviewLimit')); if (!Number.isInteger(dailyAutoReviewLimit) || dailyAutoReviewLimit < 1 || dailyAutoReviewLimit > 500) throw new Error('每日句子重组自动复习上限必须是 1 到 500 之间的整数'); if (!Number.isInteger(dailyKanjiReadingReviewLimit) || dailyKanjiReadingReviewLimit < 1 || dailyKanjiReadingReviewLimit > 500) throw new Error('每日汉字读音自动复习上限必须是 1 到 500 之间的整数'); await api('/api/settings/daily-plan', {method:'PUT', body:JSON.stringify({dailyAutoReviewLimit, dailyKanjiReadingReviewLimit})}); state.dashboard = null; toast('每日学习计划已保存'); await renderSettings(); }
   } catch (error) { if (event.target.id === 'login-form') $('#login-error').textContent = error.message; else toast(error.data?.details?.join('；') || error.message, true); }
 });
 window.addEventListener('popstate', event => { const entry = event.state || {route:'home'}; route(entry.route || 'home', {...entry, fromPop:true}); });

@@ -1,9 +1,11 @@
 Flask==3.1.1
 fsrs==6.3.1
 gunicorn==23.0.0
-spacy==3.7.5
-ginza==5.2.0
-ja_ginza==5.2.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.7.1+cpu
+transformers[sentencepiece]==4.50.3
+kwja==2.5.1
+rhoknp==1.8.0
 fonttools==4.58.5
 brotli==1.1.0
 tzdata==2026.3

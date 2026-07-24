@@ -10,10 +10,10 @@ def test_practice_frontend_renders_one_slot_per_structure_slot_and_never_a_fixed
     assert "const index = slotIndex++" in source
     assert 'class="answer-slot empty"' in source
     assert 'class="fixed-element"' in source
-    assert "shuffle(sentence.chunks.map(chunk => chunk.id))" in source
-    assert "slotAssignments: Array(sentence.chunks.length).fill(null)" in source
+    assert "shuffle(card.sentence.chunks.map(chunk => chunk.id))" in source
+    assert "slotAssignments: cardType === 'sentence_order' ? Array(card.sentence.chunks.length).fill(null) : []" in source
     assert "const id = item.slotAssignments[index]" in source
-    assert "item.selected" not in source
+    assert "item.selected =" not in source
     assert "practiceStructure:state.draft.practiceStructure" in source
 
 

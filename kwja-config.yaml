@@ -1,0 +1,8 @@
+model_size: tiny
+device: cpu
+num_workers: 0
+torch_compile: false
+typo_batch_size: 1
+char_batch_size: 1
+seq2seq_batch_size: 1
+word_batch_size: 1

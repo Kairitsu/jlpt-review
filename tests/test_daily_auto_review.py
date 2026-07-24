@@ -74,6 +74,13 @@ def make_old_card(
                WHERE id=?""",
             (stability, last_review_at, next_review_at, sentence_id),
         )
+        connection.execute(
+            """UPDATE practice_cards
+               SET fsrs_state=2,fsrs_step=NULL,stability=?,difficulty=5.0,
+                   last_review_at=?,next_review_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (stability, last_review_at, next_review_at, sentence_id),
+        )
 
 
 def set_created_at(db_module, sentence_id, created_at):
@@ -82,12 +89,19 @@ def set_created_at(db_module, sentence_id, created_at):
             "UPDATE sentences SET created_at=?,updated_at=? WHERE id=?",
             (created_at, created_at, sentence_id),
         )
+        connection.execute(
+            """UPDATE practice_cards SET created_at=?,updated_at=?
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (created_at, created_at, sentence_id),
+        )
 
 
 def add_review_event(db_module, sentence_id, reviewed_at, *, source="selected"):
     with db_module.get_db() as connection:
-        sentence = connection.execute(
-            "SELECT * FROM sentences WHERE id=?", (sentence_id,)
+        card = connection.execute(
+            """SELECT * FROM practice_cards
+               WHERE sentence_id=? AND card_type='sentence_order' AND active=1""",
+            (sentence_id,),
         ).fetchone()
         session_id = connection.execute(
             """INSERT INTO practice_sessions(source,sentence_ids_json,total,created_at)
@@ -96,29 +110,30 @@ def add_review_event(db_module, sentence_id, reviewed_at, *, source="selected"):
         ).lastrowid
         connection.execute(
             """INSERT INTO review_events(
-                 sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
+                 card_id,sentence_id,session_id,rating,reviewed_at,duration_ms,is_new,
                  fsrs_state_before,fsrs_state_after,fsrs_step_before,fsrs_step_after,
                  stability_before,stability_after,difficulty_before,difficulty_after,
                  next_review_before,next_review_after,fsrs_version,created_at
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
+                card["id"],
                 sentence_id,
                 session_id,
                 3,
                 reviewed_at,
                 1000,
-                int(sentence["last_review_at"] is None),
-                sentence["fsrs_state"],
-                sentence["fsrs_state"],
-                sentence["fsrs_step"],
-                sentence["fsrs_step"],
-                sentence["stability"],
-                sentence["stability"],
-                sentence["difficulty"],
-                sentence["difficulty"],
-                sentence["next_review_at"],
-                sentence["next_review_at"],
-                sentence["fsrs_version"],
+                int(card["last_review_at"] is None),
+                card["fsrs_state"],
+                card["fsrs_state"],
+                card["fsrs_step"],
+                card["fsrs_step"],
+                card["stability"],
+                card["stability"],
+                card["difficulty"],
+                card["difficulty"],
+                card["next_review_at"],
+                card["next_review_at"],
+                card["fsrs_version"],
                 reviewed_at,
             ),
         )
@@ -192,7 +207,8 @@ def test_daily_plan_setting_defaults_validates_and_is_not_overwritten(
     client, db, _ = load_app(tmp_path, monkeypatch)
 
     assert client.get("/api/settings/daily-plan").get_json() == {
-        "dailyAutoReviewLimit": 50
+        "dailyAutoReviewLimit": 50,
+        "dailyKanjiReadingReviewLimit": 30,
     }
     with db.get_db() as connection:
         assert connection.execute(
@@ -202,7 +218,8 @@ def test_daily_plan_setting_defaults_validates_and_is_not_overwritten(
             "DELETE FROM settings WHERE key='daily_auto_review_limit'"
         )
     assert client.get("/api/settings/daily-plan").get_json() == {
-        "dailyAutoReviewLimit": 50
+        "dailyAutoReviewLimit": 50,
+        "dailyKanjiReadingReviewLimit": 30,
     }
 
     saved = client.put(
@@ -212,7 +229,8 @@ def test_daily_plan_setting_defaults_validates_and_is_not_overwritten(
     assert saved.get_json()["dailyAutoReviewLimit"] == 73
     db.init_db(enable_fuzzing=False)
     assert client.get("/api/settings/daily-plan").get_json() == {
-        "dailyAutoReviewLimit": 73
+        "dailyAutoReviewLimit": 73,
+        "dailyKanjiReadingReviewLimit": 30,
     }
 
     invalid_values = [None, "50", 1.5, True, 0, -1, 501]
@@ -224,7 +242,8 @@ def test_daily_plan_setting_defaults_validates_and_is_not_overwritten(
         assert "1 到 500" in response.get_json()["error"]
     assert client.put("/api/settings/daily-plan", json=[]).status_code == 400
     assert client.get("/api/settings/daily-plan").get_json() == {
-        "dailyAutoReviewLimit": 73
+        "dailyAutoReviewLimit": 73,
+        "dailyKanjiReadingReviewLimit": 30,
     }
 
 

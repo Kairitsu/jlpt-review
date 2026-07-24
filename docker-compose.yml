@@ -7,6 +7,8 @@ services:
       - ./secrets/app.env
     environment:
       DATA_DIR: /app/data
+      ANALYZER_URL: http://analyzer:8100
+      ANALYZER_TIMEOUT_SECONDS: "180"
     ports:
       - "127.0.0.1:3220:8000"
     volumes:
@@ -17,3 +19,43 @@ services:
       timeout: 5s
       retries: 3
 
+  analyzer:
+    build: .
+    container_name: jlpt-review-kwja-analyzer
+    restart: unless-stopped
+    environment:
+      KWJA_CACHE_DIR: /app/data/kwja-models
+      KWJA_CONFIG_FILE: /app/kwja-config.yaml
+      KWJA_ANALYSIS_CACHE_DIR: /app/data/kwja-analysis-cache
+      HF_HOME: /app/data/kwja-models/huggingface
+      KWJA_INFERENCE_TIMEOUT_SECONDS: "180"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+    expose:
+      - "8100"
+    volumes:
+      - ./data:/app/data
+    command:
+      - gunicorn
+      - --workers
+      - "1"
+      - --threads
+      - "1"
+      - --worker-class
+      - sync
+      - --bind
+      - 0.0.0.0:8100
+      - --timeout
+      - "300"
+      - --access-logfile
+      - "-"
+      - --error-logfile
+      - "-"
+      - kwja_service:app
+    mem_limit: 1600m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

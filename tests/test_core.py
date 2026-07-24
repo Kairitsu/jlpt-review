@@ -28,14 +28,19 @@ def test_tokenizer_exact_duplicate_and_punctuation():
     assert validate_practice_data(sentence, chunks, analysis["structure"], analysis["correctOrder"])[0]
 
 
-def test_organize_is_local_ginza_with_fixed_structure(tmp_path, monkeypatch):
+def test_organize_uses_kwja_with_fixed_structure_and_reading_candidates(tmp_path, monkeypatch):
     client = load_app(tmp_path, monkeypatch)
     response = client.post("/api/sentences/organize", json={"chinese":"你好", "japanese":"こんにちは。"})
     data = response.get_json()
     assert response.status_code == 200
-    assert data["source"] == "ginza"
-    assert set(data) == {"chunks", "correctOrder", "practiceStructure", "schemaVersion", "source", "sentenceFurigana"}
-    assert [x["text"] for x in data["chunks"]] == ["こんにちは"]
+    assert data["source"] == "kwja_tiny_phrase"
+    assert set(data) == {
+        "analysis", "chunks", "correctOrder", "practiceStructure",
+        "readingCardCount", "readingCards", "readingSkips",
+        "schemaVersion", "sentenceFurigana", "source",
+    }
+    assert data["schemaVersion"] == 3
+    assert "".join(x["text"] for x in data["chunks"]) == "こんにちは"
     assert data["practiceStructure"][-1]["text"] == "。"
     assert "".join(x["text"] for x in data["sentenceFurigana"]) == "こんにちは。"
     assert client.get("/api/settings").status_code == 404

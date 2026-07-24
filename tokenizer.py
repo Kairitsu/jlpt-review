@@ -1,51 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import logging
-import threading
 import unicodedata
 
+from kwja_analyzer import analyze_with_kwja
 
-LOGGER = logging.getLogger(__name__)
-CHUNK_SCHEMA_VERSION = 2
-TOKENIZER_NAME = "ginza-ja_ginza-bunsetu"
+CHUNK_SCHEMA_VERSION = 3
+TOKENIZER_NAME = "kwja-tiny-phrase"
 FIXED_EXTRA = set("〜～")
-
-_nlp = None
-_ginza = None
-_nlp_unavailable = False
-_nlp_lock = threading.RLock()
-
-
-def _get_nlp():
-    """Load one standard ja_ginza model per process and reuse it.
-
-    NER is not needed for bunsetu boundaries or readings, so keeping that
-    component disabled saves memory on this small deployment.
-    """
-    global _nlp, _ginza, _nlp_unavailable
-    if _nlp_unavailable:
-        raise RuntimeError("GiNZA model is unavailable in this process")
-    if _nlp is None:
-        with _nlp_lock:
-            if _nlp is None:
-                try:
-                    import ginza
-                    import spacy
-
-                    _nlp = spacy.load("ja_ginza", disable=["ner"])
-                    _ginza = ginza
-                except Exception:
-                    _nlp_unavailable = True
-                    raise
-    return _nlp
-
-
-def _document(text: str):
-    # spaCy pipeline components are shared by all Gunicorn threads. Serialize
-    # inference so component state is never mutated concurrently.
-    with _nlp_lock:
-        return _get_nlp()(text)
 
 
 def is_fixed_char(char: str) -> bool:
@@ -135,41 +97,27 @@ def _append_range(
             )
 
 
-def _fallback_ranges(text: str) -> list[tuple[int, int]]:
-    """Conservative lossless fallback: one slot per non-fixed text run."""
-    if not text:
-        return []
-    ranges = []
-    start = 0
-    current_fixed = is_fixed_char(text[0])
-    for index in range(1, len(text)):
-        fixed = is_fixed_char(text[index])
-        if fixed != current_fixed:
-            ranges.append((start, index))
-            start = index
-            current_fixed = fixed
-    ranges.append((start, len(text)))
-    return ranges
-
-
-def _ranges_from_ginza(doc, text: str) -> list[tuple[int, int]]:
-    spans = list(_ginza.bunsetu_spans(doc))
-    if not spans:
-        raise ValueError("GiNZA did not return bunsetu spans")
+def _ranges_from_phrases(phrases, text: str) -> list[tuple[int, int]]:
+    if not phrases:
+        raise ValueError("KWJA 未返回文节")
     ranges: list[tuple[int, int]] = []
     cursor = 0
-    for span in spans:
-        start, end = int(span.start_char), int(span.end_char)
+    for phrase in phrases:
+        if not isinstance(phrase, dict):
+            raise ValueError("KWJA 文节格式无效")
+        start, end = phrase.get("start"), phrase.get("end")
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise ValueError("KWJA 文节缺少原文偏移")
         if start < cursor or end <= start or end > len(text):
-            raise ValueError("GiNZA returned overlapping or invalid source offsets")
-        if start > cursor:
-            ranges.append((cursor, start))
+            raise ValueError("KWJA 返回了重叠或越界的文节")
+        if start != cursor:
+            raise ValueError("KWJA 文节没有连续覆盖原句")
         ranges.append((start, end))
         cursor = end
-    if cursor < len(text):
-        ranges.append((cursor, len(text)))
+    if cursor != len(text):
+        raise ValueError("KWJA 文节没有完整覆盖原句")
     if "".join(text[start:end] for start, end in ranges) != text:
-        raise ValueError("GiNZA ranges cannot reconstruct the source sentence")
+        raise ValueError("KWJA 文节无法无损还原原句")
     return ranges
 
 
@@ -326,39 +274,36 @@ def analyze_sentence(text: str) -> dict:
             "structure": [],
             "correctOrder": [],
             "furigana": [],
-            "source": "ginza",
+            "source": "kwja_tiny_phrase",
             "schemaVersion": CHUNK_SCHEMA_VERSION,
+            "analysis": analyze_with_kwja(text),
         }
 
-    try:
-        doc = _document(text)
-        ranges = _ranges_from_ginza(doc, text)
-        chunks, structure = _structure_from_ranges(text, ranges, prefix="g")
-        furigana = _furigana_from_doc(text, doc)
-        source = "ginza"
-    except Exception:
-        LOGGER.exception("GiNZA analysis failed; using lossless fallback")
-        ranges = _fallback_ranges(text)
-        chunks, structure = _structure_from_ranges(text, ranges, prefix="f")
-        furigana = [{"text": text}]
-        source = "fallback"
+    analysis = analyze_with_kwja(text)
+    ranges = _ranges_from_phrases(analysis["phrases"], text)
+    chunks, structure = _structure_from_ranges(text, ranges, prefix="k")
+    furigana = _furigana_from_morphemes(text, analysis["morphemes"])
 
     correct_order = [chunk["id"] for chunk in chunks]
     valid, message = validate_practice_data(text, chunks, structure, correct_order)
     if not valid:
         raise ValueError(message)
+    analysis["furigana"] = furigana
+    analysis["chunks"] = chunks
+    analysis["practiceStructure"] = structure
     return {
         "chunks": chunks,
         "structure": structure,
         "correctOrder": correct_order,
         "furigana": furigana,
-        "source": source,
+        "source": "kwja_tiny_phrase",
         "schemaVersion": CHUNK_SCHEMA_VERSION,
+        "analysis": analysis,
     }
 
 
 def local_tokenize(text: str) -> list[dict]:
-    """Compatibility wrapper: return only learner-sortable GiNZA chunks."""
+    """Compatibility wrapper: return only learner-sortable KWJA phrase chunks."""
     return analyze_sentence(text)["chunks"]
 
 
@@ -434,16 +379,24 @@ def _annotate_morpheme(surface: str, reading: str) -> list[dict]:
     return [{"text": surface, "ruby": reading}]
 
 
-def _furigana_from_doc(text: str, doc) -> list[dict]:
+def _furigana_from_morphemes(text: str, morphemes) -> list[dict]:
     result: list[dict] = []
     cursor = 0
-    for token in doc:
-        start, end = int(token.idx), int(token.idx + len(token.text))
+    for morpheme in morphemes:
+        if not isinstance(morpheme, dict):
+            raise ValueError("KWJA 形态素格式无效")
+        start, end = morpheme.get("start"), morpheme.get("end")
+        if (
+            not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < cursor
+            or end <= start
+            or end > len(text)
+        ):
+            raise ValueError("KWJA 形态素偏移无效")
         if start > cursor:
             result.append({"text": text[cursor:start]})
-        reading_values = token.morph.get("Reading")
-        reading = reading_values[0] if reading_values else ""
-        result.extend(_annotate_morpheme(text[start:end], reading))
+        result.extend(_annotate_morpheme(text[start:end], morpheme.get("reading", "")))
         cursor = end
     if cursor < len(text):
         result.append({"text": text[cursor:]})
@@ -458,8 +411,5 @@ def furigana_segments(text: str) -> list[dict]:
         raise TypeError("日语文本必须是字符串")
     if not text:
         return []
-    try:
-        return _furigana_from_doc(text, _document(text))
-    except Exception:
-        LOGGER.exception("GiNZA furigana analysis failed; returning plain text")
-        return [{"text": text}]
+    analysis = analyze_with_kwja(text)
+    return _furigana_from_morphemes(text, analysis["morphemes"])
